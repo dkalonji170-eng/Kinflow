@@ -65,7 +65,7 @@ if [ "$1" = "pages" ]; then
   else
     git checkout --orphan gh-pages
   fi
-  cp -f -r ../build/web/* .
+  cp -f -r build/web/* .
   git add -A
   git commit -m "Site web KinFlow $(date '+%Y-%m-%d %H:%M')" || true
   git push -u origin gh-pages 2>&1 | tail -3
