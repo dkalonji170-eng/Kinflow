@@ -87,6 +87,7 @@ class _TrafficScreenState extends State<TrafficScreen>
   bool afficherActionsPosition = false;
 
   bool carteSurLieuRecherche = false;
+  bool carteSurDestination = false;
   String? dernierLieuRecherche;
 
   // ---------------------------------------------------------------------------
@@ -726,20 +727,6 @@ class _TrafficScreenState extends State<TrafficScreen>
 
     Journal.a('NAVIGATION', 'Suivi interrompu par un geste manuel');
     setState(() => modeNavigation = false);
-
-    if (_itineraire != null) {
-      Journal.i(
-        'NAVIGATION',
-        'Pas de reprise automatique : un itinéraire est affiché',
-      );
-      return;
-    }
-
-    Journal.i('NAVIGATION', 'Reprise automatique du suivi dans 10 s');
-    _repriseNavTimer = Timer(const Duration(seconds: 10), () {
-      _repriseNavTimer = null;
-      activerSuiviNavigation();
-    });
   }
 
   // ---------------------------------------------------------------------------
@@ -765,7 +752,6 @@ class _TrafficScreenState extends State<TrafficScreen>
       LatLng(positionActuelle!.latitude, positionActuelle!.longitude),
       17,
       aucunePositionAvant: premierePosition,
-      apres: activerSuiviNavigation,
     );
   }
 
@@ -907,6 +893,7 @@ class _TrafficScreenState extends State<TrafficScreen>
   // ---------------------------------------------------------------------------
 
   void basculerPosition() {
+    // Retour depuis le lieu consulté vers la position utilisateur.
     if (carteSurLieuRecherche && lieuRecherche != null) {
       if (positionActuelle != null) {
         Journal.i(
@@ -914,10 +901,11 @@ class _TrafficScreenState extends State<TrafficScreen>
           'Bouton « Ma position » : retour depuis le lieu consulté',
         );
         afficherPositionUtilisateur = true;
-        glisserVersPosition(
-          apres: _itineraire == null ? activerSuiviNavigation : null,
-        );
-        setState(() => carteSurLieuRecherche = false);
+        glisserVersPosition();
+        setState(() {
+          carteSurLieuRecherche = false;
+          carteSurDestination = false;
+        });
       } else {
         Journal.i(
           'POSITION',
@@ -925,22 +913,50 @@ class _TrafficScreenState extends State<TrafficScreen>
         );
         obtenirPosition();
       }
-    } else if (lieuRecherche != null) {
+      return;
+    }
+
+    // Bascule entre le point bleu (ma position) et le pin vert (destination).
+    final destination = _arriveeItineraire;
+    if (_itineraire != null && destination != null) {
+      if (carteSurDestination) {
+        // On regardait le pin vert : on revient sur le point bleu.
+        Journal.i('POSITION', 'Bascule : retour sur le point bleu');
+        if (positionActuelle != null) {
+          afficherPositionUtilisateur = true;
+          glisserVersPosition();
+        } else {
+          obtenirPosition();
+          return;
+        }
+        setState(() => carteSurDestination = false);
+      } else {
+        // On regardait le point bleu : on va voir le pin vert (destination).
+        Journal.i('POSITION', 'Bascule : vue sur le pin vert (destination)');
+        deplacerCarteDoucement(destination, mapController.camera.zoom);
+        setState(() => carteSurDestination = true);
+      }
+      return;
+    }
+
+    // Aucun itinéraire actif : comportement de recentrage simple.
+    if (lieuRecherche != null) {
       _repriseNavTimer?.cancel();
       _repriseNavTimer = null;
       Journal.i('CARTE', 'Recentrage sur le lieu consulté');
       deplacerCarteDoucement(lieuRecherche!, mapController.camera.zoom);
       setState(() {
         carteSurLieuRecherche = true;
-        modeNavigation = false;
+        carteSurDestination = false;
       });
     } else if (positionActuelle != null) {
       Journal.i('POSITION', 'Bouton « Ma position » : recentrage simple');
       afficherPositionUtilisateur = true;
-      glisserVersPosition(
-        apres: _itineraire == null ? activerSuiviNavigation : null,
-      );
-      setState(() => carteSurLieuRecherche = false);
+      glisserVersPosition();
+      setState(() {
+        carteSurLieuRecherche = false;
+        carteSurDestination = false;
+      });
     } else {
       Journal.i(
         'POSITION',
@@ -1498,6 +1514,7 @@ class _TrafficScreenState extends State<TrafficScreen>
   void _onSupprimer() {
     var recalculerSansEtape = false;
     setState(() {
+      carteSurDestination = false;
       if (actionsSurPosition) {
         afficherPositionUtilisateur = false;
         positionStream?.cancel();
@@ -1533,10 +1550,6 @@ class _TrafficScreenState extends State<TrafficScreen>
       pointActions = null;
       afficherActionsPosition = false;
     });
-
-    if (_itineraire == null) {
-      activerSuiviNavigation();
-    }
     if (recalculerSansEtape) {
       final destination = _arriveeItineraire!;
       final pos = positionActuelle!;
@@ -1982,7 +1995,7 @@ class _TrafficScreenState extends State<TrafficScreen>
             heroTag: 'position',
             backgroundColor: !boutonActif
                 ? Colors.grey
-                : (carteSurLieuRecherche
+                : ((carteSurLieuRecherche || carteSurDestination)
                       ? Colors.blue
                       : KinColors.primary),
             onPressed: boutonActif ? basculerPosition : null,
