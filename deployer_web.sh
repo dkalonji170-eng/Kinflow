@@ -3,13 +3,16 @@
 # KinFlow — Déploiement du site web
 # ---------------------------------------------------------------------------
 # Usage :
-#   ./deployer_web.sh zip      → reconstruit le site et crée "kinflow-web.zip"
-#                                (prêt à glisser-déposer sur netlify.com)
-#   ./deployer_web.sh pages    → reconstruit et pousse vers GitHub Pages
-#                                (nécessite d'abord : git remote add origin <url>)
+#   ./deployer_web.sh            → identique à "netlify" (recommandé)
+#   ./deployer_web.sh netlify    → compile, publie la branche "gh-pages" avec
+#                                  uniquement le site compilé. Netlify (connecté
+#                                  au dépôt GitHub) déploie alors automatiquement.
+#   ./deployer_web.sh pages      → alias de "netlify"
+#   ./deployer_web.sh zip        → compile et crée "kinflow-web.zip"
+#                                  (à déposer sur app.netlify.com/drop si besoin)
 #
-# Quand tu modifies le code, relance ce script : tout le monde verra alors la
-# nouvelle version (aucune action côté utilisateur).
+# Quand tu modifies le code, relance : ./deployer_web.sh
+# Le site se mettra à jour tout seul (aucune action côté utilisateur).
 # ---------------------------------------------------------------------------
 set -e
 
@@ -19,7 +22,7 @@ echo "▶ Compilation du site web..."
 flutter build web
 
 ZIP="kinflow-web.zip"
-if [ "$1" = "zip" ] || [ -z "$1" ]; then
+if [ "$1" = "zip" ]; then
   echo "▶ Création de $ZIP (prêt pour Netlify / Vercel)..."
   rm -f "$ZIP"
   cd build/web
@@ -43,43 +46,57 @@ z.close()
   exit 0
 fi
 
-if [ "$1" = "pages" ]; then
-  echo "▶ Publication sur GitHub Pages ($(git remote get-url origin 2>/dev/null))..."
+# ---------------------------------------------------------------------------
+# Publication du site (Netlify connecté au dépôt GitHub)
+# ---------------------------------------------------------------------------
+if [ "$1" = "netlify" ] || [ "$1" = "pages" ] || [ -z "$1" ]; then
+  echo "▶ Publication du site web sur GitHub ($(git remote get-url origin 2>/dev/null))..."
   if ! git remote get-url origin >/dev/null 2>&1; then
     echo "✗ Aucun dépôt distant."
     echo "  D'abord :  git remote add origin https://github.com/dkalonji170-eng/kinflow.git"
     exit 1
   fi
 
-  # 1) On commite le code source et on le pousse (historique des versions).
+  # 1) Historique du code source sur "master".
   git add -A
   git commit -m "KinFlow $(date '+%Y-%m-%d %H:%M')" || true
   git push -u origin master 2>&1 | tail -3 || true
 
-  # 2) La branche "gh-pages" ne contient que le site compilé (build/web/).
-  #    GitHub Pages la sert tel quel, donc on renouvelle son contenu.
-  echo "▶ Mise à jour de la branche gh-pages (le site web)..."
+  # 2) Reconstruit la branche "gh-pages" avec UNIQUEMENT le site compilé,
+  #    dans un répertoire de travail temporaire (le code source reste intact).
+  TMP_DIR=$(mktemp -d)
+  rm -f "$TMP_DIR/.keep" 2>/dev/null || true
   if git show-ref --verify --quiet refs/heads/gh-pages; then
-    git checkout gh-pages
-    git rm -rq --ignore-unmatch -- . 2>/dev/null || true
+    git worktree add "$TMP_DIR" gh-pages >/dev/null 2>&1 || TMP_DIR_EXISTS=1
   else
-    git checkout --orphan gh-pages
+    git worktree add --detach "$TMP_DIR" >/dev/null 2>&1 || TMP_DIR_EXISTS=1
   fi
-  cp -f -r build/web/* .
-  git add -A
-  git commit -m "Site web KinFlow $(date '+%Y-%m-%d %H:%M')" || true
-  git push -u origin gh-pages 2>&1 | tail -3
-  git checkout master
+
+  if [ -n "$TMP_DIR_EXISTS" ]; then
+    echo "✗ Impossible de préparer la branche gh-pages."
+    rm -rf "$TMP_DIR"
+    exit 1
+  fi
+
+  (
+    cd "$TMP_DIR"
+    if git show-ref --verify --quiet refs/heads/gh-pages 2>/dev/null; then
+      git rm -rq --ignore-unmatch -- . 2>/dev/null || true
+      find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf -- {} +
+    fi
+    cp -r "$OLDPWD/build/web/." .
+    git add -A
+    git commit -m "Site web KinFlow $(date '+%Y-%m-%d %H:%M')" || true
+    git push -u origin gh-pages 2>&1 | tail -3
+  )
+  git worktree remove --force "$TMP_DIR"
 
   echo ""
-  echo "✓ Site poussé sur GitHub Pages !"
-  echo "  Active la publication (1 seule fois) ici :"
-  echo "    https://github.com/dkalonji170-eng/kinflow/settings/pages"
-  echo "  → Source : 'Deploy from a branch' → branche 'gh-pages' → / (root)"
-  echo "  Votre site sera en ligne sur :"
-  echo "    https://dkalonji170-eng.github.io/kinflow/"
+  echo "✓ Site compilé et envoyé sur la branche gh-pages !"
+  echo "  Netlify déploie automatiquement ; ton site sera à jour dans ~1 min sur :"
+  echo "    https://kinflow.netlify.app"
   exit 0
 fi
 
-echo "Usage : ./deployer_web.sh zip | pages"
+echo "Usage : ./deployer_web.sh [netlify|pages|zip]"
 exit 1
