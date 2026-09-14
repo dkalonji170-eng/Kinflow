@@ -267,6 +267,10 @@ class Journal extends ChangeNotifier {
           details: entree.details,
           precedente: true,
         );
+        // Le badge du bouton doit signaler aussi les erreurs retrouvées sur
+        // disque, sinon après une relance/plantage le rapport en montre et le
+        // bouton reste sans chiffre.
+        if (entree.niveau == NiveauJournal.erreur) _erreursNonVues++;
       }
       _entrees.insertAll(0, retrouvees);
       _planifierNotification();

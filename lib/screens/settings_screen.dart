@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'notifications_screen.dart';
 import 'offline_maps_screen.dart';
-import '../theme_provider.dart';
+import '../theme/theme_provider.dart';
 import 'about_screen.dart';
 import 'help_screen.dart';
 import 'splash_screen.dart';

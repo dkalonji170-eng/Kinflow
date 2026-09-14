@@ -44,15 +44,10 @@ class TrafficPanel extends StatelessWidget {
 
           SizedBox(
             height: 46,
-            child: OutlinedButton.icon(
+            child: OutlinedButton(
               onPressed: onPosition,
               style: styleBouton,
-              icon: Icon(
-                Icons.location_on,
-                size: 20,
-                color: couleurTexte,
-              ),
-              label: chargementPosition
+              child: chargementPosition
                   ? const SizedBox(
                       width: 18,
                       height: 18,
@@ -74,15 +69,10 @@ class TrafficPanel extends StatelessWidget {
 
           SizedBox(
             height: 46,
-            child: OutlinedButton.icon(
+            child: OutlinedButton(
               onPressed: onRecherche,
               style: styleBouton,
-              icon: Icon(
-                Icons.search,
-                size: 20,
-                color: couleurTexte,
-              ),
-              label: Text(
+              child: Text(
                 "Rechercher un lieu",
                 style: TextStyle(
                   color: couleurTexte,

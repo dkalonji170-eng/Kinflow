@@ -165,18 +165,28 @@ class ControleurOrientation {
 
     final reference = _capReference;
     if (reference == null) {
-      // Premier cap exploitable de la session : alignement immédiat et pose
-      // du référentiel initial (cap + position).
+      // Aucune référence posée à l'entrée du suivi : premier cap exploitable
+      // de la session, alignement immédiat et pose du référentiel initial.
       return _recadrer(capFiltre, position);
     }
 
     final delta = differenceAngulaireDegres(reference, capFiltre).abs();
 
+    if (_positionReference == null) {
+      // La référence angulaire a déjà été posée par la rotation affichée à
+      // l'entrée du suivi (vue d'ensemble d'un itinéraire, par exemple) :
+      // la première mesure ne fait que poser l'origine du test de distance.
+      // On ne pivote pas encore — la carte garde son orientation jusqu'à un
+      // VRAI déplacement, au lieu de se réaligner sur le premier cap venu
+      // (souvent 0° à l'arrêt, ce qui la faisait « tourner toute seule »).
+      _positionReference = position;
+      return null;
+    }
+
     // Composante distance : validée seulement si le GPS est assez précis
     // pour distinguer 5 m réels du bruit de mesure.
     var distanceOk = false;
-    if (precisionMetres <= precisionGpsMaxMetres &&
-        _positionReference != null) {
+    if (precisionMetres <= precisionGpsMaxMetres) {
       final ref = _positionReference!;
       distanceOk = distanceHaversineMetres(
             ref.latitude,
@@ -201,11 +211,18 @@ class ControleurOrientation {
     return normaliserDegres(-capFiltre);
   }
 
-  /// Réinitialisation complète (entrée/sortie du mode navigation) : le
-  /// prochain cap valide réalignera la carte immédiatement.
-  void reinitialiser() {
+  /// Réinitialisation complète (entrée/sortie du mode navigation).
+  ///
+  /// Si [rotationInitialeDegres] est fournie (la rotation affichée par la
+  /// caméra), elle devient la référence angulaire : le prochain cap NE
+  /// réaligne plus la carte d'un coup — seul un vrai déplacement (double
+  /// seuil 10°/5 m) la fera pivot. Sans elle, le premier cap valide
+  /// réaligne immédiatement (bouton « Ma position » sans itinéraire).
+  void reinitialiser({double? rotationInitialeDegres}) {
     _filtreCap.reinitialiser();
-    _capReference = null;
+    _capReference = rotationInitialeDegres == null
+        ? null
+        : normaliserDegres(-rotationInitialeDegres);
     _positionReference = null;
   }
 }

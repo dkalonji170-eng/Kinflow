@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
@@ -7,8 +6,10 @@ import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:material_design_icons_flutter/material_design_icons_flutter.dart';
 
 import '../main.dart' show tileDownloadService;
+import '../config/carte.dart' show bornesAfrique;
 import '../models/route_result.dart';
 import '../models/search_result.dart';
 import '../services/compass_service.dart';
@@ -20,7 +21,10 @@ import '../services/search_service.dart';
 import '../services/supabase_service.dart';
 import '../services/traffic_service.dart';
 import '../services/traffic_stats_service.dart';
+import '../services/vue_itineraire.dart' show calculerVueItineraire;
 import '../theme/kinflow_theme.dart';
+import '../utils/formatage.dart' show formaterDistance, formaterDuree, formaterHeure;
+import '../utils/geo.dart' show deltaRotation, distanceALignes, distanceMetres, normaliserDegre, projeterSurAlignes, rotationTrace;
 import '../widgets/traffic_map.dart';
 import '../widgets/traffic_panel.dart';
 import '../widgets/traffic_questionnaire.dart';
@@ -29,12 +33,6 @@ import 'diagnostics_screen.dart';
 import 'profile_screen.dart';
 import 'search_screen.dart';
 import 'settings_screen.dart';
-
-/// Bornes de la vue « Afrique » affichée tant qu'aucune position n'est connue.
-final LatLngBounds _limitesAfrique = LatLngBounds(
-  const LatLng(-35.0, -18.0),
-  const LatLng(37.5, 52.0),
-);
 
 class TrafficScreen extends StatefulWidget {
   const TrafficScreen({super.key});
@@ -105,16 +103,45 @@ class _TrafficScreenState extends State<TrafficScreen>
 
   StreamSubscription<Position>? positionStream;
 
+  /// Dernière position GPS acceptée par le filtre anti-bruit, horodatée.
+  /// À l'arrêt le GPS dérive de quelques mètres : tant que le téléphone n'a
+  /// pas réellement avancé, on ne bouge pas le point bleu d'une fix à l'autre.
+  (LatLng, DateTime)? _positionAcceptee;
+
+  /// Vitesse effective minimale (m/s) en dessous de laquelle une fix n'est
+  /// pas considérée comme un réel déplacement. On mesure la distance depuis
+  /// la dernière position acceptée sur le temps écoulé (≃ vitesse de marche
+  /// lente), car la vitesse GPS brute est souvent annoncée 0,0 en marchant —
+  /// ce qui figeait le point bleu et bloquait la règle 10°/5 m.
+  static const double _seuilVitesseEffectiveMs = 0.45;
+
+  /// Seuil (mètres) : en dessous d'une réelle avancée, un déplacement GPS
+  /// plus court que ce seuil alors que la vitesse effective est quasi nulle
+  /// est traité comme du bruit de mesure et ignoré.
+  static const double _seuilBruitPositionMetres = 5.0;
+
+  /// Distance minimale (mètres) d'un itinéraire exploitable. En dessous de ce
+  /// seuil le trajet est jugé trop court (départ et arrivée quasi confondus) :
+  /// le calcul est refusé avec le motif « distance trop courte ».
+  static const double _distanceMinItineraireMetres = 100.0;
+
   // ---------------------------------------------------------------------------
   // Mode navigation : la carte suit la position et pivote selon le cap
   // ---------------------------------------------------------------------------
 
   bool modeNavigation = false;
-  double capUtilisateur = 0;
+  double? capUtilisateur;
   Timer? _repriseNavTimer;
 
   bool _centrerQuandPrete = false;
   bool _centrerPremiereFois = false;
+  VoidCallback? _centrerApres; // Rappel différé lorsque la carte n'était pas prête
+
+  /// Ajustement de la vue sur un itinéraire demandé alors que la carte
+  /// n'était pas encore prête (FMTC en cours d'initialisation) : rejoué
+  /// dès que le rendu est disponible, au lieu d'être perdu silencieusement.
+  List<LatLng>? _vueItineraireEnAttente;
+  VoidCallback? _apresVueItineraireEnAttente;
 
   // Animation caméra pilotée par un ticker (centrage, vue d'ensemble).
   Ticker? _suiviTicker;
@@ -133,18 +160,53 @@ class _TrafficScreenState extends State<TrafficScreen>
   // Itinéraire
   // ---------------------------------------------------------------------------
 
-  List<ZoneTrafic> _zonesTrafic = [];
   RouteResult? _itineraire;
   bool _chargementItineraire = false;
+
+  /// Vrai quand le moteur local a dû chercher au-delà du premier palier de
+  /// routes (les 5 premières lignes ne convenant pas) : l'indicateur de
+  /// calcul affiche alors « Réflexion profonde... ».
+  bool _rechercheItineraireElargie = false;
+
+  /// Vrai du début du calcul de l'itinéraire jusqu'à son terme (tracé
+  /// affiché, annulation ou échec) : toute l'activité de la carte (routes,
+  /// POIs, tuiles, polylignes) est suspendue pour laisser la priorité au
+  /// calcul moteur local + secours OSRM.
+  bool _travaillerCarteSuspendu = false;
+
   LatLng? _arriveeItineraire;
   final List<LatLng> _etapes = [];
   bool _lignesTraficAvantItineraire = true;
 
+  /// Segments (id OSM) du réseau chargé qui forment le tracé bleu → vert,
+  /// fournis par le moteur local : la carte n'affiche QUE ces polylignes
+  /// colorées pendant l'itinéraire (rien n'est re-tracé).
+  List<int>? _itineraireSegmentIds;
+
+  /// Zones de trafic signalées, reçues de la carte : elles orientent le
+  /// moteur local (éviter les bouchons) quand OSRM est injoignable.
+  List<ZoneTrafic> _zonesTrafic = [];
+
   int _versionZonesTrafic = 0;
+
   bool actionsSurDestination = false;
   bool actionsSurEtape = false;
   bool _dialogueDeviationOuvert = false;
   int _generationItineraire = 0;
+
+  /// Bannière de l'itinéraire : distance et durée restantes affichées. Elles
+  /// ne changent pas en continu : elles restent figées entre deux paliers,
+  /// recalculées seulement à chaque 1/5 du trajet (20 %, 40 %, 60 %, 80 %,
+  /// arrivée). Discret : seuls les chiffres bougent, aucun message.
+  double _banniereDistanceRestante = 0;
+  double _banniereDureeRestante = 0;
+  static const List<double> _paliersBanniere = [0.8, 0.6, 0.4, 0.2, 0.0];
+  int _bannierePalier = 0;
+
+  /// Étape(s) en place AVANT la recherche en cours : si l'utilisateur annule
+  /// le calcul (croix de l'indicateur), on les restaure pour ne pas laisser
+  /// un drapeau sans tracé recalculé.
+  List<LatLng> _etapesAvantRecherche = const [];
 
   // ---------------------------------------------------------------------------
   // Signalement
@@ -153,7 +215,6 @@ class _TrafficScreenState extends State<TrafficScreen>
   String etatActuel = "Aucun signalement";
   bool _propositionSignalementOuverte = false;
   bool afficherQuestionnaire = false;
-  Timer? _verifSignalementTimer;
 
   // ---------------------------------------------------------------------------
   // Quartier / rue du point bleu (géocodage inverse de la position courante)
@@ -245,16 +306,15 @@ class _TrafficScreenState extends State<TrafficScreen>
 
   /// Au premier affichage du trafic, s'assure que le GPS du téléphone est
   /// allumé : s'il est coupé, ouvre les réglages pour forcer l'utilisateur
-  /// à l'activer (comme pour la position). Une fois activé, relance un fix.
+  /// à l'activer (comme pour la position).
+  ///
+  /// Le point bleu (position + suivi GPS en continu) ne se déclenche
+  /// JAMAIS ici : il faut que l'utilisateur appuie sur « Ma position ».
   Future<void> _activerGpsPourTrafic() async {
     if (!mounted) return;
     final active = await locationService.verifierActiverService();
     if (!mounted) return;
-    if (active) {
-      if (positionActuelle == null) {
-        obtenirPosition();
-      }
-    } else {
+    if (!active) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
@@ -487,7 +547,10 @@ class _TrafficScreenState extends State<TrafficScreen>
     }
 
     if (positionActuelle != null) {
-      centrerSurPosition(premierePosition: aucunMarqueurAvant);
+      centrerSurPosition(
+        premierePosition: aucunMarqueurAvant,
+        apres: activerSuiviNavigation,
+      );
     }
   }
 
@@ -538,12 +601,37 @@ class _TrafficScreenState extends State<TrafficScreen>
           journaliserFix(position);
           if (!mounted) return;
 
+          // Filtre anti-bruit : fix rejetée quand le téléphone est à l'arrêt
+          // (ou quasi immobile). Le GPS dérive de quelques mètres sans bouger :
+          // l'accepter ferait sautiller le point bleu et zigzaguer la caméra.
+          // On se base sur la VITESSE EFFECTIVE (dérivée de la distance /
+          // temps) et non sur position.speed, souvent 0,0 à la marche lente.
+          final pointFix = LatLng(position.latitude, position.longitude);
+          final positionAcceptee =
+              _positionAcceptee ?? (pointFix, DateTime.now());
+          _positionAcceptee = positionAcceptee;
+          final dureeSec = DateTime.now()
+              .difference(positionAcceptee.$2)
+              .inMilliseconds /
+              1000.0;
+          final distanceDepuisAcceptee =
+              const Distance().distance(positionAcceptee.$1, pointFix);
+          final vitesseEffectiveMs = dureeSec > 0
+              ? distanceDepuisAcceptee / dureeSec
+              : 0;
+          if (distanceDepuisAcceptee < _seuilBruitPositionMetres &&
+              vitesseEffectiveMs < _seuilVitesseEffectiveMs) {
+            return;
+          }
+          _positionAcceptee = (pointFix, DateTime.now());
+
           setState(() {
             positionActuelle = position;
 
-            // Seule la course GPS en déplacement réel (> 1 m/s) alimente le cap.
-            final vitesse = position.speed;
-            if (vitesse >= 1.0 && position.heading >= 0) {
+            // Tout fix ACCEPTÉ ici est un réel déplacement (vitesse effective
+            // ≥ 0,45 m/s) : le cap GPS est alors exploitable pour la règle
+            // d'orientation 10°/5 m, y compris à la marche.
+            if (position.heading >= 0) {
               capUtilisateur = position.heading;
             }
 
@@ -555,7 +643,16 @@ class _TrafficScreenState extends State<TrafficScreen>
 
           _verifierDeviation(position);
           _mettreAJourZonePosition(position);
-        });
+        }, onError: (Object e, StackTrace st) {
+          // Permission révoquée en cours de route, GPS coupé… : le flux
+          // rejette une erreur. Sans ce garde-fou, elle remontait en erreur
+          // non gérée (ZonedGuarded) et l'app était consignée en plantage.
+          Journal.e('POSITION', 'Flux GPS interrompu', {'erreur': '$e'});
+          debugPrint('[KinFlow] Flux GPS interrompu: $e');
+          positionStream?.cancel();
+          positionStream = null;
+          if (mounted) setState(() => chargementPosition = false);
+        }, cancelOnError: true);
   }
 
   // ---------------------------------------------------------------------------
@@ -587,7 +684,7 @@ class _TrafficScreenState extends State<TrafficScreen>
     if (position.accuracy > _precisionGpsMaxMetres) return;
 
     final point = LatLng(position.latitude, position.longitude);
-    if (_distanceALItineraire(point, itineraire.points) <
+    if (distanceALignes(point, itineraire.points) <
         _seuilDeviationMetres) {
       _mettreAJourProgression(position);
       _pointsHorsTraceConsecutifs = 0;
@@ -622,6 +719,7 @@ class _TrafficScreenState extends State<TrafficScreen>
             onPressed: () {
               Navigator.of(contextDialogue).pop();
               final destination = _arriveeItineraire ?? itineraire.points.last;
+              _etapesAvantRecherche = List.of(_etapes);
               calculerItineraire(point, destination);
             },
             child: const Text("Recalculer"),
@@ -631,31 +729,6 @@ class _TrafficScreenState extends State<TrafficScreen>
     ).whenComplete(() {
       _dialogueDeviationOuvert = false;
     });
-  }
-
-  /// Distance minimale entre [p] et la polyligne [points], en mètres
-  /// (projection orthogonale sur chaque segment).
-  double _distanceALItineraire(LatLng p, List<LatLng> points) {
-    var minD = double.infinity;
-    for (var i = 0; i < points.length - 1; i++) {
-      final a = points[i];
-      final b = points[i + 1];
-      final cosLat = math.cos(b.latitude * math.pi / 180);
-      final ax = (b.longitude - a.longitude) * cosLat;
-      final ay = b.latitude - a.latitude;
-      final bx = (p.longitude - a.longitude) * cosLat;
-      final by = p.latitude - a.latitude;
-      final len2 = ax * ax + ay * ay;
-      if (len2 <= 0) continue;
-      final t = ((bx * ax + by * ay) / len2).clamp(0.0, 1.0);
-      final projLat = a.latitude + t * (b.latitude - a.latitude);
-      final projLon = a.longitude + t * (b.longitude - a.longitude);
-      final dLat = (p.latitude - projLat) * 111320;
-      final dLon = (p.longitude - projLon) * 111320 * cosLat;
-      final d = math.sqrt(dLat * dLat + dLon * dLon);
-      if (d < minD) minD = d;
-    }
-    return minD;
   }
 
   /// Met à jour la progression le long de l'itinéraire : calcule l'index du
@@ -674,7 +747,7 @@ class _TrafficScreenState extends State<TrafficScreen>
     var meilleur = 0;
     var minD = double.infinity;
     for (var i = 0; i < points.length; i++) {
-      final d = _distanceMetres(p, points[i]);
+      final d = distanceMetres(p, points[i]);
       if (d < minD) {
         minD = d;
         meilleur = i;
@@ -689,13 +762,6 @@ class _TrafficScreenState extends State<TrafficScreen>
       if (!mounted) return;
       setState(() => _debutVisuelItineraire = nouveau);
     }
-  }
-
-  double _distanceMetres(LatLng a, LatLng b) {
-    final cosLat = math.cos(b.latitude * math.pi / 180);
-    final dLat = (a.latitude - b.latitude) * 111320;
-    final dLon = (a.longitude - b.longitude) * 111320 * cosLat;
-    return math.sqrt(dLat * dLat + dLon * dLon);
   }
 
   // ---------------------------------------------------------------------------
@@ -733,7 +799,7 @@ class _TrafficScreenState extends State<TrafficScreen>
   // Recentrage / animation caméra
   // ---------------------------------------------------------------------------
 
-  void centrerSurPosition({bool premierePosition = false}) {
+  void centrerSurPosition({bool premierePosition = false, VoidCallback? apres}) {
     if (positionActuelle == null) return;
 
     Journal.i('CARTE', 'Recentrage sur la position utilisateur demandé', {
@@ -743,15 +809,18 @@ class _TrafficScreenState extends State<TrafficScreen>
     if (!cartePrete) {
       _centrerQuandPrete = true;
       _centrerPremiereFois = premierePosition;
+      _centrerApres = apres;
       return;
     }
 
     _centrerQuandPrete = false;
+    _centrerApres = null;
 
     _animerVueAfriquePuis(
       LatLng(positionActuelle!.latitude, positionActuelle!.longitude),
       17,
       aucunePositionAvant: premierePosition,
+      apres: apres,
     );
   }
 
@@ -776,7 +845,7 @@ class _TrafficScreenState extends State<TrafficScreen>
     }
 
     final fit = CameraFit.bounds(
-      bounds: _limitesAfrique,
+      bounds: bornesAfrique,
       padding: const EdgeInsets.all(24),
     ).fit(mapController.camera);
     _animerCameraVers(
@@ -803,6 +872,38 @@ class _TrafficScreenState extends State<TrafficScreen>
       17,
       mapController.camera.rotation,
       apres: apres,
+    );
+  }
+
+  /// Bouton « Ma position » : recentre la carte sur le point bleu puis
+  /// (hors itinéraire) active le suivi navigation — la carte suit le point
+  /// bleu et pivote selon la course GPS (seuils mètres/degrés).
+  ///
+  /// Si le suivi est déjà actif, il est relancé proprement (session remise
+  /// à zéro, décalage écran reglissé vers le bas) au lieu de ne rien faire :
+  /// le bouton garde ainsi toujours un effet visible.
+  void recentrerSurPositionEtSuivre() {
+    if (positionActuelle == null) {
+      obtenirPosition();
+      return;
+    }
+
+    if (modeNavigation) {
+      // Suivi déjà actif : on le coupe puis on le relance à la frame suivante
+      // pour recadrer la caméra sur le point bleu. Un itinéraire affiché ne
+      // bloque plus la reprise : la rotation selon la course GPS continue de
+      // fonctionner le long du tracé.
+      interrompreSuiviNavigation();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) activerSuiviNavigation();
+      });
+      return;
+    }
+
+    // Suivi inactif : centrage animé vers la position, puis activation du
+    // suivi. Le suivi reste possible avec un itinéraire affiché.
+    glisserVersPosition(
+      apres: activerSuiviNavigation,
     );
   }
 
@@ -834,18 +935,6 @@ class _TrafficScreenState extends State<TrafficScreen>
     if (!_suiviTicker!.isActive) _suiviTicker!.start();
   }
 
-  double _normaliserDegre(double deg) {
-    final r = deg % 360;
-    return r < 0 ? r + 360 : r;
-  }
-
-  double _deltaRotation(double de, double vers) {
-    var d = (vers - de) % 360;
-    if (d > 180) d -= 360;
-    if (d < -180) d += 360;
-    return d;
-  }
-
   void _surTickSuivi(Duration _) {
     if (!mounted || !cartePrete) return;
     final camera = mapController.camera;
@@ -870,8 +959,8 @@ class _TrafficScreenState extends State<TrafficScreen>
           (centreCible.longitude - debutCentre.longitude) * k,
     );
     final zoom = debutZoom + (zoomCible - debutZoom) * k;
-    final delta = _deltaRotation(debutRotation, rotationCible);
-    final rotation = _normaliserDegre(debutRotation + delta * k);
+    final delta = deltaRotation(debutRotation, rotationCible);
+    final rotation = normaliserDegre(debutRotation + delta * k);
 
     mapController.move(centre, zoom, offset: _suiviOffset);
     mapController.rotate(rotation);
@@ -892,77 +981,41 @@ class _TrafficScreenState extends State<TrafficScreen>
   // Bouton « Ma position » / bascule lieu
   // ---------------------------------------------------------------------------
 
+  /// Le point vert actuellement visible sur la carte : la destination de
+  /// l'itinéraire si elle existe, sinon le lieu recherché (pin vert). Null
+  /// si aucun des deux n'est présent.
+  LatLng? _pointVertSurCarte() {
+    if (_arriveeItineraire != null) return _arriveeItineraire;
+    return lieuRecherche;
+  }
+
   void basculerPosition() {
-    // Retour depuis le lieu consulté vers la position utilisateur.
-    if (carteSurLieuRecherche && lieuRecherche != null) {
-      if (positionActuelle != null) {
-        Journal.i(
-          'POSITION',
-          'Bouton « Ma position » : retour depuis le lieu consulté',
-        );
-        afficherPositionUtilisateur = true;
-        glisserVersPosition();
-        setState(() {
-          carteSurLieuRecherche = false;
-          carteSurDestination = false;
-        });
-      } else {
-        Journal.i(
-          'POSITION',
-          'Bouton « Ma position » : aucune position connue, demande GPS',
-        );
-        obtenirPosition();
-      }
-      return;
-    }
+    // Rôle unique : tourner la carte vers le point vert ou revenir au point
+    // bleu (position utilisateur).
+    if (!afficherPositionUtilisateur || positionActuelle == null) return;
+    final pointVert = _pointVertSurCarte();
+    if (pointVert == null) return;
 
-    // Bascule entre le point bleu (ma position) et le pin vert (destination).
-    final destination = _arriveeItineraire;
-    if (_itineraire != null && destination != null) {
-      if (carteSurDestination) {
-        // On regardait le pin vert : on revient sur le point bleu.
-        Journal.i('POSITION', 'Bascule : retour sur le point bleu');
-        if (positionActuelle != null) {
-          afficherPositionUtilisateur = true;
-          glisserVersPosition();
-        } else {
-          obtenirPosition();
-          return;
-        }
-        setState(() => carteSurDestination = false);
-      } else {
-        // On regardait le point bleu : on va voir le pin vert (destination).
-        Journal.i('POSITION', 'Bascule : vue sur le pin vert (destination)');
-        deplacerCarteDoucement(destination, mapController.camera.zoom);
-        setState(() => carteSurDestination = true);
-      }
-      return;
-    }
-
-    // Aucun itinéraire actif : comportement de recentrage simple.
-    if (lieuRecherche != null) {
-      _repriseNavTimer?.cancel();
-      _repriseNavTimer = null;
-      Journal.i('CARTE', 'Recentrage sur le lieu consulté');
-      deplacerCarteDoucement(lieuRecherche!, mapController.camera.zoom);
-      setState(() {
-        carteSurLieuRecherche = true;
-        carteSurDestination = false;
-      });
-    } else if (positionActuelle != null) {
-      Journal.i('POSITION', 'Bouton « Ma position » : recentrage simple');
+    if (carteSurDestination || carteSurLieuRecherche) {
+      // On regardait le point vert : on revient sur le point bleu.
       afficherPositionUtilisateur = true;
-      glisserVersPosition();
       setState(() {
-        carteSurLieuRecherche = false;
         carteSurDestination = false;
+        carteSurLieuRecherche = false;
       });
+      recentrerSurPositionEtSuivre();
     } else {
-      Journal.i(
-        'POSITION',
-        'Bouton « Ma position » : position inconnue, demande GPS',
-      );
-      obtenirPosition();
+      // On regardait le point bleu : on va voir le point vert.
+      deplacerCarteDoucement(pointVert, mapController.camera.zoom);
+      setState(() {
+        if (identical(_arriveeItineraire, pointVert)) {
+          carteSurDestination = true;
+          carteSurLieuRecherche = false;
+        } else {
+          carteSurLieuRecherche = true;
+          carteSurDestination = false;
+        }
+      });
     }
   }
 
@@ -1036,6 +1089,7 @@ class _TrafficScreenState extends State<TrafficScreen>
       return;
     }
     final depart = LatLng(position.latitude, position.longitude);
+    _etapesAvantRecherche = List.of(_etapes);
     _etapes.clear();
     await calculerItineraire(depart, cible);
   }
@@ -1063,11 +1117,13 @@ class _TrafficScreenState extends State<TrafficScreen>
       actionsSurEtape = false;
       lieuRecherche = null;
       carteSurLieuRecherche = false;
+      _etapesAvantRecherche = List.of(_etapes);
       _etapes.add(point);
     });
-    final depart = positionActuelle != null
-        ? LatLng(positionActuelle!.latitude, positionActuelle!.longitude)
-        : precedent.points.first;
+    // Le départ de l'itinéraire reste celui qui était déjà affiché : ajouter
+    // une étape insère le point entre départ et arrivée, sans ré-ancrer le
+    // parcours sur la position GPS courante (ce qui allongeait le trajet).
+    final depart = precedent.points.first;
     await calculerItineraire(depart, destination);
   }
 
@@ -1076,6 +1132,8 @@ class _TrafficScreenState extends State<TrafficScreen>
 
     setState(() {
       _chargementItineraire = true;
+      _rechercheItineraireElargie = false;
+      _travaillerCarteSuspendu = true;
       afficherActionsPosition = false;
       actionsSurEpingle = false;
       actionsSurPosition = false;
@@ -1099,9 +1157,13 @@ class _TrafficScreenState extends State<TrafficScreen>
       'etapes': _etapes.length,
     });
 
-    // Le moteur local (Overpass + Dijkstra) et OSRM tournent en parallèle :
-    // le premier résultat validé est utilisé. L'autre tâche continue en
-    // arrière‑plan (son résultat est ignoré via _generationItineraire).
+    // Les deux moteurs partent en parallèle. Le moteur LOCAL est prioritaires :
+    // il calcule sur les MÊMES lignes de circulation que celles affichées sur
+    // la carte (segments déjà téléchargés/affichés, servis par le cache), et
+    // son coût = distance × état du trafic choisit naturellement le tracé le
+    // plus « vert ». Le tracé suit donc exactement les routes colorées.
+    // OSRM (qui suit son propre réseau et ignore les embouteillages signalés)
+    // n'est qu'un secours quand le réseau local ne couvre pas le parcours.
     RouteResult? resultat;
 
     final calculLocal = itineraireService.calculer(
@@ -1109,6 +1171,11 @@ class _TrafficScreenState extends State<TrafficScreen>
       arrivee,
       zones: _zonesTrafic,
       etapes: List.of(_etapes),
+      onRechercheElargie: () {
+        if (mounted) {
+          setState(() => _rechercheItineraireElargie = true);
+        }
+      },
     );
 
     final calculOsrm = routeService.calculer(
@@ -1117,21 +1184,59 @@ class _TrafficScreenState extends State<TrafficScreen>
       etapes: List.of(_etapes),
     );
 
-    resultat = await _premierResultat(calculLocal, calculOsrm);
+    resultat = await _prefererLocal(calculLocal, calculOsrm);
 
     if (!mounted) return;
 
     if (generation != _generationItineraire) {
-      setState(() => _chargementItineraire = false);
+      setState(() {
+        _chargementItineraire = false;
+        _travaillerCarteSuspendu = false;
+      });
+      return;
+    }
+
+    // Un trajet plus court que la distance minimale est refusé : départ et
+    // arrivée quasi confondus, navigation sans objet. Motif « distance trop
+    // courte », avec l'état de la carte restauré comme en cas d'échec.
+    if (resultat != null &&
+        resultat.distanceMeters < _distanceMinItineraireMetres) {
+      Journal.e('ITINERAIRE', 'Distance trop courte', {
+        'distanceMeters': resultat.distanceMeters,
+        'minimumMeters': _distanceMinItineraireMetres,
+      });
+      setState(() {
+        _chargementItineraire = false;
+        _travaillerCarteSuspendu = false;
+        afficherLignesTrafic = _lignesTraficAvantItineraire;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Distance trop courte pour l'itinéraire."),
+        ),
+      );
       return;
     }
 
     setState(() {
       _chargementItineraire = false;
+      _travaillerCarteSuspendu = false;
       if (resultat != null) {
         _itineraire = resultat;
+        _itineraireSegmentIds = resultat.segmentsIds.isEmpty
+            ? null
+            : resultat.segmentsIds;
         _arriveeItineraire = arrivee;
+        // La vue d'ensemble montre déjà le point vert (destination) en haut :
+        // le bouton « Ma position » doit savoir qu'on regarde la destination,
+        // sinon son premier appui fait un saut inutile (il croit qu'on
+        // regardait la position).
+        carteSurDestination = true;
+        carteSurLieuRecherche = false;
         _debutVisuelItineraire = -1;
+        _banniereDistanceRestante = resultat.distanceMeters;
+        _banniereDureeRestante = resultat.durationSeconds;
+        _bannierePalier = 0;
         // L'épingle qui a servi de destination (ou d'étape) est consommée
         // par l'itinéraire : elle disparaît et ne laisse que le point vert
         // de destination (ou le drapeau d'étape) à sa place.
@@ -1161,8 +1266,11 @@ class _TrafficScreenState extends State<TrafficScreen>
     if (resultat == null) {
       Journal.e('ITINERAIRE', 'Calcul impossible : aucun itinéraire obtenu');
       // La recherche a échoué, aucun itinéraire affiché : on rend au bouton
-      // son état précédent.
-      afficherLignesTrafic = _lignesTraficAvantItineraire;
+      // son état précédent et on relance le travail de la carte.
+      setState(() {
+        afficherLignesTrafic = _lignesTraficAvantItineraire;
+        _travaillerCarteSuspendu = false;
+      });
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
@@ -1173,140 +1281,150 @@ class _TrafficScreenState extends State<TrafficScreen>
       return;
     }
 
+    // Après le tracé, on montre la vue d'ensemble de l'itinéraire SANS
+    // reprendre le suivi navigation automatiquement : le suivi se relance
+    // quand l'utilisateur l'active (bouton « Ma position ») ou commence à
+    // marcher. Un suivi automatique réécrivait la caméra à chaque frame et
+    // « résistait » à tous les gestes (double-clic de zoom, pincement) tant
+    // qu'on restait sur la vue d'ensemble.
     _ajusterVueSurItineraire(resultat.points);
   }
 
-  /// Renvoie le premier [RouteResult] non nul parmi [a] et [b], quel que soit
-  /// l'ordre de complétion. Si les deux échouent, renvoie null.
-  Future<RouteResult?> _premierResultat(
-    Future<RouteResult?> a,
-    Future<RouteResult?> b,
+  /// Plafond d'attente pour OSRM, utilisé uniquement en secours. Un réseau
+  /// sain répond en 1 à 3 s ; depuis l'Afrique centrale, les serveurs publics
+  /// OSRM sont souvent lents ou géographiquement limités, on laisse plus de
+  /// marge que sur une connexion européenne.
+  static const _dureeMaxAttenteOsrm = Duration(seconds: 20);
+
+  /// Le moteur local ([local]) est le moteur PRINCIPAL : il tourne sur les
+  /// segments de circulation déjà chargés (mêmes lignes que celles affichées)
+  /// et privilégie naturellement le tracé le plus fluide. OSRM ([osrm]) n'est
+  /// attendu qu'en secours, si le réseau local ne couvre pas le parcours.
+  /// Si les deux échouent, renvoie null.
+  Future<RouteResult?> _prefererLocal(
+    Future<RouteResult?> local,
+    Future<RouteResult?> osrm,
   ) async {
-    final completer = Completer<RouteResult?>();
-    var restant = 2;
-    RouteResult? premier;
-
-    void terminer() {
-      restant--;
-      if (!completer.isCompleted) {
-        if (premier != null || restant == 0) {
-          completer.complete(premier);
-        }
-      }
-    }
-
-    a.then((r) {
-      if (r != null && premier == null) {
-        premier = r;
-        Journal.s('ITINERAIRE', 'Itinéraire calculé par le moteur local', {
-          'points': r.points.length,
-          'distance_m': r.distanceMeters.round(),
-          'duree_s': r.durationSeconds.round(),
-        });
-      }
-      terminer();
-    }).catchError((e) {
+    final resultatLocal = await local.catchError((e) {
       debugPrint('[KinFlow] Calcul itinéraire local échoué: $e');
       Journal.e('ITINERAIRE', 'Erreur du moteur local', {'erreur': '$e'});
-      terminer();
+      return null as RouteResult?;
     });
+    if (resultatLocal != null) {
+      // OSRM tournait en parallèle ; on ne l'attend plus, son résultat
+      // éventuel est jeté (et ses erreurs avalées).
+      unawaited(osrm.catchError((_) => null as RouteResult?));
+      Journal.s(
+        'ITINERAIRE',
+        'Itinéraire calculé sur les lignes de circulation',
+        {
+          'points': resultatLocal.points.length,
+          'distance_m': resultatLocal.distanceMeters.round(),
+          'duree_s': resultatLocal.durationSeconds.round(),
+        },
+      );
+      return resultatLocal;
+    }
 
-    b.then((r) {
-      if (r != null && premier == null) {
-        premier = r;
-        Journal.s('ITINERAIRE', 'Itinéraire obtenu via OSRM', {
-          'points': r.points.length,
-          'distance_m': r.distanceMeters.round(),
-          'duree_s': r.durationSeconds.round(),
-        });
-      }
-      terminer();
-    }).catchError((e) {
+    Journal.a(
+      'ITINERAIRE',
+      'Réseau routier local insuffisant, OSRM en secours',
+    );
+    RouteResult? resultatOsrm;
+    try {
+      resultatOsrm = await osrm.timeout(_dureeMaxAttenteOsrm);
+    } on TimeoutException {
+      Journal.a(
+        'ITINERAIRE',
+        'OSRM (secours) trop lent, aucun itinéraire obtenu',
+      );
+    } catch (e) {
       debugPrint('[KinFlow] Calcul itinéraire OSRM échoué: $e');
       Journal.e('ITINERAIRE', 'Erreur du serveur OSRM', {'erreur': '$e'});
-      terminer();
-    });
-
-    return completer.future;
+    }
+    if (resultatOsrm != null) {
+      Journal.s('ITINERAIRE', 'Itinéraire obtenu via OSRM (secours)', {
+        'points': resultatOsrm.points.length,
+        'distance_m': resultatOsrm.distanceMeters.round(),
+        'duree_s': resultatOsrm.durationSeconds.round(),
+      });
+    }
+    return resultatOsrm;
   }
 
-  void _ajusterVueSurItineraire(List<LatLng> points) {
-    if (!cartePrete || points.isEmpty) return;
+  /// Les zones de trafic (« signalements collaboratifs ») sont reçues par la
+  /// carte : le moteur local (principal) s'en sert pour pondérer le coût des
+  /// rues. On ne recalcule plus l'itinéraire à chaque mise à jour — un
+  /// recalcul systématique gaspillerait du réseau en petit débit.
+  void _appliquerZonesTrafic(List<ZoneTrafic> zones) {
+    _zonesTrafic = zones;
+  }
+
+  void _ajusterVueSurItineraire(List<LatLng> points, {VoidCallback? apres}) {
+    if (points.isEmpty) return;
+    if (!cartePrete) {
+      // La carte n'est pas encore rendue (initialisation FMTC en cours,
+      // parfois longue sur réseau lent) : mémoriser la demande et la rejouer
+      // quand la carte est prête. Sans ce report, l'ajustement vertical
+      // bleu bas / vert haut n'était jamais appliqué sur ce trajet.
+      _vueItineraireEnAttente = List.of(points);
+      _apresVueItineraireEnAttente = apres;
+      return;
+    }
 
     Journal.i('ITINERAIRE', 'Ajustement de la vue sur le parcours complet', {
       'nombre_points': points.length,
     });
 
-    final valides =
+    final itineraireVue = _itineraire;
+    final pointsValides =
         points.where((p) => p.latitude.abs() <= 90 && p.longitude.abs() <= 180).toList();
-    if (valides.isEmpty) return;
+    if (pointsValides.length < 2) return;
 
-    var minLat = double.infinity;
-    var maxLat = double.negativeInfinity;
-    var minLon = double.infinity;
-    var maxLon = double.negativeInfinity;
-    for (final p in valides) {
-      if (p.latitude < minLat) minLat = p.latitude;
-      if (p.latitude > maxLat) maxLat = p.latitude;
-      if (p.longitude < minLon) minLon = p.longitude;
-      if (p.longitude > maxLon) maxLon = p.longitude;
-    }
+    final depart = pointsValides.first;
+    final arrivee = pointsValides.last;
+    final rotationCible = rotationTrace(depart, arrivee);
 
-    final cosLat = math.cos((minLat + maxLat) * 0.5 * math.pi / 180);
-    final porteeLat = (maxLat - minLat) * 111320;
-    final porteeLon = (maxLon - minLon) * 111320 * cosLat;
-    final porteeMetres = math.max(porteeLat, porteeLon);
-    if (!minLat.isFinite || !maxLat.isFinite || porteeMetres < 5) {
+    // Cadrage pur (centre, zoom, rotation) calculé par [calculerVueItineraire]
+    // : toute la géométrie vit dans vue_itineraire.dart, ici on ne fait que
+    // l'animer. Null = cas dégénéré (portée < 5 m, carte pas encore
+    // dimensionnée) : repli sur une animation vers le départ.
+    final vue = calculerVueItineraire(
+      camera: mapController.camera,
+      points: points,
+      debutRoute: itineraireVue?.debutRoute ?? 0,
+      finRoute: itineraireVue?.finRoute ?? points.length - 1,
+    );
+
+    if (vue == null) {
       _animerCameraVers(
-        valides.first,
-        16,
-        mapController.camera.rotation,
+        depart,
+        mapController.camera.zoom.clamp(16.0, 19.0).toDouble(),
+        rotationCible,
         duree: const Duration(milliseconds: 1200),
+        apres: apres,
       );
       return;
     }
 
-    final depart = valides.first;
-    final arrivee = valides.last;
-    final margeLat = (maxLat - minLat) * 0.35 + 0.0015;
-    final margeLon = (maxLon - minLon) * 0.35 + 0.0015;
-    if (depart.latitude <= arrivee.latitude) {
-      minLat -= margeLat;
-    } else {
-      maxLat += margeLat;
-    }
-    if (depart.longitude <= arrivee.longitude) {
-      minLon -= margeLon;
-    } else {
-      maxLon += margeLon;
-    }
-
-    final dLat = arrivee.latitude - depart.latitude;
-    final dLon = arrivee.longitude - depart.longitude;
-    final bearingDeg = math.atan2(dLon, dLat) * 180.0 / math.pi;
-    final rotationCible = (90.0 - bearingDeg) % 360.0;
-
-    final estCourt = porteeMetres < 200;
+    final estCourt = distanceMetres(depart, arrivee) < 200;
     final dureeMs = estCourt ? 700 : 1200;
 
     try {
-      final fit = CameraFit.bounds(
-        bounds: LatLngBounds(LatLng(minLat, minLon), LatLng(maxLat, maxLon)),
-        padding: const EdgeInsets.only(left: 70, right: 70, top: 80, bottom: 120),
-      ).fit(mapController.camera.withRotation(rotationCible));
-
       _animerCameraVers(
-        fit.center,
-        fit.zoom,
-        rotationCible,
+        vue.centre,
+        vue.zoom,
+        vue.rotation,
         duree: Duration(milliseconds: dureeMs),
+        apres: apres,
       );
-    } catch (e) {
+    } catch (_) {
       _animerCameraVers(
-        valides.first,
-        16,
-        mapController.camera.rotation,
+        depart,
+        vue.zoom,
+        vue.rotation,
         duree: Duration(milliseconds: dureeMs),
+        apres: apres,
       );
     }
   }
@@ -1317,28 +1435,40 @@ class _TrafficScreenState extends State<TrafficScreen>
       _generationItineraire++;
       lieuRecherche = _arriveeItineraire;
       _itineraire = null;
+      _itineraireSegmentIds = null;
       _arriveeItineraire = null;
       _debutVisuelItineraire = -1;
       _etapes.clear();
+      _vueItineraireEnAttente = null;
+      _apresVueItineraireEnAttente = null;
       actionsSurDestination = false;
       actionsSurEtape = false;
+      _travaillerCarteSuspendu = false;
       afficherLignesTrafic = _lignesTraficAvantItineraire;
     });
   }
 
-  String _formatDistance(double metres) {
-    if (metres >= 1000) {
-      return '${(metres / 1000).toStringAsFixed(1)} km';
-    }
-    return '${metres.round()} m';
-  }
-
-  String _formatDuree(double secondes) {
-    final minutes = (secondes / 60).round();
-    if (minutes < 60) return '$minutes min';
-    final heures = minutes ~/ 60;
-    final restantes = minutes % 60;
-    return restantes == 0 ? '$heures h' : '$heures h $restantes';
+  /// Annule la recherche d'itinéraire en cours (croix de l'indicateur de
+  /// calcul) : l'indicateur disparaît, le travail de la carte reprend, et le
+  /// calcul déjà lancé en arrière-plan est ignoré à son retour (génération
+  /// avancée). Le pin de destination reste posé : on peut relancer depuis là.
+  void _annulerRechercheItineraire() {
+    Journal.i('ITINERAIRE', 'Recherche d\'itinéraire annulée par l\'utilisateur');
+    setState(() {
+      _generationItineraire++;
+      _chargementItineraire = false;
+      _travaillerCarteSuspendu = false;
+      _vueItineraireEnAttente = null;
+      _apresVueItineraireEnAttente = null;
+      afficherLignesTrafic = _lignesTraficAvantItineraire;
+      // On revient à l'état d'avant la recherche : si on ajoutait une étape,
+      // le drapeau posé disparaît (aucun tracé n'a été recalculé avec elle).
+      _etapes
+        ..clear()
+        ..addAll(_etapesAvantRecherche);
+      _etapesAvantRecherche = const [];
+      actionsSurEtape = false;
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -1435,76 +1565,110 @@ class _TrafficScreenState extends State<TrafficScreen>
   }
 
   /// Affiche une petite fenêtre avec les coordonnées géographiques exactes
-  /// du point bleu de position, et deux boutons « Copier » et « Quitter ».
+  /// du point bleu de position. Les coordonnées en vert se copient d'un
+  /// simple appui, sans bouton dédié.
   void _voirDetailsPosition() {
     final position = positionActuelle;
     if (position == null || !mounted) return;
+    _voirDetailsCoordonnees(
+      LatLng(position.latitude, position.longitude),
+      'Ma position',
+    );
+  }
 
-    final latitude = position.latitude.toStringAsFixed(6);
-    final longitude = position.longitude.toStringAsFixed(6);
+  /// Affiche une petite fenêtre avec les coordonnées géographiques exactes
+  /// du point vert de destination de l'itinéraire.
+  void _voirDetailsDestination() {
+    final destination = _arriveeItineraire;
+    if (destination == null || !mounted) return;
+    _voirDetailsCoordonnees(destination, 'Destination');
+  }
+
+  void _voirDetailsCoordonnees(LatLng point, String titre) {
+    final latitude = point.latitude.toStringAsFixed(6);
+    final longitude = point.longitude.toStringAsFixed(6);
     final coordonnees = '$latitude, $longitude';
 
     final sombre = Theme.of(context).brightness == Brightness.dark;
+    final vert = _couleurLatitude();
+    final bleu = _couleurLongitude();
 
     showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: sombre ? KinColors.surfaceSombre : Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text(
-          'Ma position',
-          style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+        title: Text(
+          titre,
+          style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
         ),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _infosRow('Latitude', latitude),
-            _infosRow('Longitude', longitude),
+            _infosRow('Latitude', latitude, couleurValeur: vert),
+            _infosRow('Longitude', longitude, couleurValeur: bleu),
             const SizedBox(height: 8),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(
-                horizontal: 12,
-                vertical: 10,
-              ),
-              decoration: BoxDecoration(
-                color: sombre
-                    ? Colors.white10
-                    : Colors.black.withValues(alpha: 0.05),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: SelectableText(
-                coordonnees,
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  color: sombre ? KinColors.texteSombre : KinColors.texteClair,
+            InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () {
+                Clipboard.setData(ClipboardData(text: coordonnees));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Coordonnées copiées')),
+                );
+              },
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                decoration: BoxDecoration(
+                  color: sombre
+                      ? Colors.white10
+                      : Colors.black.withValues(alpha: 0.05),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Flexible(
+                      child: SelectableText.rich(
+                        TextSpan(
+                          style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          children: [
+                            TextSpan(
+                              text: latitude,
+                              style: TextStyle(color: vert),
+                            ),
+                            const TextSpan(text: ', '),
+                            TextSpan(
+                              text: longitude,
+                              style: TextStyle(color: bleu),
+                            ),
+                          ],
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                    Icon(
+                      Icons.copy,
+                      size: 16,
+                      color: vert,
+                    ),
+                  ],
                 ),
               ),
             ),
           ],
         ),
         actions: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              TextButton.icon(
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: coordonnees));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Coordonnées copiées')),
-                  );
-                },
-                icon: const Icon(Icons.copy, size: 18),
-                label: const Text('Copier'),
-              ),
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Quitter'),
-              ),
-            ],
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Quitter'),
           ),
         ],
       ),
@@ -1522,17 +1686,21 @@ class _TrafficScreenState extends State<TrafficScreen>
         actionsSurPosition = false;
         _generationItineraire++;
         _itineraire = null;
+        _itineraireSegmentIds = null;
         _arriveeItineraire = null;
         _debutVisuelItineraire = -1;
         _etapes.clear();
+        _travaillerCarteSuspendu = false;
         afficherLignesTrafic = _lignesTraficAvantItineraire;
       } else if (actionsSurDestination) {
         _generationItineraire++;
         _itineraire = null;
+        _itineraireSegmentIds = null;
         _arriveeItineraire = null;
         _debutVisuelItineraire = -1;
         _etapes.clear();
         actionsSurDestination = false;
+        _travaillerCarteSuspendu = false;
         afficherLignesTrafic = _lignesTraficAvantItineraire;
       } else if (actionsSurEtape) {
         _etapes.clear();
@@ -1553,6 +1721,7 @@ class _TrafficScreenState extends State<TrafficScreen>
     if (recalculerSansEtape) {
       final destination = _arriveeItineraire!;
       final pos = positionActuelle!;
+      _etapesAvantRecherche = List.of(_etapes);
       calculerItineraire(LatLng(pos.latitude, pos.longitude), destination);
     }
   }
@@ -1563,6 +1732,14 @@ class _TrafficScreenState extends State<TrafficScreen>
       lieuRecherche = null;
       dernierLieuRecherche = null;
       carteSurLieuRecherche = false;
+      // Une épingle fraîchement posée ne garde pas d'ancienne feuille
+      // d'actions ouverte sur un autre point.
+      pointActions = null;
+      afficherActionsPosition = false;
+      actionsSurEpingle = false;
+      actionsSurPosition = false;
+      actionsSurDestination = false;
+      actionsSurEtape = false;
     });
   }
 
@@ -1594,49 +1771,51 @@ class _TrafficScreenState extends State<TrafficScreen>
               children: [
                 if (info.type.isNotEmpty) _infosRow("Type", info.typeFr),
                 if (info.adresse.isNotEmpty) _infosRow("Adresse", info.adresse),
-                _infosRow(
-                  "Coordonnées",
-                  "${lat.toStringAsFixed(5)}, ${lon.toStringAsFixed(5)}",
-                ),
+                _infosCoordonnees(lat.toStringAsFixed(6), lon.toStringAsFixed(6)),
               ],
             ),
           ),
         ),
         actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              _onEpingleAvecCoordonnees(lat, lon);
-            },
-            child: Text(
-              "Épingler",
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: sombre
-                    ? KinColors.texteSombre
-                    : KinColors.texteClair,
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(context);
+                  _onEpingleAvecCoordonnees(lat, lon);
+                },
+                child: Text(
+                  "Épingler",
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: sombre
+                        ? KinColors.texteSombre
+                        : KinColors.texteClair,
+                  ),
+                ),
               ),
-            ),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(
-              "Fermer",
-              style: TextStyle(
-                fontSize: 14,
-                color: sombre
-                    ? KinColors.texteSecondaireSombre
-                    : KinColors.texteSecondaireClair,
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: Text(
+                  "Fermer",
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: sombre
+                        ? KinColors.texteSecondaireSombre
+                        : KinColors.texteSecondaireClair,
+                  ),
+                ),
               ),
-            ),
+            ],
           ),
         ],
       ),
     );
   }
 
-  Widget _infosRow(String label, String value) {
+  Widget _infosRow(String label, String value, {Color? couleurValeur}) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
       child: RichText(
@@ -1652,8 +1831,90 @@ class _TrafficScreenState extends State<TrafficScreen>
               text: "$label : ",
               style: const TextStyle(fontWeight: FontWeight.bold),
             ),
-            TextSpan(text: value),
+            TextSpan(
+              text: value,
+              style: couleurValeur != null
+                  ? TextStyle(
+                      color: couleurValeur,
+                      fontWeight: FontWeight.w600,
+                    )
+                  : null,
+            ),
           ],
+        ),
+      ),
+    );
+  }
+
+  /// Couleur de la latitude dans les coordonnées : verte.
+  Color _couleurLatitude() =>
+      Theme.of(context).brightness == Brightness.dark
+          ? const Color(0xFF4CD98E)
+          : KinColors.primaryFonce;
+
+  /// Couleur de la longitude dans les coordonnées : bleue.
+  Color _couleurLongitude() =>
+      Theme.of(context).brightness == Brightness.dark
+          ? const Color(0xFF64B5F6)
+          : const Color(0xFF1565C0);
+
+  /// Ligne « Coordonnées » du panneau lieu : la latitude en vert et la
+  /// longitude en bleu signale que la ligne est interactive ; appuyer
+  /// dessus copie les coordonnées (aucun bouton dédié).
+  Widget _infosCoordonnees(String latitude, String longitude) {
+    final coordonnees = '$latitude, $longitude';
+    final sombre = Theme.of(context).brightness == Brightness.dark;
+    final vert = _couleurLatitude();
+    final bleu = _couleurLongitude();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: () {
+          Clipboard.setData(ClipboardData(text: coordonnees));
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Coordonnées copiées')),
+          );
+        },
+        child: RichText(
+          text: TextSpan(
+            style: TextStyle(
+              fontSize: 13,
+              color: sombre ? KinColors.texteSombre : KinColors.texteClair,
+            ),
+            children: [
+              const TextSpan(
+                text: "Coordonnées : ",
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              TextSpan(
+                text: latitude,
+                style: TextStyle(
+                  color: vert,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const TextSpan(text: ', '),
+              TextSpan(
+                text: longitude,
+                style: TextStyle(
+                  color: bleu,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              WidgetSpan(
+                alignment: PlaceholderAlignment.middle,
+                child: Padding(
+                  padding: const EdgeInsets.only(left: 4),
+                  child: Icon(
+                    Icons.copy,
+                    size: 14,
+                    color: vert.withValues(alpha: 0.65),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -1733,20 +1994,36 @@ class _TrafficScreenState extends State<TrafficScreen>
                     : null,
                 lieuRecherche: lieuRecherche,
                 afficherLignesTrafic: afficherLignesTrafic,
+                suspendreTravailCarte: _travaillerCarteSuspendu,
                 onMapTap: _onMapTap,
                 onMapReady: () {
                   setState(() => cartePrete = true);
                   if (_centrerQuandPrete && positionActuelle != null) {
-                    centrerSurPosition(premierePosition: _centrerPremiereFois);
+                    final apres = _centrerApres;
+                    _centrerApres = null;
+                    centrerSurPosition(
+                      premierePosition: _centrerPremiereFois,
+                      apres: apres,
+                    );
+                  }
+                  if (_vueItineraireEnAttente != null) {
+                    final points = _vueItineraireEnAttente!;
+                    final apres = _apresVueItineraireEnAttente;
+                    _vueItineraireEnAttente = null;
+                    _apresVueItineraireEnAttente = null;
+                    _ajusterVueSurItineraire(points, apres: apres);
                   }
                 },
                 epingle: epingle,
+                onPoserEpingle: (point) =>
+                    _onEpingleAvecCoordonnees(point.latitude, point.longitude),
                 pointActions: pointActions,
                 actionsSurEpingle: actionsSurEpingle,
                 versionZonesTrafic: _versionZonesTrafic,
-                onZonesTrafic: (zones) => _zonesTrafic = zones,
+                onZonesTrafic: _appliquerZonesTrafic,
                 itinerairePoints: _itineraire?.points,
                 itineraireSeverites: _itineraire?.severites,
+                itineraireSegmentIds: _itineraireSegmentIds,
                 itineraireDebutRoute: _itineraire?.debutRoute ?? 0,
                 itineraireDebutVisuel: _debutVisuelItineraire,
                 itineraireFinRoute: _itineraire?.finRoute ?? -1,
@@ -1775,7 +2052,9 @@ class _TrafficScreenState extends State<TrafficScreen>
                 onSupprimer: _onSupprimer,
                 onVoirDetails: actionsSurPosition
                     ? _voirDetailsPosition
-                    : null,
+                    : actionsSurDestination
+                        ? _voirDetailsDestination
+                        : null,
               ),
               if (_tileProgress > 0 && _tileProgress < 100)
                 _construireBarreProgressionTuiles(),
@@ -1787,7 +2066,9 @@ class _TrafficScreenState extends State<TrafficScreen>
 
         _construireBarreEtat(
           context,
-          positionActuelle != null && _itineraire != null,
+          positionActuelle != null &&
+              afficherPositionUtilisateur &&
+              (_arriveeItineraire != null || lieuRecherche != null),
         ),
 
         AnimatedSize(
@@ -1879,25 +2160,27 @@ class _TrafficScreenState extends State<TrafficScreen>
     );
   }
 
-  /// Indicateur « Calcul de l'itinéraire... » lors du chargement.
+  /// Indicateur « Calcul de l'itinéraire... » lors du chargement, qui devient
+  /// « Réflexion profonde... » quand la première fournée de routes ne convient
+  /// pas et que le moteur élargit sa recherche. Une croix à droite permet
+  /// d'annuler la recherche en cours.
   Widget _construireIndicateurItineraire() {
+    final sombre = Theme.of(context).brightness == Brightness.dark;
     return Positioned(
       top: 8,
       left: 0,
       right: 0,
       child: Center(
         child: Material(
-          color: Theme.of(context).brightness == Brightness.dark
-              ? KinColors.surfaceSombre
-              : Colors.white,
+          color: sombre ? KinColors.surfaceSombre : Colors.white,
           elevation: 4,
           borderRadius: BorderRadius.circular(24),
-          child: const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Padding(
+            padding: const EdgeInsets.only(left: 16, right: 2, top: 2, bottom: 2),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                SizedBox(
+                const SizedBox(
                   width: 16,
                   height: 16,
                   child: CircularProgressIndicator(
@@ -1905,14 +2188,24 @@ class _TrafficScreenState extends State<TrafficScreen>
                     color: KinColors.primary,
                   ),
                 ),
-                SizedBox(width: 10),
+                const SizedBox(width: 10),
                 Text(
-                  "Calcul de l'itinéraire...",
-                  style: TextStyle(
+                  _rechercheItineraireElargie
+                      ? "Réflexion profonde..."
+                      : "Calcul de l'itinéraire...",
+                  style: const TextStyle(
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
                     color: KinColors.texteClair,
                   ),
+                ),
+                const SizedBox(width: 4),
+                IconButton(
+                  onPressed: _annulerRechercheItineraire,
+                  icon: const Icon(Icons.close, size: 20),
+                  color: sombre ? Colors.white70 : Colors.black54,
+                  tooltip: 'Annuler la recherche',
+                  visualDensity: VisualDensity.compact,
                 ),
               ],
             ),
@@ -1922,61 +2215,216 @@ class _TrafficScreenState extends State<TrafficScreen>
     );
   }
 
-  /// Bannière du trajet en cours (distance + durée + annulation).
+  /// Bannière du trajet en cours : « Itinéraire tracé », heure d'arrivée
+  /// estimée (distance · durée) et pastille discrète quand une étape est
+  /// ajoutée au parcours. Apparition douce (fondu + glissement).
+  ///
+  /// Distance, durée et heure d'arrivée restent figées entre deux paliers et
+  /// se recalculent seulement à chaque 1/5 du trajet (20 %, 40 %, 60 %,
+  /// 80 %, arrivée). Seuls les chiffres changent : pas de message.
   Widget _construireBanniereItineraire() {
-    final itineraire = _itineraire!;
+    _mettreAJourBanniere();
+    final sombre = Theme.of(context).brightness == Brightness.dark;
+    final couleurTitre = sombre ? Colors.white : KinColors.texteClair;
+    final couleurSecondaire = sombre
+        ? KinColors.texteSecondaireSombre
+        : KinColors.texteSecondaireClair;
+    final couleurArrivee = sombre ? const Color(0xFF4CD98E) : KinColors.primaryFonce;
+    final arrivee = DateTime.now()
+        .add(Duration(seconds: _banniereDureeRestante.round()));
+    final avecEtape = _etapes.isNotEmpty;
+
     return Positioned(
       top: 8,
-      left: 0,
-      right: 0,
+      left: 12,
+      right: 12,
       child: Center(
-        child: Material(
-          color: Theme.of(context).brightness == Brightness.dark
-              ? KinColors.surfaceSombre
-              : Colors.white,
-          elevation: 4,
-          borderRadius: BorderRadius.circular(24),
-          child: Padding(
-            padding: const EdgeInsets.only(left: 16, right: 4),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.route, color: KinColors.primary, size: 20),
-                const SizedBox(width: 8),
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      _formatDistance(itineraire.distanceMeters),
-                      style: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.bold,
-                        color: KinColors.texteClair,
+        child: TweenAnimationBuilder<double>(
+          tween: Tween(begin: 0.0, end: 1.0),
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOutCubic,
+          builder: (context, t, child) => Opacity(
+            opacity: t,
+            child: Transform.translate(
+              offset: Offset(0, -10 * (1 - t)),
+              child: child,
+            ),
+          ),
+          child: Material(
+            color: sombre ? KinColors.surfaceSombre : Colors.white,
+            elevation: 4,
+            shadowColor: Colors.black.withValues(alpha: 0.28),
+            borderRadius: BorderRadius.circular(20),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: sombre
+                            ? const [Color(0xFF4CD98E), KinColors.primary]
+                            : [KinColors.primaryClair, KinColors.primaryFonce],
                       ),
+                      borderRadius: BorderRadius.circular(14),
                     ),
-                    Text(
-                      _formatDuree(itineraire.durationSeconds),
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: KinColors.texteSecondaireClair,
+                    child: const Icon(Icons.route, color: Colors.white, size: 22),
+                  ),
+                  const SizedBox(width: 12),
+                  Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'Itinéraire tracé',
+                            style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                              color: couleurTitre,
+                            ),
+                          ),
+                          if (avecEtape) ...[
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 7,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: KinColors.accent.withValues(alpha: 0.16),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    MdiIcons.flagCheckered,
+                                    size: 12,
+                                    color: KinColors.accentTranche,
+                                  ),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    '1 étape',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                      color: sombre
+                                          ? const Color(0xFFFFC94D)
+                                          : KinColors.accentTranche,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
-                    ),
-                  ],
-                ),
-                const SizedBox(width: 4),
-                IconButton(
-                  onPressed: annulerItineraire,
-                  icon: const Icon(Icons.close, size: 18),
-                  color: KinColors.texteSecondaireClair,
-                  tooltip: 'Annuler l\'itinéraire',
-                ),
-              ],
+                      const SizedBox(height: 3),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(
+                            Icons.schedule,
+                            size: 13,
+                            color: KinColors.accent,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Arrivée à ${formaterHeure(arrivee)}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: couleurArrivee,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            '·',
+                            style: TextStyle(color: couleurSecondaire),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            '${formaterDistance(_banniereDistanceRestante)} · '
+                            '${formaterDuree(_banniereDureeRestante)}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: couleurSecondaire,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(width: 4),
+                  IconButton(
+                    onPressed: annulerItineraire,
+                    icon: const Icon(Icons.close, size: 18),
+                    color: couleurSecondaire,
+                    tooltip: 'Annuler l\'itinéraire',
+                  ),
+                ],
+              ),
             ),
           ),
         ),
       ),
     );
+  }
+
+  /// Met à jour les valeurs restantes affichées dans la bannière, mais
+  /// uniquement quand un palier est franchi : tout les 1/5 du trajet (20 %,
+  /// 40 %, 60 %, 80 %, arrivée). Entre deux paliers les chiffres restent
+  /// figés. Discret : aucun message, seuls les nombres changent.
+  void _mettreAJourBanniere() {
+    final itineraire = _itineraire;
+    if (itineraire == null || itineraire.distanceMeters <= 0) return;
+    final distanceRestante = _distanceRestanteMetres();
+    final fractionRestante = distanceRestante / itineraire.distanceMeters;
+    if (fractionRestante <= _paliersBanniere[_bannierePalier]) {
+      _banniereDistanceRestante = distanceRestante;
+      _banniereDureeRestante = itineraire.durationSeconds * fractionRestante;
+      if (_bannierePalier < _paliersBanniere.length - 1) _bannierePalier++;
+    }
+  }
+
+  /// Distance (mètres) restant à parcourir jusqu'à l'arrivée, calculée en
+  /// projetant la position courante sur le tracé de l'itinéraire. Sans
+  /// position valide (trajet pas commencé), renvoie la distance totale.
+  double _distanceRestanteMetres() {
+    final itineraire = _itineraire;
+    final pos = positionActuelle;
+    if (itineraire == null) return 0;
+    final points = itineraire.points;
+    if (points.length < 2 || pos == null) return itineraire.distanceMeters;
+
+    final p = LatLng(pos.latitude, pos.longitude);
+
+    // Longueur cumulée le long de la polyligne (= chainage « traveled »).
+    final cumuls = <double>[0];
+    double total = 0;
+    for (var i = 0; i < points.length - 1; i++) {
+      total += distanceMetres(points[i], points[i + 1]);
+      cumuls.add(total);
+    }
+
+    // Projette la position sur chaque segment et retient le point du tracé
+    // le plus proche, mesuré en distance parcourue depuis le départ.
+    var parcouru = 0.0;
+    final proj = projeterSurAlignes(p, points);
+    if (proj != null) {
+      parcouru = cumuls[proj.index] +
+          proj.t * (cumuls[proj.index + 1] - cumuls[proj.index]);
+    }
+
+    return (total - parcouru).clamp(0.0, itineraire.distanceMeters);
   }
 
   /// Barre inférieure : état en cours, bouton recentrer et bouton trafic.

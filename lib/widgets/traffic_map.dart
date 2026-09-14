@@ -1,19 +1,32 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:math' show Point, exp, max, min;
-import 'package:flutter/foundation.dart' show compute, debugPrint, kIsWeb;
+import 'dart:math'
+    show Point, cos, exp, max, min;
+import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
-import 'package:flutter_map/flutter_map.dart';
-import 'package:http/http.dart' as http;
+import 'package:flutter_map/flutter_map.dart' hide LatLngTween;
 import 'package:latlong2/latlong.dart' hide Path;
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_map_tile_caching/flutter_map_tile_caching.dart';
+import '../config/carte.dart' show bornesAfrique, zoomMinGlobal;
 import '../main.dart'
     show tileDownloadService, waitForFmtc, initFmtc, fmtcSucceeded;
 import '../models/road_segment.dart';
 import '../models/traffic_state.dart';
 import '../theme/kinflow_theme.dart';
+import '../utils/geo.dart' show deltaRotation, distanceMetresHaversine, normaliserDegre;
+import '../utils/latlng_tween.dart';
+import '../services/poi_service.dart'
+    show
+        Poi,
+        PoiService,
+        CircuitBreakerPois,
+        iconePoi,
+        maxPoisVisiblesParType,
+        prioritePoi,
+        zoomMinPois,
+        zoomNomPois;
+import '../services/rendu_itineraire.dart' show decouperItineraireParEtat;
 import '../services/road_service.dart';
 import '../services/diagnostics_service.dart';
 import '../services/data_usage_service.dart';
@@ -22,6 +35,8 @@ import '../services/traffic_simulator.dart';
 import '../services/traffic_stats_service.dart';
 import '../services/supabase_service.dart';
 import '../services/orientation_navigation.dart';
+import 'map_controls.dart';
+import 'map_painters.dart' show PeintreEpingle, PeintreEtape;
 
 
 class _SegmentsParZone {
@@ -39,26 +54,26 @@ class _SegmentsParZone {
         grille = _indexerSegments(segments);
 }
 
-class _Poi {
-  final LatLng point;
-  final String nom;
-  final String type;
-  const _Poi(this.point, this.nom, this.type);
-}
-
-const double _zoomMinGlobal = 8.0;
 const double _rayonLabel = 40.0;
-const double _zoomMinPois = 14.0;
-const double _zoomNomPois = 16.5;
-const int _maxPois = 500;
-const int _maxPoisParType = 30;
-const int _maxPoisVisiblesParType = 10;
 
 /// Plafond de tronçons dessinés simultanément : au-delà, les classes de rue
 /// les moins importantes sont abandonnées. Sans ce garde-fou, une vue dense
 /// de Kinshasa au zoom ≥ 15 produit des dizaines de milliers de polylignes
 /// repeintes à CHAQUE frame — c'est ce qui rendait la carte inexploitable.
 const int _maxPolylignes = 1600;
+
+/// Plafond réduit pendant la nuit (00h → 6h) : le trafic est absent, inutile
+/// de peindre toutes les ruelles. Division du coût de rendu par ~2, les
+/// grands axes restent prioritaires (tri par classe de rue inchangé).
+const int _maxPolylignesNuit = 800;
+
+/// Fenêtre nocturne 00h → 6h (le pic du matin démarre vers 5h00 dans le
+/// simulateur) : toutes les rues passent en vert uniforme et le travail de
+/// la carte est réduit tant que la ville dort.
+bool _estNuit() {
+  final h = DateTime.now().hour;
+  return h >= 0 && h < 6;
+}
 
 /// Mode navigation : raideur du lissage exponentiel caméra (par seconde).
 const double _navFacteurLissage = 5.0;
@@ -68,6 +83,13 @@ const double _navFacteurLissage = 5.0;
 /// quand le cap GPS varie vite ou bruite (le seuil bas de 10° déclenche des
 /// recadrages fréquents, un raideur élevée les rendrait secoués).
 const double _navFacteurLissageRotation = 1.5;
+
+/// Mode navigation : écart angulaire minimal (degrés) entre la rotation
+/// caméra courante et le cap filtré pour reprogrammer une adaptation
+/// continue de l'orientation. Sous ce seuil la carte reste figée : le filtre
+/// circulaire du cap suffit déjà à éliminer le bruit, il ne faut pas en
+/// plus faire « danser » la caméra sur des micro-variations.
+const double _seuilRotationContinueDegres = 4.0;
 
 /// Mode navigation : part de la hauteur d'écran séparant le centre réel de
 /// la caméra du point utilisateur (placé plus bas, vers le tiers inférieur).
@@ -112,20 +134,19 @@ Map<int, List<int>> _indexerSegments(List<RoadSegment> segments) {
       }
     }
   }
-  return grille;
-}
-
-final LatLngBounds _limitesAfrique = LatLngBounds(
-  const LatLng(-35.0, -18.0),
-  const LatLng(37.5, 52.0),
-);
+return grille;
+  }
 
 /// Styles de fond de carte, choisis indépendamment du thème clair/sombre
 /// de l'application.
 enum _ModeCarte {
   claire,
   sombre,
-  satellite;
+  satellite,
+  positron,
+  darkMatter,
+  voyager,
+  topo;
 }
 
 const String _urlTuiles =
@@ -137,6 +158,18 @@ const String _urlTuilesSombre = _urlTuiles;
 
 const String _urlTuilesSatellite =
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+
+const String _urlTuilesPositron =
+    'https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png';
+
+const String _urlTuilesDarkMatter =
+    'https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png';
+
+const String _urlTuilesVoyager =
+    'https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png';
+
+const String _urlTuilesTopo =
+    'https://tile.opentopomap.org/{z}/{x}/{y}.png';
 
 const Map<String, double> _zoomMinParClasse = {
   'motorway': 6.0,
@@ -156,217 +189,6 @@ const Map<String, double> _zoomMinParClasse = {
   'service': 15.0,
 };
 
-List<_Poi> _parserPois(dynamic json) {
-  final resultats = <_Poi>[];
-  final elements =
-      (json as Map<String, dynamic>)['elements'] as List? ?? const [];
-
-  for (final e in elements) {
-    final tags = (e['tags'] as Map<String, dynamic>?) ?? const {};
-
-    double? lat = (e['lat'] as num?)?.toDouble();
-    double? lon = (e['lon'] as num?)?.toDouble();
-    if (lat == null || lon == null) {
-      final centre = (e['center'] as Map?) ?? const {};
-      lat = (centre['lat'] as num?)?.toDouble();
-      lon = (centre['lon'] as num?)?.toDouble();
-    }
-    if (lat == null || lon == null) continue;
-
-    final type = (tags['amenity'] ??
-            tags['shop'] ??
-            tags['tourism'] ??
-            tags['leisure'] ??
-            tags['office']
-        ).toString();
-    if (type.isEmpty) continue;
-
-    final nom = (tags['name'] ?? '').toString();
-
-    resultats.add(_Poi(LatLng(lat, lon), nom, type));
-  }
-
-  final parType = <String, List<_Poi>>{};
-  for (final poi in resultats) {
-    final liste = parType.putIfAbsent(poi.type, () => []);
-    if (liste.length < _maxPoisParType) liste.add(poi);
-  }
-
-  final limites = <_Poi>[
-    for (final liste in parType.values) ...liste,
-  ];
-
-  limites.sort((a, b) {
-    final aNom = a.nom.isEmpty ? 1 : 0;
-    final bNom = b.nom.isEmpty ? 1 : 0;
-    if (aNom != bNom) return aNom - bNom;
-    return _prioritePoi(a.type).compareTo(_prioritePoi(b.type));
-  });
-
-  return limites.take(_maxPois).toList();
-}
-
-(IconData, Color) _iconePoi(String type) {
-  switch (type) {
-    case 'restaurant':
-    case 'cafe':
-    case 'bar':
-    case 'pub':
-      return (Icons.restaurant, const Color(0xFFE65100));
-    case 'school':
-    case 'college':
-    case 'university':
-      return (Icons.school, const Color(0xFF6A1B9A));
-    case 'hospital':
-    case 'clinic':
-      return (Icons.local_hospital, const Color(0xFFC62828));
-    case 'pharmacy':
-      return (Icons.local_pharmacy, const Color(0xFFE53935));
-    case 'bank':
-      return (Icons.account_balance, const Color(0xFF00695C));
-    case 'marketplace':
-    case 'market':
-      return (Icons.storefront, const Color(0xFFEF6C00));
-    case 'place_of_worship':
-    case 'church':
-    case 'mosque':
-      return (Icons.church, const Color(0xFF6D4C41));
-    case 'fuel':
-      return (Icons.local_gas_station, const Color(0xFF37474F));
-    case 'police':
-      return (Icons.local_police, const Color(0xFF283593));
-    case 'fire_station':
-      return (Icons.local_fire_department, const Color(0xFFD32F2F));
-    case 'post_office':
-      return (Icons.local_post_office, const Color(0xFF1565C0));
-    case 'library':
-      return (Icons.local_library, const Color(0xFFF57F17));
-    case 'cinema':
-      return (Icons.movie, const Color(0xFF7B1FA2));
-    case 'theatre':
-      return (Icons.theater_comedy, const Color(0xFF8E24AA));
-    case 'parking':
-      return (Icons.local_parking, const Color(0xFF1565C0));
-    case 'taxi':
-      return (Icons.local_taxi, const Color(0xFFF9A825));
-    case 'supermarket':
-      return (Icons.shopping_cart, const Color(0xFF2E7D32));
-    case 'mall':
-      return (Icons.local_mall, const Color(0xFF388E3C));
-    case 'convenience':
-    case 'general':
-    case 'bakery':
-    case 'butcher':
-      return (Icons.store, const Color(0xFF00897B));
-    case 'hotel':
-    case 'guest_house':
-      return (Icons.hotel, const Color(0xFF1E88E5));
-    case 'museum':
-      return (Icons.museum, const Color(0xFF5D4037));
-    case 'attraction':
-      return (Icons.attractions, const Color(0xFFD81B60));
-    case 'viewpoint':
-      return (Icons.photo_camera, const Color(0xFF43A047));
-    case 'park':
-      return (Icons.park, const Color(0xFF2E7D32));
-    case 'stadium':
-    case 'sports_centre':
-      return (Icons.stadium, const Color(0xFFEF6C00));
-    case 'government':
-    case 'embassy':
-      return (Icons.account_balance, const Color(0xFF455A64));
-    default:
-      return (Icons.place, const Color(0xFF757575));
-  }
-}
-
-int _prioritePoi(String type) {
-  switch (type) {
-    case 'hospital':
-    case 'clinic':
-      return 0;
-    case 'school':
-    case 'college':
-    case 'university':
-      return 1;
-    case 'marketplace':
-    case 'market':
-      return 2;
-    case 'fuel':
-      return 3;
-    case 'police':
-      return 4;
-    case 'fire_station':
-      return 5;
-    case 'place_of_worship':
-    case 'church':
-    case 'mosque':
-      return 6;
-    case 'bank':
-      return 7;
-    case 'pharmacy':
-      return 8;
-    case 'post_office':
-      return 9;
-    case 'library':
-      return 10;
-    case 'parking':
-      return 11;
-    case 'park':
-      return 12;
-    case 'hotel':
-    case 'guest_house':
-      return 13;
-    case 'supermarket':
-    case 'mall':
-      return 14;
-    case 'museum':
-      return 15;
-    case 'cinema':
-    case 'theatre':
-      return 16;
-    case 'stadium':
-    case 'sports_centre':
-      return 17;
-    case 'taxi':
-      return 18;
-    case 'government':
-    case 'embassy':
-      return 19;
-    case 'restaurant':
-      return 20;
-    case 'cafe':
-      return 21;
-    case 'bar':
-    case 'pub':
-      return 22;
-    case 'convenience':
-    case 'general':
-    case 'bakery':
-    case 'butcher':
-      return 23;
-    case 'attraction':
-    case 'viewpoint':
-      return 24;
-    default:
-      return 25;
-  }
-}
-
-class LatLngTween extends Tween<LatLng> {
-  LatLngTween({super.begin, super.end});
-
-  @override
-  LatLng lerp(double t) {
-    final b = begin!;
-    final e = end!;
-    return LatLng(
-      b.latitude + (e.latitude - b.latitude) * t,
-      b.longitude + (e.longitude - b.longitude) * t,
-    );
-  }
-}
-
 class TrafficMap extends StatefulWidget {
 
   final MapController mapController;
@@ -376,6 +198,13 @@ class TrafficMap extends StatefulWidget {
   final LatLng? lieuRecherche;
 
   final bool afficherLignesTrafic;
+
+  /// Vrai pendant le calcul d'un itinéraire : toute l'activité de la carte
+  /// (polylignes de trafic, chargement des routes, POIs, zones, prefetch de
+  /// tuiles et leurs timers) est suspendue pour laisser toute la bande
+  /// passante et le CPU au calcul. Le rendu du fond de carte et les
+  /// interactions (recentrage, zoom) restent normaux.
+  final bool suspendreTravailCarte;
 
   final VoidCallback onMapReady;
 
@@ -395,6 +224,11 @@ class TrafficMap extends StatefulWidget {
   final VoidCallback? onUserInteract;
 
   final LatLng? epingle;
+
+  /// Appelé quand l'utilisateur pose l'épingle de prévisualisation qui suit
+  /// le centre de l'écran (bouton « Poser ») : fournit la coordonnée
+  /// géographique actuellement au centre de la carte.
+  final ValueChanged<LatLng>? onPoserEpingle;
 
   final LatLng? pointActions;
 
@@ -430,6 +264,13 @@ class TrafficMap extends StatefulWidget {
   /// dernier point) : les pointillés noirs reprennent ensuite jusqu'à
   /// l'arrivée réelle.
   final int itineraireFinRoute;
+
+  /// Segments (id OSM) du réseau routier qui forment le tracé bleu → vert,
+  /// renseignés par le moteur local. Quand ils sont présents, la carte
+  /// n'affiche QUE ces polylignes colorées déjà chargées (l'itinéraire EST
+  /// la ligne de circulation) et masque tout le reste. Null sans itinéraire
+  /// ou en repli OSRM.
+  final List<int>? itineraireSegmentIds;
 
   /// Pin vert de la destination de l'itinéraire en cours (null sinon) :
   /// reste visible même quand un autre lieu est ensuite recherché.
@@ -480,6 +321,8 @@ class TrafficMap extends StatefulWidget {
 
     this.afficherLignesTrafic = true,
 
+    this.suspendreTravailCarte = false,
+
     required this.onMapReady,
 
     this.onMapTap,
@@ -498,6 +341,8 @@ class TrafficMap extends StatefulWidget {
 
     this.epingle,
 
+    this.onPoserEpingle,
+
     this.pointActions,
 
     this.actionsSurEpingle = false,
@@ -515,6 +360,8 @@ class TrafficMap extends StatefulWidget {
     this.itineraireDebutVisuel = -1,
 
     this.itineraireFinRoute = -1,
+
+    this.itineraireSegmentIds,
 
     this.pointDestination,
 
@@ -549,13 +396,28 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   bool _fmtcReady = false;
   bool _carteRendue = false;
   _ModeCarte _modeCarte = _ModeCarte.claire;
+  final ScrollController _menuCartesScroll = ScrollController();
   FMTCTileProvider? _tileProvider;
   Timer? _timerConsoTuiles;
   int _tailleCachePrecedenteKiBToOctets = 0;
 
+  /// Prétéléchargement des tuiles du couloir d'itinéraire : instance FMTC
+  /// dédiée (annulée avant chaque nouvelle passe) et zooms de la vue
+  /// d'ensemble, plafonnés pour ne jamais vider le réseau ni la batterie.
+  static const String _instanceIdTuilesCouloir = 'kinflow_couloir_itineraire';
+  static const List<int> _zoomsPrechargementCouloir = [11, 12, 13, 14, 15];
+  static const int _maxTuilesTotalesCouloir = 600;
+
   /// Vrai quand le fond est sombre (carte sombre ou satellite) : sert aux
   /// réglages de contraste (contours, drapeaux) indépendants du thème.
-  bool get _fondSombre => _modeCarte != _ModeCarte.claire;
+  bool get _fondSombre =>
+      _modeCarte == _ModeCarte.sombre ||
+      _modeCarte == _ModeCarte.darkMatter ||
+      _modeCarte == _ModeCarte.satellite;
+
+  /// Plafond de tronçons dessinés selon l'heure : réduit de nuit pour
+  /// alléger le rendu quand le trafic est inexistant.
+  int get _plafondPolylignes => _estNuit() ? _maxPolylignesNuit : _maxPolylignes;
 
   String _lastStatus = '';
   double _downloadProgress = 0;
@@ -611,6 +473,12 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// même valeur fausserait sa dynamique).
   Position? _navDerniereMesure;
 
+  /// Position à laquelle la dernière adaptation CONTINUE de rotation a été
+  /// appliquée : l'adaptation ne doit tourner la carte qu'après un réel
+  /// déplacement ([seuilDistanceMetres]), sinon le cap filtré qui dérive à
+  /// l'arrêt ferait pivoter la carte immobile.
+  LatLng? _navDernierePositionRotationContinue;
+
   Timer? _longPressTimer;
   Timer? _zoomOutTimer;
   Timer? _singleTapTimer;
@@ -628,6 +496,25 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   bool _appuiBoutonAction = false;
   bool _pointeurBouge = false;
 
+  /// Nombre de gestes utilisateur en cours (glisser, pincer, pivoter,
+  /// double-clic de zoom). Tant qu'il est strictement positif, le ticker de
+  /// suivi navigation suspend son écriture de la caméra : sans cela il
+  /// réécrirait chaque frame au milieu du geste et « résisterait » au zoom.
+  int _gestesActifs = 0;
+
+  /// Mode pose d'épingle : une épingle de prévisualisation est collée au
+  /// centre de l'écran et suit la carte tant que l'utilisateur ne l'a pas
+  /// posée avec le bouton « Poser ».
+  bool _modePoserEpingle = false;
+
+  /// Opacité des boutons flottants (pose d'épingle, cartes) : pleine après
+  /// une interaction, puis atténuée quand l'utilisateur reste longtemps sans
+  /// les toucher.
+  bool _boutonsVisibles = true;
+  Timer? _timerBoutons;
+  static const Duration _dureeAvantEstompage = Duration(seconds: 8);
+  static const double _opaciteBoutonsInactifs = 0.35;
+
   final RoadService _roadService = RoadService();
   final TrafficSimulator _simulateur = TrafficSimulator();
   final TrafficStatsService _statsService = TrafficStatsService();
@@ -640,6 +527,11 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   List<Polyline> _polylignesTrafic = [];
   List<Polyline> _polylignesTraficCache = [];
   List<Polyline> _polylignesItineraire = [];
+
+  /// Raccord en pointillés noirs reliant l'étape à l'itinéraire quand elle est
+  /// posée hors réseau routier (bâtiment, parcelle). Vide sinon.
+  List<Polyline> _raccordEtape = [];
+
   final Map<String, _SegmentsParZone> _segmentsCache = {};
   Timer? _debounceRoutes;
   Timer? _debounceRoutesPrefetch;
@@ -650,10 +542,21 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
 
   List<ZoneTrafic> _zonesTrafic = [];
 
-  List<_Poi> _pois = [];
-  final Map<String, List<_Poi>> _poiCache = {};
+  List<Poi> _pois = [];
+  final Map<String, List<Poi>> _poiCache = {};
   Timer? _debouncePois;
   int _signatureZoom = -1;
+  final PoiService _poiService = PoiService();
+
+  /// Nombre d'échecs consécutifs de chargement des routes : sert au repli
+  /// exponentiel (5 s, 15 s, 35 s, 75 s… plafonné) pour éviter de marteler
+  /// Overpass quand le réseau est mauvais. Réinitialisé dès un succès.
+  int _tentativesRoutes = 0;
+
+  /// Nombre d'échecs consécutifs de chargement des POIs : même repli
+  /// exponentiel que les routes (5 s → 15 s → 35 s… plafonné), pour ne pas
+  /// asphyxier Overpass avec des retries rapprochés sur réseau instable.
+  int _tentativesPois = 0;
 
   @override
   void initState() {
@@ -687,11 +590,23 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       const Duration(minutes: 3),
       (_) => _chargerZonesTrafic(),
     );
+
+    _interactionSurBoutons();
   }
 
   @override
   void didUpdateWidget(TrafficMap oldWidget) {
     super.didUpdateWidget(oldWidget);
+
+    // Pendant le calcul d'un itinéraire, tout le travail de la carte
+    // (polylignes, routes, POIs, zones, tuiles, timers) est suspendu.
+    if (widget.suspendreTravailCarte &&
+        !oldWidget.suspendreTravailCarte) {
+      _mettreEnPauseTravailCarte();
+    } else if (!widget.suspendreTravailCarte &&
+        oldWidget.suspendreTravailCarte) {
+      _reprendreTravailCarte();
+    }
 
     if (widget.modeSombre != oldWidget.modeSombre) {
       final nouveauMode = widget.modeSombre
@@ -725,6 +640,11 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
           // Itinéraire annulé : on recharge la vue pour afficher toutes les
           // rues de la zone courante.
           unawaited(_chargerRoutes());
+        } else {
+          // Nouveau tracé : on préchauffe les tuiles du fond de carte le
+          // long du couloir pour éviter l'écran blanc de 1 à 2 s pendant
+          // l'animation de la vue d'ensemble.
+          unawaited(_prechargerTuilesCouloir(widget.itinerairePoints!));
         }
       });
     } else if (widget.itineraireDebutVisuel !=
@@ -732,6 +652,15 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       // Le suivi réél a avancé : la portion parcourue derrière l'utilisateur
       // doit disparaître du rendu. On rebâtit juste les polylignes.
       _reconstruirePolylignes();
+    }
+
+    // Nouvelle étape posée (ou retirée) : son raccord en pointillés, si elle
+    // est hors chaussée, doit être reconstruit même quand le tracé reste le
+    // même objet.
+    if (!identical(oldWidget.pointEtape, widget.pointEtape)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _reconstruirePolylignes();
+      });
     }
 
     // Bouton « lignes » réactivé : rien n'a été construit pendant qu'elles
@@ -745,22 +674,63 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       _reconstruirePolylignes();
     }
 
+    // Nouvel itinéraire calculé (segments du tracé connus) : on précharge le
+    // couloir bleu → vert dans le cache local pour pouvoir afficher le tracé
+    // comme lignes de circulation colorées (rien n'est re-tracé).
+    if (!identical(
+        oldWidget.itineraireSegmentIds, widget.itineraireSegmentIds)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (widget.itineraireSegmentIds != null &&
+            widget.itineraireSegmentIds!.isNotEmpty) {
+          unawaited(_prechargerCouloirItineraire());
+        } else {
+          _reconstruirePolylignes();
+        }
+      });
+    }
+
     final newPos = widget.positionActuelle;
     if (newPos != null) {
       final newLatLng = LatLng(newPos.latitude, newPos.longitude);
       final oldPos = _displayedPosition;
 
-      if (oldPos == null) {
-        _displayedPosition = newLatLng;
-      } else {
+      void nettoyerAnimation() {
         _positionAnimController?.stop();
         _positionAnimController?.dispose();
+        _positionAnimController = null;
+        _positionAnimation = null;
+      }
+
+      if (widget.modeNavigation) {
+        // En navigation la caméra suit elle-même (ticker) : on pose le point
+        // bleu directement sur la fix neuve. Le tween 300 ms déclenchait un
+        // setState PAR TRAME → re-construction des couches polylignes
+        // (600→1600) à chaque frame, d'où les ratés du point bleu quand le
+        // trafic est affiché. La caméra lissée absorbe la discontinuité.
+        nettoyerAnimation();
+        _displayedPosition = newLatLng;
+      } else if (oldPos == null) {
+        _displayedPosition = newLatLng;
+      } else {
+        // Une nouvelle mesure GPS arrive parfois en plein milieu de
+        // l'animation précédente (distanceFilter=1m en déplacement) :
+        // reprendre depuis la POSITION VISIBLE ACTUELLE, pas depuis
+        // l'ancienne cible, sinon le point bleu repart en arrière d'un coup
+        // puis ré-accélère → zigzags « bizarres » pendant le déplacement.
+        final animVisible = _positionAnimController;
+        final enCours = animVisible?.isAnimating ?? false;
+        final base = enCours && _positionAnimation != null
+            ? _positionAnimation!.value
+            : oldPos;
+
+        nettoyerAnimation();
         _positionAnimController = AnimationController(
           vsync: this,
           duration: const Duration(milliseconds: 300),
         );
         _positionAnimation = LatLngTween(
-          begin: oldPos,
+          begin: base,
           end: newLatLng,
         ).animate(CurvedAnimation(
           parent: _positionAnimController!,
@@ -827,7 +797,12 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
         );
         _singleTapTimer = Timer(const Duration(milliseconds: 180), () {
           if (!mounted) return;
-          widget.onMapTap?.call(point);
+          // En mode pose d'épingle, un appui simple ne doit ni sélectionner
+          // un pin ni ouvrir les infos d'un lieu : la carte sert uniquement
+          // à être déplacée sous l'épingle de prévisualisation.
+          if (!_modePoserEpingle) {
+            widget.onMapTap?.call(point);
+          }
           _singleTapTimer = null;
         });
       }
@@ -859,6 +834,47 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     _appuiBoutonAction = false;
   }
 
+  /// Coupe tout le travail périodique de la carte (polylignes, routes, POIs,
+  /// zones, prefetch de tuiles) pendant le calcul d'un itinéraire : plus
+  /// aucun timer ne se déclenche, les chargements en attente sont annulés.
+  void _mettreEnPauseTravailCarte() {
+    _rafraichissementSimulation?.cancel();
+    _rafraichissementRoutes?.cancel();
+    _rafraichissementPrefetch?.cancel();
+    _rafraichissementStats?.cancel();
+    _debounceRoutes?.cancel();
+    _debounceRoutesPrefetch?.cancel();
+    _debouncePois?.cancel();
+  }
+
+  /// Reprend le travail de la carte après le calcul : relance les timers et
+  /// rebâtit la vue courante (polylignes, POIs, routes, zones) immédiatement.
+  void _reprendreTravailCarte() {
+    _rafraichissementSimulation = Timer.periodic(
+      const Duration(minutes: 5),
+      (_) => _reconstruirePolylignes(),
+    );
+    _rafraichissementRoutes = Timer.periodic(
+      const Duration(hours: 4),
+      (_) => _chargerRoutes(),
+    );
+    _rafraichissementPrefetch = Timer.periodic(
+      const Duration(minutes: 2),
+      (_) => _prefetchTuiles(),
+    );
+    _rafraichissementStats = Timer.periodic(
+      const Duration(minutes: 3),
+      (_) => _chargerZonesTrafic(),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _reconstruirePolylignes();
+      unawaited(_chargerPois());
+      unawaited(_chargerRoutes());
+      unawaited(_chargerZonesTrafic());
+    });
+  }
+
   @override
   void dispose() {
     _rafraichissementSimulation?.cancel();
@@ -876,9 +892,11 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     _timerFinChargement?.cancel();
     _timerConsoTuiles?.cancel();
     _timerConsoTuiles = null;
+    _timerBoutons?.cancel();
     _annulerLongPress();
     _statusSub?.cancel();
     _progressSub?.cancel();
+    _menuCartesScroll.dispose();
     super.dispose();
   }
 
@@ -963,6 +981,10 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// collaboratif (rayon qui grandit avec le nombre de témoins).
   Future<void> _chargerZonesTrafic() async {
     if (!_fmtcReady || !mounted) return;
+    if (widget.suspendreTravailCarte) return;
+    // Nuit : tout est vert, les signalements des autres ne changent rien à
+    // l'affichage. On économise l'appel Supabase toutes les 3 minutes.
+    if (_estNuit()) return;
     final brut = await SupabaseService().chargerSignalementsRecents();
     if (!mounted) return;
     final zones = _statsService.calculerZones(
@@ -985,55 +1007,135 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     return null;
   }
 
+  void _basculerModePoserEpingle() {
+    _interactionSurBoutons();
+    setState(() => _modePoserEpingle = !_modePoserEpingle);
+    if (_modePoserEpingle) {
+      // Pendant la pose, la carte doit rester entièrement libre sous
+      // l'épingle : on coupe le suivi navigation et tout geste en attente.
+      widget.onNavigationInterrompue?.call();
+      _annulerSansTap();
+    }
+  }
+
+  /// Réveille les boutons flottants (opacité pleine) et reprogramme leur
+  /// estompage : appelé à chaque interaction de l'utilisateur avec la carte
+  /// ou les boutons eux-mêmes.
+  void _interactionSurBoutons() {
+    _timerBoutons?.cancel();
+    if (!_boutonsVisibles) {
+      if (mounted) setState(() => _boutonsVisibles = true);
+    }
+    _timerBoutons = Timer(_dureeAvantEstompage, () {
+      if (!mounted) return;
+      if (_modePoserEpingle) {
+        _interactionSurBoutons();
+        return;
+      }
+      setState(() => _boutonsVisibles = false);
+    });
+  }
+
+  /// Pose l'épingle de prévisualisation à la coordonnée géographique
+  /// actuellement au centre de l'écran, puis quitte le mode pose.
+  void _poserEpingle() {
+    final centre = widget.mapController.camera.center;
+    if (!centre.latitude.isFinite || !centre.longitude.isFinite) return;
+    setState(() => _modePoserEpingle = false);
+    widget.onPoserEpingle?.call(centre);
+  }
+
   void _ouvrirMenuCartes() {
     if (!_fmtcReady || !mounted) return;
+    _interactionSurBoutons();
     final sombre = _modeCarte == _ModeCarte.sombre;
     showModalBottomSheet<void>(
       context: context,
+      // Contrôle la hauteur nous-mêmes : sans cela la feuille est plafonnée
+      // et le geste de glissement sert à la fermer, pas à défiler la liste.
+      isScrollControlled: true,
       backgroundColor:
           sombre ? KinColors.surfaceSombre : Colors.white,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text(
-                'Cartes',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                  color: sombre ? KinColors.texteSombre : Colors.black87,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(context).height * 0.6,
+          ),
+          child: Scrollbar(
+            thumbVisibility: true,
+            controller: _menuCartesScroll,
+            child: ListView(
+              controller: _menuCartesScroll,
+              padding: EdgeInsets.zero,
+              children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Cartes',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: sombre ? KinColors.texteSombre : Colors.black87,
+                  ),
                 ),
               ),
-            ),
-            _OptionModeCarte(
-              icone: Icons.light_mode,
-              libelle: 'Claire',
-              selectionne: _modeCarte == _ModeCarte.claire,
+              OptionModeCarte(
+                icone: Icons.light_mode,
+                libelle: 'Claire',
+                selectionne: _modeCarte == _ModeCarte.claire,
+                sombre: sombre,
+                onTap: () => _choisirMode(_ModeCarte.claire),
+              ),
+              OptionModeCarte(
+                icone: Icons.dark_mode,
+                libelle: 'Sombre',
+                selectionne: _modeCarte == _ModeCarte.sombre,
+                sombre: sombre,
+                onTap: () => _choisirMode(_ModeCarte.sombre),
+              ),
+              OptionModeCarte(
+                icone: Icons.satellite_alt,
+                libelle: 'Satellite',
+                selectionne: _modeCarte == _ModeCarte.satellite,
+                sombre: sombre,
+                onTap: () => _choisirMode(_ModeCarte.satellite),
+              ),
+              OptionModeCarte(
+                icone: Icons.wb_sunny,
+                libelle: 'Positron',
+                selectionne: _modeCarte == _ModeCarte.positron,
+                sombre: sombre,
+                onTap: () => _choisirMode(_ModeCarte.positron),
+              ),
+              OptionModeCarte(
+                icone: Icons.nightlight_round,
+                libelle: 'Dark Matter',
+                selectionne: _modeCarte == _ModeCarte.darkMatter,
+                sombre: sombre,
+                onTap: () => _choisirMode(_ModeCarte.darkMatter),
+              ),
+OptionModeCarte(
+              icone: Icons.explore,
+              libelle: 'Voyager',
+              selectionne: _modeCarte == _ModeCarte.voyager,
               sombre: sombre,
-              onTap: () => _choisirMode(_ModeCarte.claire),
+              onTap: () => _choisirMode(_ModeCarte.voyager),
             ),
-            _OptionModeCarte(
-              icone: Icons.dark_mode,
-              libelle: 'Sombre',
-              selectionne: _modeCarte == _ModeCarte.sombre,
-              sombre: sombre,
-              onTap: () => _choisirMode(_ModeCarte.sombre),
-            ),
-            _OptionModeCarte(
-              icone: Icons.satellite_alt,
-              libelle: 'Satellite',
-              selectionne: _modeCarte == _ModeCarte.satellite,
-              sombre: sombre,
-              onTap: () => _choisirMode(_ModeCarte.satellite),
-            ),
-            const SizedBox(height: 8),
-          ],
+              OptionModeCarte(
+                icone: Icons.terrain,
+                libelle: 'Topographique',
+                selectionne: _modeCarte == _ModeCarte.topo,
+                sombre: sombre,
+                onTap: () => _choisirMode(_ModeCarte.topo),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
         ),
+      ),
       ),
     );
   }
@@ -1054,7 +1156,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
 
   void _demarrerVueAfrique() {
     final cible = CameraFit.bounds(
-      bounds: _limitesAfrique,
+      bounds: bornesAfrique,
       padding: const EdgeInsets.all(24),
     ).fit(widget.mapController.camera);
 
@@ -1118,22 +1220,10 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
           (_animCibleCentre!.longitude - _animDebutCentre!.longitude) * k,
     );
     final zoom = _animDebutZoom + (_animCibleZoom - _animDebutZoom) * k;
-    final delta = _deltaRotation(_animDebutRotation, _animCibleRotation);
-    final rotation = _normaliserDegre(_animDebutRotation + delta * k);
+    final delta = deltaRotation(_animDebutRotation, _animCibleRotation);
+    final rotation = normaliserDegre(_animDebutRotation + delta * k);
     widget.mapController.move(centre, zoom);
     widget.mapController.rotate(rotation);
-  }
-
-  double _normaliserDegre(double deg) {
-    final r = deg % 360;
-    return r < 0 ? r + 360 : r;
-  }
-
-  double _deltaRotation(double de, double vers) {
-    var d = (vers - de) % 360;
-    if (d > 180) d -= 360;
-    if (d < -180) d += 360;
-    return d;
   }
 
   void _demarrerSuiviNavigation() {
@@ -1158,17 +1248,26 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     _navDernierTick = null;
     _navRotationCible = null;
     _navDerniereMesure = null;
+    _navDernierePositionRotationContinue = null;
+    _gestesActifs = 0;
     // Nouvelle session de suivi : référentiel d'orientation remis à zéro.
-    // Le premier cap valide réalignera la carte immédiatement.
-    _orientationNav.reinitialiser();
+    // La rotation affichée (vue d'ensemble d'un itinéraire, bouton
+    // « Ma position ») devient la référence angulaire : le premier cap GPS
+    // ne réaligne plus la carte d'un coup, seul un vrai déplacement la fera
+    // pivoter (double seuil 10°/5 m).
+    _orientationNav.reinitialiser(
+      rotationInitialeDegres: widget.mapController.camera.rotation,
+    );
     _navTicker ??= createTicker(_surTickNavigation);
     if (!_navTicker!.isActive) _navTicker!.start();
   }
 
   void _arreterSuiviNavigation() {
     _navTicker?.stop();
+    _gestesActifs = 0;
     _navDernierTick = null;
     _navCentreCourant = null;
+    _navDernierePositionRotationContinue = null;
   }
 
   /// Boucle de suivi navigation : la caméra glisse en continu vers la
@@ -1191,6 +1290,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
         widget.positionActuelle == null) {
       return;
     }
+    // Un geste utilisateur est en cours (pincement, pivotement, double-clic) :
+    // on suspend l'écriture caméra du suivi pour ne pas lui faire opposition.
+    if (_gestesActifs > 0) return;
 
     final dt = (_navDernierTick == null
             ? 16
@@ -1223,6 +1325,41 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
           _navRotationCible = rotationCibleRecadrage;
         }
       }
+
+      // Adaptation continue : au lieu d'attendre les seuls recadrages à
+      // double seuil, la carte suit EN DOUCEUR la direction filtrée du
+      // déplacement (le point de direction du trajet reste « droit », vers
+      // le haut de l'écran). Le filtre circulaire du cap a déjà gommé le
+      // bruit ; le seuil minimal ci-dessous empêche les micro-rotations
+      // perpétuelles tant que la trajectoire ne va pas vraiment plus « au
+      // haut » que la rotation affichée.
+      //
+      // GARDE-FOU : l'adaptation n'est appliquée qu'après un réel
+      // déplacement depuis la dernière adaptation ([seuilDistanceMetres]).
+      // Sans ce garde-fou, le cap filtré qui dérive lentement à l'arrêt
+      // (GPS qui renvoie 0° à l'immobilité) ferait tourner la carte toute
+      // seule, sans que le pied ait bougé.
+      final capFiltre = _orientationNav.capFiltre;
+      if (capFiltre != null) {
+        final derniere = _navDernierePositionRotationContinue;
+        final deplacementSuffisant = derniere == null ||
+            distanceHaversineMetres(
+              derniere.latitude,
+              derniere.longitude,
+              cible.latitude,
+              cible.longitude,
+            ) >=
+                seuilDistanceMetres;
+        if (deplacementSuffisant) {
+          final cibleContinue = normaliserDegre(-capFiltre);
+          final cibleEnCours = _navRotationCible ?? _navRotationCourante;
+          if (deltaRotation(cibleEnCours, cibleContinue).abs() >=
+              _seuilRotationContinueDegres) {
+            _navRotationCible = cibleContinue;
+            _navDernierePositionRotationContinue = cible;
+          }
+        }
+      }
     }
 
     // Centre de départ : l'état interne lissé, JAMAIS camera.center (qui
@@ -1242,9 +1379,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     final cibleRot = _navRotationCible;
     if (cibleRot != null) {
       final kRot = 1 - exp(-_navFacteurLissageRotation * dt / 1000);
-      final delta = _deltaRotation(rotation, cibleRot);
+      final delta = deltaRotation(rotation, cibleRot);
       if (delta.abs() > 0.3) {
-        rotation = _normaliserDegre(rotation + delta * kRot);
+        rotation = normaliserDegre(rotation + delta * kRot);
       } else {
         rotation = cibleRot;
         _navRotationCible = null;
@@ -1286,6 +1423,18 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     if (event.source == MapEventSource.mapController) {
       return;
     }
+    // Suivi des gestes : on suspend le ticker navigation de leur début à leur
+    // fin (glisser, pincer, pivoter, double-clic de zoom) pour que la caméra
+    // lui appartienne pleinement pendant le geste.
+    if (event is MapEventMoveStart ||
+        event is MapEventRotateStart ||
+        event is MapEventDoubleTapZoomStart) {
+      _gestesActifs++;
+    } else if (event is MapEventMoveEnd ||
+        event is MapEventRotateEnd ||
+        event is MapEventDoubleTapZoomEnd) {
+      if (_gestesActifs > 0) _gestesActifs--;
+    }
     _journaliserGeste(event);
     // Pendant la navigation, un zoom manuel (pincement, molette, double-tap)
     // devient la nouvelle cible du suivi : le suivi continue de recentrer la
@@ -1299,24 +1448,24 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     if (event is MapEventMove) {
       _surZoomChange();
       _debouncePois?.cancel();
-      _debouncePois = Timer(const Duration(milliseconds: 250), () {
+      _debouncePois = Timer(const Duration(milliseconds: 550), () {
         if (mounted) unawaited(_chargerPois());
       });
       // Pendant le déplacement, on lance un prefetch des routes de la
       // zone vers laquelle on se dirige : les données arrivent avant
       // l'arrêt du geste et le cache est prêt au moment du rebuild.
       _debounceRoutesPrefetch?.cancel();
-      _debounceRoutesPrefetch = Timer(const Duration(milliseconds: 1200), () {
+      _debounceRoutesPrefetch = Timer(const Duration(milliseconds: 1800), () {
         if (mounted) unawaited(_prefetchRoutes());
       });
     }
     if (event is MapEventMoveEnd) {
       _debounceRoutes?.cancel();
-      _debounceRoutes = Timer(const Duration(milliseconds: 400), () {
+      _debounceRoutes = Timer(const Duration(milliseconds: 900), () {
         if (mounted) unawaited(_chargerRoutes());
       });
       _debouncePois?.cancel();
-      _debouncePois = Timer(const Duration(milliseconds: 700), () {
+      _debouncePois = Timer(const Duration(milliseconds: 1300), () {
         if (mounted) unawaited(_chargerPois());
       });
       _prefetchTuiles();
@@ -1352,16 +1501,22 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
 
   Future<void> _chargerPois() async {
     if (!_fmtcReady || !mounted) return;
+    if (widget.suspendreTravailCarte) return;
+    if (CircuitBreakerPois.ouvert) return;
 
     final camera = widget.mapController.camera;
-    if (camera.zoom < _zoomMinPois) {
+    if (camera.zoom < zoomMinPois) {
       if (_pois.isNotEmpty) {
         setState(() => _pois = []);
       }
       return;
     }
 
-    final cle = 'kinshasa';
+    // Les POIs sont chargés par REGION VISIBLE (arrondie) plutôt que sur
+    // toute la ville : Overpass traite une requête locale bien plus vite
+    // qu'un balayage de Kinshasa entier, ce qui soulage les serveurs 429.
+    final rond = _arrondirBoundsEtendu(camera.visibleBounds, 0.15);
+    final cle = '${rond.south}|${rond.west}|${rond.north}|${rond.east}';
 
     final enCache = _poiCache[cle];
     if (enCache != null) {
@@ -1371,7 +1526,8 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     }
 
     try {
-      final pois = await _telechargerPois();
+      final pois = await _poiService.telechargerPois(rond);
+      _tentativesPois = 0;
       _poiCache[cle] = pois;
       while (_poiCache.length > 30) {
         _poiCache.remove(_poiCache.keys.first);
@@ -1381,86 +1537,17 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       }
     } catch (e) {
       debugPrint('[KinFlow] Erreur chargement POI: $e');
+      CircuitBreakerPois.enregistrerEchec();
       _debouncePois?.cancel();
-      _debouncePois = Timer(const Duration(seconds: 15), () {
+      // Repli exponentiel (5 s, 15 s, 35 s, 75 s… plafonné à 120 s) : quand
+      // Overpass souffre, on espace les tentatives au lieu de marteler.
+      final delai = const Duration(seconds: 5) * (1 << min(_tentativesPois, 4));
+      final delaiMs = min(delai.inMilliseconds, 120000);
+      _tentativesPois++;
+      _debouncePois = Timer(Duration(milliseconds: delaiMs), () {
         if (mounted) unawaited(_chargerPois());
       });
     }
-  }
-
-  Future<List<_Poi>> _telechargerPois() async {
-    const query = '''
-[out:json][timeout:25];
-area["boundary"="administrative"]["admin_level"="4"]["name"="Kinshasa"]->.kin;
-(
-  nwr["amenity"~"^(restaurant|cafe|bar|pub|school|college|university|hospital|clinic|pharmacy|bank|marketplace|market|place_of_worship|church|mosque|fuel|police|fire_station|post_office|library|cinema|theatre|parking|taxi)\$"](area.kin);
-  nwr["shop"~"^(supermarket|mall|convenience|general|bakery|butcher)\$"](area.kin);
-  nwr["tourism"~"^(hotel|guest_house|museum|attraction|viewpoint)\$"](area.kin);
-  nwr["leisure"~"^(park|stadium|sports_centre)\$"](area.kin);
-  nwr["office"~"^(government|embassy)\$"](area.kin);
-);
-out center tags;
-''';
-
-    const maxTentatives = 3;
-    const baseBackoff = Duration(seconds: 2);
-
-    // Bascule sur un miroir Overpass différent à chaque tentative pour ne
-    // pas marteler un serveur déjà limité en débit (429/504).
-    const endpoints = [
-      'https://overpass-api.de/api/interpreter',
-      'https://overpass.kumi.systems/api/interpreter',
-      'https://overpass.private.coffee/api/interpreter',
-    ];
-
-    for (var tentative = 0; tentative < maxTentatives; tentative++) {
-      final endpoint = endpoints[tentative % endpoints.length];
-      try {
-        final reponse = await http
-            .post(
-              Uri.parse(endpoint),
-              headers: {'User-Agent': 'KinFlow-App/1.0 (projet kinflow)'},
-              body: {'data': query},
-            )
-            .timeout(const Duration(seconds: 25));
-
-        if (reponse.statusCode == 200) {
-          return compute(_parserPois, json.decode(reponse.body));
-        }
-
-        final resoumettre =
-            reponse.statusCode == 429 || reponse.statusCode == 504;
-        if (!resoumettre) {
-          throw Exception('Overpass POI: HTTP ${reponse.statusCode}');
-        }
-
-        final retryAfter =
-            int.tryParse(reponse.headers['retry-after'] ?? '');
-        final delai = retryAfter != null && retryAfter > 0
-            ? Duration(seconds: retryAfter)
-            : baseBackoff * (1 << tentative);
-        Journal.a('CARTE', 'Surcharge Overpass POI, nouvelle tentative dans ${delai.inSeconds} s', {
-          'code_http': reponse.statusCode,
-          'tentative': tentative + 1,
-          'miroir': endpoint,
-        });
-        await Future<void>.delayed(delai);
-      } on TimeoutException {
-        if (tentative >= maxTentatives - 1) rethrow;
-        final delai = baseBackoff * (1 << tentative);
-        Journal.a('CARTE', 'Délai dépassé Overpass POI, nouvelle tentative dans ${delai.inSeconds} s', {
-          'tentative': tentative + 1,
-          'miroir': endpoint,
-        });
-        await Future<void>.delayed(delai);
-      } on http.ClientException {
-        if (tentative >= maxTentatives - 1) rethrow;
-        final delai = baseBackoff * (1 << tentative);
-        await Future<void>.delayed(delai);
-      }
-    }
-
-    throw Exception('Overpass POI: échec après $maxTentatives tentatives');
   }
 
   void _surZoomChange() {
@@ -1474,7 +1561,7 @@ out center tags;
   }
 
   int _seuilPoiParZoom(double zoom) {
-    if (zoom < _zoomMinPois) return -1;
+    if (zoom < zoomMinPois) return -1;
     if (zoom < 14.5) return 10;
     if (zoom < 15.5) return 19;
     if (zoom < 16.5) return 23;
@@ -1489,26 +1576,26 @@ out center tags;
     return 90;
   }
 
-  List<_Poi> _poisVisibles() {
+  List<Poi> _poisVisibles() {
     if (!_carteRendue) return const [];
     final camera = widget.mapController.camera;
     final zoom = camera.zoom;
-    if (zoom < _zoomMinPois) return const [];
+    if (zoom < zoomMinPois) return const [];
 
     final seuil = _seuilPoiParZoom(zoom);
     if (seuil < 0) return const [];
 
     final espace = _espacementPois(zoom);
 
-    final parType = <String, List<_Poi>>{};
+    final parType = <String, List<Poi>>{};
     for (final poi in _pois) {
-      if (_prioritePoi(poi.type) > seuil) continue;
+      if (prioritePoi(poi.type) > seuil) continue;
       parType.putIfAbsent(poi.type, () => []).add(poi);
     }
     final types = parType.keys.toList()
-      ..sort((a, b) => _prioritePoi(a).compareTo(_prioritePoi(b)));
+      ..sort((a, b) => prioritePoi(a).compareTo(prioritePoi(b)));
 
-    final visibles = <_Poi>[];
+    final visibles = <Poi>[];
     final poses = <Offset>[];
     final indices = <String, int>{};
     final places = <String, int>{};
@@ -1522,7 +1609,7 @@ out center tags;
         if (i >= liste.length) continue;
         indices[type] = i + 1;
         aAvance = true;
-        if ((places[type] ?? 0) >= _maxPoisVisiblesParType) continue;
+        if ((places[type] ?? 0) >= maxPoisVisiblesParType) continue;
         final poi = liste[i];
         final ecran = camera.latLngToScreenPoint(poi.point);
         final pos = Offset(ecran.x, ecran.y);
@@ -1544,19 +1631,19 @@ out center tags;
 
   Future<void> _chargerRoutes() async {
     if (!_fmtcReady || !mounted) return;
+    if (widget.suspendreTravailCarte) return;
 
     final camera = widget.mapController.camera;
-    if (camera.zoom < _zoomMinGlobal) {
+    if (camera.zoom < zoomMinGlobal) {
       if (_polylignesTrafic.isNotEmpty) {
         setState(() => _polylignesTrafic = []);
       }
       return;
     }
 
-    // Pendant un itinéraire, on charge aussi le trafic de la partie visible :
-    // l'utilisateur peut zoomer/regarder ailleurs que le couloir, les lignes
-    // doivent y apparaître en quelques secondes. Seul l'itinéraire garde la
-    // priorité de dessin au-dessus des rues.
+    // Pendant un itinéraire, la vue reste finie par le couloir : les
+    // segments chargés ici alimentent uniquement le filtre du tracé
+    // bleu → vert (cache partagé, donc aucun re-téléchargement).
 
     final detailsComplets = camera.zoom >= 15;
     // Étendre les bounds de 15 % pour que les petits panning après un
@@ -1570,8 +1657,10 @@ out center tags;
       return;
     }
 
-    _reconstruirePolylignes();
-
+    // Pas de vidage avant le téléchargement : la zone vue n'est pas dans le
+    // cache, mais les polylignes déjà affichées restent visibles pendant
+    // l'attente (les zoommades rapides ne font pas clignoter la carte).
+    // Le rebuild aura lieu quand les segments seront arrivés.
     try {
       final segments = await _roadService.obtenirRoutes(
         rond,
@@ -1579,6 +1668,7 @@ out center tags;
       );
       if (!mounted) return;
 
+      _tentativesRoutes = 0;
       _segmentsCache[_cleSegments(rond, detailsComplets)] =
           _SegmentsParZone(segments, rond, detailsComplets);
       while (_segmentsCache.length > 40) {
@@ -1597,9 +1687,155 @@ out center tags;
       });
       _reconstruirePolylignes();
       _debounceRoutes?.cancel();
-      _debounceRoutes = Timer(const Duration(seconds: 5), () {
+      // Repli exponentiel : 5 s, 15 s, 35 s, 75 s… plafonné à 120 s. Tant que
+      // le réseau est mauvais, on espace les tentatives au lieu de marteler.
+      final delai =
+          const Duration(seconds: 5) * (1 << min(_tentativesRoutes, 4));
+      final delaiMs = min(delai.inMilliseconds, 120000);
+      _tentativesRoutes++;
+      _debounceRoutes = Timer(Duration(milliseconds: delaiMs), () {
         if (mounted) unawaited(_chargerRoutes());
       });
+    }
+  }
+
+  /// Charge dans le cache local les segments traversés par l'itinéraire
+  /// (le couloir bleu → vert), avec la même finesse que le moteur de calcul :
+  /// court trajet → toutes classes de rues, longue distance → grands axes.
+  /// Les zones déjà servies par [RoadService] (cache mémoire/disque partagé)
+  /// ne déclenchent AUCUN téléchargement : disponible quasi instantanément.
+  Future<void> _prechargerCouloirItineraire() async {
+    if (!_fmtcReady || !mounted) return;
+    if (widget.suspendreTravailCarte) return;
+    final points = widget.itinerairePoints;
+    if (points == null || points.length < 2) return;
+
+    const marge = 0.03;
+    var minLat = double.infinity;
+    var maxLat = double.negativeInfinity;
+    var minLon = double.infinity;
+    var maxLon = double.negativeInfinity;
+    for (final p in points) {
+      if (p.latitude < minLat) minLat = p.latitude;
+      if (p.latitude > maxLat) maxLat = p.latitude;
+      if (p.longitude < minLon) minLon = p.longitude;
+      if (p.longitude > maxLon) maxLon = p.longitude;
+    }
+    if (minLat > maxLat || minLon > maxLon) return;
+    final couloir = LatLngBounds(
+      LatLng(minLat - marge, minLon - marge),
+      LatLng(maxLat + marge, maxLon + marge),
+    );
+    final lointain = (couloir.north - couloir.south) > 0.08 ||
+        (couloir.east - couloir.west) > 0.08;
+    final detailsComplets = !lointain;
+    final rond = _arrondirBounds(couloir);
+
+    if (_aSegmentsPour(rond, detailsComplets)) {
+      _reconstruirePolylignes();
+      return;
+    }
+    try {
+      final segments = await _roadService.obtenirRoutes(
+        couloir,
+        detailsComplets: detailsComplets,
+      );
+      if (!mounted) return;
+      _segmentsCache[_cleSegments(rond, detailsComplets)] =
+          _SegmentsParZone(segments, rond, detailsComplets);
+      while (_segmentsCache.length > 40) {
+        _segmentsCache.remove(_segmentsCache.keys.first);
+      }
+      Journal.i('CARTE', 'Couloir de l\'itinéraire prêt pour affichage', {
+        'segments': segments.length,
+        'details_complets': detailsComplets,
+      });
+      _reconstruirePolylignes();
+    } catch (e) {
+      debugPrint('[KinFlow] Préchargement couloir itinéraire échoué: $e');
+      _reconstruirePolylignes();
+    }
+  }
+
+  /// Préchauffe les tuiles du FOND DE CARTE le long du couloir de
+  /// l'itinéraire, aux zooms de la vue d'ensemble. Dès que le tracé est
+  /// connu la caméra s'anime vers le parcours complet : si la zone n'est
+  /// pas encore en cache, elle apparaît blanche pendant 1 à 2 s le temps
+  /// que les tuiles arrivent. En les téléchargeant en parallèle de
+  /// l'animation (même source et mêmes zooms que la carte affichée), la vue
+  /// d'ensemble s'affiche instantanément. Fire-and-forget : l'écran n'attend
+  /// jamais la fin du téléchargement.
+  ///
+  /// PASSE UNIQUE couvrant toute la plage de zooms : l'ancienne boucle
+  /// annulait la passe précédente avec le même identifiant FMTC avant chaque
+  /// démarrage, si bien que chaque zoom tuait la passe du zoom précédent et
+  /// que seul le dernier zoom était réellement téléchargé — la vue
+  /// d'ensemble (souvent z12-z13) restait grise longtemps.
+  Future<void> _prechargerTuilesCouloir(List<LatLng> points) async {
+    if (!_fmtcReady || kIsWeb || !mounted) return;
+    // Le réseau seul n'a pas de cache à préchauffer.
+    if (_tileProvider == null) return;
+    // Le satellite est lourd et son itinéraire n'est pas dessiné : on
+    // laisse la carte s'afficher normalement sans précharger.
+    if (_modeCarte == _ModeCarte.satellite) return;
+
+    var minLat = double.infinity;
+    var maxLat = double.negativeInfinity;
+    var minLon = double.infinity;
+    var maxLon = double.negativeInfinity;
+    for (final p in points) {
+      if (p.latitude < minLat) minLat = p.latitude;
+      if (p.latitude > maxLat) maxLat = p.latitude;
+      if (p.longitude < minLon) minLon = p.longitude;
+      if (p.longitude > maxLon) maxLon = p.longitude;
+    }
+    if (minLat > maxLat || minLon > maxLon) return;
+
+    const marge = 0.02;
+    final couloir = LatLngBounds(
+      LatLng(minLat - marge, minLon - marge),
+      LatLng(maxLat + marge, maxLon + marge),
+    );
+
+    final store = FMTCStore('kinshasa');
+    try {
+      final region = RectangleRegion(couloir).toDownloadable(
+        minZoom: _zoomsPrechargementCouloir.first,
+        maxZoom: _zoomsPrechargementCouloir.last,
+        options: TileLayer(
+          urlTemplate: _urlDuMode,
+          userAgentPackageName: 'com.kinflow.kinflow',
+        ),
+      );
+      final nombre = await store.download.countTiles(region);
+      if (nombre <= 0 || nombre > _maxTuilesTotalesCouloir) return;
+
+      // Une seule passe de téléchargement à la fois : on annule celle de
+      // l'itinéraire précédent avant d'en lancer la nouvelle (un itinéraire
+      // recalculé pendant que la passe tourne encore).
+      await store.download.cancel(instanceId: _instanceIdTuilesCouloir);
+
+      final (:downloadProgress, :tileEvents) = store.download.startForeground(
+        region: region,
+        parallelThreads: 2,
+        skipExistingTiles: true,
+        skipSeaTiles: true,
+        retryFailedRequestTiles: false,
+        instanceId: _instanceIdTuilesCouloir,
+      );
+      tileEvents.listen((_) {}, onError: (_) {});
+
+      // Le téléchargement est lancé mais nul besoin d'attendre tout son
+      // trajet : on le laisse finir en arrière-plan. On écoute juste les
+      // erreurs de démarrage qui remonteraient en async vide.
+      downloadProgress.listen((_) {}, onError: (_) {});
+    } catch (e) {
+      debugPrint('[KinFlow] Préchargement tuiles du couloir échoué: $e');
+    }
+    // Le widget est démonté : la passe de téléchargement ne doit pas rester
+    // active sans lecteur (elle continuerait à écrire des octets en cache).
+    if (!mounted) {
+      await store.download.cancel(instanceId: _instanceIdTuilesCouloir);
     }
   }
 
@@ -1608,8 +1844,11 @@ out center tags;
   /// rebuild est instantané. Ne fait rien si la zone est déjà couverte.
   Future<void> _prefetchRoutes() async {
     if (!_fmtcReady || !mounted) return;
+    if (widget.suspendreTravailCarte) return;
+    // Nuit : pas de préchargement réseau, l'affichage au déplacement suffit.
+    if (_estNuit()) return;
     final camera = widget.mapController.camera;
-    if (camera.zoom < _zoomMinGlobal) return;
+    if (camera.zoom < zoomMinGlobal) return;
 
     final detailsComplets = camera.zoom >= 15;
     final rond = _arrondirBoundsEtendu(camera.visibleBounds, 0.20);
@@ -1683,6 +1922,9 @@ out center tags;
 
   void _prefetchTuiles() {
     if (!_fmtcReady || kIsWeb || !mounted) return;
+    if (widget.suspendreTravailCarte) return;
+    // Nuit : pas de préchargement des tuiles, économie de données mobiles.
+    if (_estNuit()) return;
     // En satellite les tuiles sont beaucoup plus lourdes : on ne précharge
     // pas, l'affichage réel suffit (ou le téléchargement hors ligne choisi).
     if (_modeCarte == _ModeCarte.satellite) return;
@@ -1704,13 +1946,23 @@ out center tags;
 
   void _reconstruirePolylignes() {
     if (!mounted || !_fmtcReady) return;
+    if (widget.suspendreTravailCarte) return;
+
+    // L'itinéraire se dessine TOUJOURS comme UNE SEULE ligne continue du
+    // point bleu (départ) au point vert (arrivée) : on part des points du
+    // tracé calculé, jamais segments de route par segments de route —
+    // chaque segment devenait une polyligne séparée et la carte montrait
+    // plusieurs bouts de ligne déconnectés, ce qui perdait le suivi.
+
     final zoom = widget.mapController.camera.zoom;
-    if (zoom < _zoomMinGlobal) {
+    if (zoom < zoomMinGlobal) {
       if (_polylignesTrafic.isNotEmpty ||
-          _polylignesItineraire.isNotEmpty) {
+          _polylignesItineraire.isNotEmpty ||
+          _raccordEtape.isNotEmpty) {
         setState(() {
           _polylignesTrafic = [];
           _polylignesItineraire = [];
+          _raccordEtape = [];
         });
       }
       return;
@@ -1730,6 +1982,7 @@ out center tags;
     } else {
       _polylignesItineraire = [];
     }
+    _raccordEtape = _construireRaccordEtape(pointsItineraire);
 
     // Lignes de trafic masquées pendant un itinéraire : on garde la dernière
     // version construite en cache pour la restaurer instantanément au
@@ -1791,8 +2044,8 @@ out center tags;
     final polylignes = <Polyline>[];
     for (final segment in candidats) {
       // Plafond atteint : les classes secondaires déjà triées en queue de
-      // liste ne sont simplement plus dessinées.
-      if (polylignes.length >= _maxPolylignes) break;
+      // liste ne sont simplement plus dessinées (plafond réduit la nuit).
+      if (polylignes.length >= _plafondPolylignes) break;
       final points = segment.points;
       if (points.length < 2) continue;
 
@@ -1822,7 +2075,7 @@ out center tags;
 
   /// Rang d'importance cartographique d'une classe : 0 = autoroute,
   /// 7 = chemin de service. Les rangs faibles sont dessinés en priorité
-  /// quand le plafond [_maxPolylignes] est atteint.
+  /// quand le plafond [_plafondPolylignes] est atteint.
   int _prioriteClasse(String classe) {
     switch (classe) {
       case 'motorway':
@@ -1851,17 +2104,17 @@ out center tags;
     }
   }
 
-  Marker _marqueurPoi(_Poi poi) {
-    final (icone, couleur) = _iconePoi(poi.type);
+  Marker _marqueurPoi(Poi poi) {
+    final (icone, couleur) = iconePoi(poi.type);
     final afficherNom =
-        widget.mapController.camera.zoom >= _zoomNomPois && poi.nom.isNotEmpty;
+        widget.mapController.camera.zoom >= zoomNomPois && poi.nom.isNotEmpty;
     return Marker(
       point: poi.point,
       width: afficherNom ? 110 : 34,
       height: afficherNom ? 48 : 34,
       alignment: Alignment.topCenter,
       rotate: true,
-      child: _MarqueurPoi(
+      child: MarqueurPoi(
         icone: icone,
         couleur: couleur,
         nom: afficherNom ? poi.nom : '',
@@ -1872,12 +2125,18 @@ out center tags;
   /// Découpe un segment en tronçons. Les rues sont colorées selon l'état
   /// simulé (heure de la journée) ; les portions couvertes par une zone de
   /// circulation réelle (puis l'itinéraire) portent la couleur des témoins.
+  ///
+  /// De nuit (00h → 6h) et hors itinéraire, tout est forcé en vert uniforme :
+  /// 1 tronçon par segment, aucune recherche de zone, aucun appel simulateur.
+  /// [pourItineraire] laisse le tracé bleu → vert fonctionner normalement.
   List<Polyline> _decouperParEtat(
     RoadSegment segment,
     List<LatLng> points,
     double zoom,
-    DateTime maintenant,
-  ) {
+    DateTime maintenant, {
+    bool pourItineraire = false,
+  }) {
+    final nuit = !pourItineraire && _estNuit();
     final couleurBase = _fondSombre ? Colors.grey.shade400 : Colors.grey.shade500;
     final baseOpacite = _fondSombre ? 0.85 : 0.6;
     final epaisseur = _epaisseur(segment.classe, zoom);
@@ -1887,12 +2146,20 @@ out center tags;
     // peintes en rouge/jaune : la ligne de trafic doit être PLEINE (opacité 1)
     // et assez épaisse pour masquer entièrement la couleur de la tuile dessous,
     // sinon on voit une ligne verte couper une route rouge (mauvais rendu).
-    final simEtat = _simulateur.estimer(segment, moment: maintenant);
+    // De nuit, l'état est figé sur fluide : la ville dort, tout roule.
+    final simEtat = nuit
+        ? EtatTrafic.fluide
+        : _simulateur.estimer(segment, moment: maintenant);
     final couleurBaseSim =
         _fondSombre ? Color.lerp(couleurBase, simEtat.couleur, 0.7)! : simEtat.couleur;
     final opaciteBaseSim = _fondSombre ? 0.85 : 1.0;
 
     ({Color couleur, double opacite}) attribut(LatLng milieu) {
+      // De nuit, aucune zone de trafic ne teinte les rues : la couleur
+      // verte est constante, ce qui fait un seul tronçon par segment.
+      if (nuit) {
+        return (couleur: couleurBaseSim, opacite: opaciteBaseSim);
+      }
       final zone = _zonePourPoint(milieu);
       if (zone == null) {
         return (couleur: couleurBaseSim, opacite: opaciteBaseSim);
@@ -1946,117 +2213,20 @@ out center tags;
   /// Itinéraire : UNE seule ligne, épaisseur constante, dont la couleur
   /// suit l'état des routes tronçon par tronçon. Les transitions de couleur
   /// sont jointes par des caps ronds pour rester un tracé unique et continu.
+  /// La couleur ne couvre QUE la portion sur chaussée : un départ ou une
+  /// arrivée hors route (bâtiment, parcelle) est raccordé par des pointillés
+  /// noirs, jamais par la couleur elle-même.
   List<Polyline> _decouperItineraireParEtat(List<LatLng> points) {
-    if (points.length < 2) return const [];
-
-    final maintenant = DateTime.now();
-    final baseOpacite = _fondSombre ? 0.9 : 0.8;
-    const epaisseur = 6.0;
-
-    // L'itinéraire est UNE seule ligne colorée continue : elle part du point
-    // bleu (départ), passe obligatoirement par le drapeau d'étape et rejoint
-    // le point vert (arrivée). Aucun décrochage pointillé aux extrémités :
-    // le tracé couvre la totalité du parcours.
-    var debut = 0;
-    final fin = points.length - 1;
-
-    // Pendant le suivi réel, la portion déjà parcourue derrière l'utilisateur
-    // est masquée : la ligne commence à [itineraireDebutVisuel] (l'index du
-    // premier point encore devant). Le tracé entier réapparaît à tout moment
-    // où l'utilisateur est hors itinéraire (recalcul) car l'index est remis
-    // à -1 par l'écran.
-    final debutVisuel =
-        widget.itineraireDebutVisuel.clamp(0, points.length - 1).toInt();
-    if (debutVisuel > debut) {
-      debut = debutVisuel;
-    }
-
-    final pointsRoute = points.sublist(debut, fin + 1);
-    if (pointsRoute.length < 2) return const [];
-
-    final severites = widget.itineraireSeverites;
-    final severitesRoute =
-        severites != null && severites.length == points.length
-            ? severites.sublist(debut, fin + 1)
-            : null;
-    final severiteParPoint =
-        severitesRoute != null && severitesRoute.length == pointsRoute.length;
-
-    final segment = RoadSegment(
-      id: -1,
-      nom: '',
-      classe: 'primary',
-      points: pointsRoute,
+    return decouperItineraireParEtat(
+      points: points,
+      debutRoute: widget.itineraireDebutRoute,
+      finRoute: widget.itineraireFinRoute,
+      debutVisuel: widget.itineraireDebutVisuel,
+      fondSombre: _fondSombre,
+      severites: widget.itineraireSeverites,
+      simulateur: _simulateur,
+      zonePourPoint: _zonePourPoint,
     );
-    final simEtat = _simulateur.estimer(segment, moment: maintenant);
-
-    ({Color couleur, double opacite}) attribut(int i) {
-      Color base;
-      if (severiteParPoint) {
-        final x = severitesRoute[i].clamp(0.0, 3.0);
-        final lo = x.floor();
-        final hi = min(lo + 1, 3);
-        base = Color.lerp(
-          EtatTrafic.values[lo].couleur,
-          EtatTrafic.values[hi].couleur,
-          x - lo,
-        )!;
-      } else {
-        base = simEtat.couleur;
-      }
-      final milieu = LatLng(
-        (pointsRoute[i].latitude + pointsRoute[i + 1].latitude) / 2,
-        (pointsRoute[i].longitude + pointsRoute[i + 1].longitude) / 2,
-      );
-      final zone = _zonePourPoint(milieu);
-      if (zone == null) {
-        return (couleur: base, opacite: baseOpacite);
-      }
-      // Même fusion que les rues : fiabilité faible → on se rapproche de
-      // l'état simulé, un signalement isolé ne noircit pas tout le tracé.
-      final f = zone.fiabilite.clamp(0.0, 1.0);
-      return (
-        couleur: Color.lerp(base, zone.etat.couleur, f)!,
-        opacite: (0.35 + 0.65 * f).clamp(0.0, 1.0),
-      );
-    }
-
-    // L'itinéraire est UNE seule ligne, épaisseur constante, dont la couleur
-    // suit l'état des routes tronçon par tronçon. Aucun contour : les
-    // polylignes de trafic étant masquées pendant l'itinéraire, le tracé
-    // n'a besoin d'aucun liseré pour se détacher.
-    final polylignes = <Polyline>[];
-    var courant = <LatLng>[pointsRoute.first];
-    var couleur = simEtat.couleur;
-    var opacite = baseOpacite;
-
-    void fermer() {
-      if (courant.length >= 2) {
-        polylignes.add(Polyline(
-          points: List.of(courant),
-          strokeWidth: epaisseur,
-          color: couleur.withValues(alpha: opacite.clamp(0.0, 1.0)),
-          // Caps ronds : les tronçons colorés se recouvrent aux transitions
-          // sans laisser voir le contour, la ligne reste unique et continue.
-          strokeCap: StrokeCap.round,
-          strokeJoin: StrokeJoin.round,
-        ));
-      }
-    }
-
-    for (var i = 0; i < pointsRoute.length - 1; i++) {
-      final a = attribut(i);
-      if (a.couleur != couleur || a.opacite != opacite) {
-        fermer();
-        courant = <LatLng>[pointsRoute[i]];
-        couleur = a.couleur;
-        opacite = a.opacite;
-      }
-      courant.add(pointsRoute[i + 1]);
-    }
-    fermer();
-
-    return polylignes;
   }
 
   List<Polyline> _decouperPourLabel(
@@ -2193,12 +2363,20 @@ out center tags;
         a.south > b.north);
   }
 
+  /// URL du fond de carte selon le mode actif : sert aussi au prétéléchargement
+  /// des tuiles du couloir d'itinéraire (même source que la carte affichée).
+  String get _urlDuMode => switch (_modeCarte) {
+    _ModeCarte.sombre => _urlTuilesSombre,
+    _ModeCarte.satellite => _urlTuilesSatellite,
+    _ModeCarte.claire => _urlTuiles,
+    _ModeCarte.positron => _urlTuilesPositron,
+    _ModeCarte.darkMatter => _urlTuilesDarkMatter,
+    _ModeCarte.voyager => _urlTuilesVoyager,
+    _ModeCarte.topo => _urlTuilesTopo,
+  };
+
   Widget _tuileDeBase(_ModeCarte mode) {
-    final url = switch (mode) {
-      _ModeCarte.sombre => _urlTuilesSombre,
-      _ModeCarte.satellite => _urlTuilesSatellite,
-      _ModeCarte.claire => _urlTuiles,
-    };
+    final url = _urlDuMode;
     return TileLayer(
       urlTemplate: url,
       userAgentPackageName: 'com.kinflow.kinflow',
@@ -2301,6 +2479,137 @@ out center tags;
     }
   }
 
+  /// Épingle classique « goutte » en relief : corps coloré aux reflets 3D,
+  /// aiguille grise au centre, pointe en bas. Dessinée en CustomPaint.
+  Widget _construireEpingle(Color couleur) {
+    return CustomPaint(
+      size: const Size(50, 50),
+      painter: PeintreEpingle(couleur),
+    );
+  }
+
+  /// Icône de localisation standard (« goutte d'eau ») : le symbole habituel
+  /// de position sur les téléphones. Utilisée pour la position de l'utilisateur
+  /// et le lieu recherché.
+  Widget _construireGoutte(Color couleur) {
+    return Icon(
+      Icons.location_on,
+      size: 46,
+      color: couleur,
+    );
+  }
+
+  /// Étape « Ajouter à l'itinéraire » : un pin ambre numéroté, clairement
+  /// différent du point vert de la destination et de l'épingle rouge.
+  Widget _construireEtape() {
+    return CustomPaint(
+      size: const Size(50, 50),
+      painter: PeintreEtape(KinColors.accent, '1'),
+    );
+  }
+
+  /// Cône de vision au-delà duquel une étape posée hors chaussée est reliée
+  /// à l'itinéraire par des pointillés noirs (bâtiment, parcelle). Tant
+  /// qu'un tracé passe sous le marqueur — l'itinéraire lui-même ou une rue
+  /// du réseau chargé — aucun raccord n'est dessiné.
+  static const double _seuilRaccordEtapeMetres = 25;
+
+  /// Raccords en pointillés noirs entre l'étape et l'itinéraire déjà tracé.
+  /// Vide si l'étape repose sur la chaussée (l'itinéraire passe alors
+  /// dessus) ou s'il n'y a pas encore de tracé à proximité.
+  List<Polyline> _construireRaccordEtape(List<LatLng>? pointsItineraire) {
+    final etape = widget.pointEtape;
+    if (etape == null) return const [];
+
+    // Pas de pointillés quand un tracé passe sous le marqueur. L'étape
+    // ajoutée révise l'itinéraire, dont la polyline est recalée au plus près
+    // du point projeté sur la chaussée ; et même sans tracé itinéraire à
+    // proximité, une rue du réseau déjà chargé sous le marqueur suffit à
+    // considérer l'étape « sur route ».
+    if (pointsItineraire != null) {
+      final proche = _projeterSurPolyligne(etape, pointsItineraire);
+      if (distanceMetresHaversine(etape, proche) < _seuilRaccordEtapeMetres) {
+        return const [];
+      }
+    }
+    if (_estSurReseauRoutier(etape, _seuilRaccordEtapeMetres)) {
+      return const [];
+    }
+    if (pointsItineraire == null) return const [];
+
+    final proche = _projeterSurPolyligne(etape, pointsItineraire);
+    return [
+      Polyline(
+        points: [etape, proche],
+        strokeWidth: 3.2,
+        color: Colors.black.withValues(alpha: _fondSombre ? 0.95 : 0.8),
+        pattern: StrokePattern.dotted(),
+        strokeCap: StrokeCap.round,
+      ),
+    ];
+  }
+
+  /// Vrai si [etape] repose sur une route du réseau déjà chargé
+  /// ([_segmentsCache]) : dans ce cas l'itinéraire, recalé dessus, passe
+  /// sous le marqueur et le raccord en pointillés n'a plus lieu d'être.
+  bool _estSurReseauRoutier(LatLng etape, double rayonMetres) {
+    final fenetre = _etendrePoint(etape, rayonMetres);
+    for (final zone in _segmentsCache.values) {
+      if (!_boundsSeChevauchent(zone.bounds, fenetre)) continue;
+      for (var i = 0; i < zone.segments.length; i++) {
+        if (!_boundsSeChevauchent(zone.bornes[i], fenetre)) continue;
+        final proche = _projeterSurPolyligne(etape, zone.segments[i].points);
+        if (distanceMetresHaversine(etape, proche) < rayonMetres) return true;
+      }
+    }
+    return false;
+  }
+
+  /// Fenêtre de quelques dizaines de mètres autour de [p], pour filtrer les
+  /// zones et segments trop éloignés avant la projection précise.
+  LatLngBounds _etendrePoint(LatLng p, double rayonMetres) {
+    final dLat = rayonMetres / 111320.0;
+    final dLon = dLat / max(cos(p.latitude * pi / 180), 0.15);
+    return LatLngBounds(
+      LatLng(p.latitude - dLat, p.longitude - dLon),
+      LatLng(p.latitude + dLat, p.longitude + dLon),
+    );
+  }
+
+  bool _boundsSeChevauchent(LatLngBounds a, LatLngBounds b) =>
+      a.north >= b.south &&
+      a.south <= b.north &&
+      a.east >= b.west &&
+      a.west <= b.east;
+
+  /// Point de la polyligne [pts] le plus proche de [p] (projection orthogonale
+  /// bornée sur chaque arête, puis choix du minimum).
+  LatLng _projeterSurPolyligne(LatLng p, List<LatLng> pts) {
+    LatLng? meilleur;
+    var minD = double.infinity;
+    for (var i = 0; i < pts.length - 1; i++) {
+      final a = pts[i];
+      final b = pts[i + 1];
+      final dx = b.longitude - a.longitude;
+      final dy = b.latitude - a.latitude;
+      final len2 = dx * dx + dy * dy;
+      if (len2 <= 0) continue;
+      final t = (((p.longitude - a.longitude) * dx +
+                  (p.latitude - a.latitude) * dy) /
+              len2)
+          .clamp(0.0, 1.0);
+      final proj = LatLng(
+        a.latitude + t * dy,
+        a.longitude + t * dx,
+      );
+      final d = distanceMetresHaversine(proj, p);
+      if (d < minD) {
+        minD = d;
+        meilleur = proj;
+      }
+    }
+    return meilleur ?? p;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2315,19 +2624,19 @@ out center tags;
 
       final styleBase =
           DefaultTextStyle.of(context).style.copyWith(
-                fontSize: _BoutonAction.tailleTexte,
+                fontSize: BoutonAction.tailleTexte,
                 fontWeight: FontWeight.w600,
               );
 
       final largeur2 =
-          _BoutonAction.largeurPour(
+          BoutonAction.largeurPour(
             'Supprimer',
             styleBase,
             textScaler,
           );
 
       final largeurDetails =
-          _BoutonAction.largeurPour(
+          BoutonAction.largeurPour(
             'Détails',
             styleBase,
             textScaler,
@@ -2347,7 +2656,7 @@ out center tags;
       } else {
 
         final largeur1 =
-            _BoutonAction.largeurPour(
+            BoutonAction.largeurPour(
               widget.libelleActionPrincipale,
               styleBase,
               textScaler,
@@ -2359,7 +2668,7 @@ out center tags;
       }
 
       hauteurBoutons =
-          _BoutonAction.hauteurPour(styleBase, textScaler);
+          BoutonAction.hauteurPour(styleBase, textScaler);
 
     }
 
@@ -2406,6 +2715,7 @@ out center tags;
                 return;
               }
               widget.onUserInteract?.call();
+              _interactionSurBoutons();
               if (_fmtcReady && !_longPressActif) {
                 _demarrerLongPress(e.localPosition);
               }
@@ -2483,6 +2793,8 @@ out center tags;
                 // La ligne de l'itinéraire calculé reste toujours visible,
                 // même si le cache des rues du couloir n'est pas encore prêt.
                 ..._polylignesItineraire,
+                // Raccord en pointillés noirs d'une étape hors réseau routier.
+                ..._raccordEtape,
               ]),
 
 
@@ -2521,15 +2833,7 @@ out center tags;
                     // son déplacement qui suit la position GPS.
                     rotate: true,
 
-                    child: const Icon(
-
-                      Icons.location_pin,
-
-                      color: Colors.blue,
-
-                      size: 50,
-
-                    ),
+                    child: _construireGoutte(Colors.blueAccent),
 
                   ),
 
@@ -2550,15 +2854,7 @@ out center tags;
                     // Reste droit pendant la rotation de la carte.
                     rotate: true,
 
-                    child: const Icon(
-
-                      Icons.location_pin,
-
-                      color: Colors.green,
-
-                      size: 50,
-
-                    ),
+                    child: _construireGoutte(const Color(0xFF00B050)),
 
                   ),
 
@@ -2577,20 +2873,13 @@ out center tags;
 
                     rotate: true,
 
-                    child: const Icon(
-
-                      Icons.location_pin,
-
-                      color: Colors.green,
-
-                      size: 50,
-
-                    ),
+                    child: _construireGoutte(const Color(0xFF00B050)),
 
                   ),
 
                 // Étape obligatoire de l'itinéraire (une seule).
-                // Affiche un petit drapeau (checkpoint) avant la destination.
+                // Affiche un pin ambre numéroté (checkpoint), distinct du
+                // point vert de la destination, avant celle-ci.
                 if (widget.pointEtape != null)
 
                   Marker(
@@ -2603,15 +2892,7 @@ out center tags;
 
                     rotate: true,
 
-                    child: Icon(
-
-                      Icons.flag,
-
-                      color: _fondSombre ? Colors.white : Colors.black,
-
-                      size: 42,
-
-                    ),
+                    child: _construireEtape(),
 
                   ),
 
@@ -2633,15 +2914,7 @@ out center tags;
                     // Reste droit pendant la rotation de la carte.
                     rotate: true,
 
-                    child: Icon(
-
-                      Icons.push_pin,
-
-                      color: _fondSombre ? Colors.white : Colors.black,
-
-                      size: 40,
-
-                    ),
+                    child: _construireEpingle(Colors.red),
 
                   ),
 
@@ -2652,7 +2925,8 @@ out center tags;
                 if (widget.pointActions != null &&
                     !widget.seulementSupprimer &&
                     !widget.actionsSurEpingle &&
-                    widget.pointActions != widget.epingle)
+                    widget.pointActions != widget.epingle &&
+                    widget.pointActions != widget.lieuRecherche)
 
                   Marker(
 
@@ -2665,20 +2939,13 @@ out center tags;
                     // Reste droit pendant la rotation de la carte.
                     rotate: true,
 
-                    child: const Icon(
-
-                      Icons.location_pin,
-
-                      color: Colors.green,
-
-                      size: 50,
-
-                    ),
+                    child: _construireEpingle(Colors.red),
 
                   ),
 
                 if (widget.afficherActions &&
-                    widget.pointActions != null)
+                    widget.pointActions != null &&
+                    !_modePoserEpingle)
 
                   Marker(
 
@@ -2695,7 +2962,7 @@ out center tags;
 
                       offset: Offset(decalageBoutons!, 40),
 
-                      child: _BoutonsActions(
+                      child: BoutonsActions(
 
                         onDefinirItineraire:
                             widget.desactiverItineraire
@@ -2738,12 +3005,61 @@ out center tags;
 
 
 
+        if (_modePoserEpingle && _fmtcReady)
+          Positioned.fill(
+            child: Stack(
+              children: [
+                // Épingle de prévisualisation au centre : elle ne capte
+                // aucun toucher, la carte reste libre à déplacer dessous.
+                Center(
+                  child: IgnorePointer(
+                    child: _construireEpingle(Colors.red),
+                  ),
+                ),
+                // Bouton « Poser » juste en dessous de l'épingle.
+                Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const SizedBox(height: 84),
+                      BoutonPoser(onPressed: _poserEpingle),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+        if (_fmtcReady)
+          Positioned(
+            left: 8,
+            bottom: 16,
+            child: AnimatedOpacity(
+              opacity: _boutonsVisibles
+                  ? 1.0
+                  : _opaciteBoutonsInactifs,
+              duration: const Duration(milliseconds: 400),
+              curve: Curves.easeOut,
+              child: BoutonPoserEpingle(
+                actif: _modePoserEpingle,
+                onPressed: _basculerModePoserEpingle,
+              ),
+            ),
+          ),
+
         if (_fmtcReady)
           Positioned(
             right: 8,
             bottom: 16,
-            child: _BoutonModeCarte(
-              onPressed: _ouvrirMenuCartes,
+            child: AnimatedOpacity(
+              opacity: _boutonsVisibles
+                  ? 1.0
+                  : _opaciteBoutonsInactifs,
+              duration: const Duration(milliseconds: 400),
+              curve: Curves.easeOut,
+              child: BoutonModeCarte(
+                onPressed: _ouvrirMenuCartes,
+              ),
             ),
           ),
 
@@ -2762,6 +3078,68 @@ out center tags;
               ),
               child: const Text(
                 'Imagerie © Esri, Maxar, Earthstar Geographics',
+                style: TextStyle(fontSize: 9, color: Colors.black87),
+              ),
+            ),
+          ),
+
+        if (_fmtcReady &&
+            (_modeCarte == _ModeCarte.positron ||
+                _modeCarte == _ModeCarte.darkMatter))
+          Positioned(
+            top: 8,
+            left: 8,
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 6,
+                vertical: 3,
+              ),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.85),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Text(
+                '© CARTO, © OpenStreetMap',
+                style: TextStyle(fontSize: 9, color: Colors.black87),
+              ),
+            ),
+          ),
+
+        if (_fmtcReady && _modeCarte == _ModeCarte.voyager)
+          Positioned(
+            top: 8,
+            left: 8,
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 6,
+                vertical: 3,
+              ),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.85),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Text(
+                '© CARTO, © OpenStreetMap',
+                style: TextStyle(fontSize: 9, color: Colors.black87),
+              ),
+            ),
+          ),
+
+        if (_fmtcReady && _modeCarte == _ModeCarte.topo)
+          Positioned(
+            top: 8,
+            left: 8,
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 6,
+                vertical: 3,
+              ),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.85),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Text(
+                '© OpenTopoMap (CC-BY-SA)',
                 style: TextStyle(fontSize: 9, color: Colors.black87),
               ),
             ),
@@ -2860,321 +3238,3 @@ out center tags;
   }
 
 }
-
-class _BoutonsActions extends StatelessWidget {
-
-  final VoidCallback? onDefinirItineraire;
-
-  /// Libellé du bouton principal (« Définir itinéraire » ou « Ajouter à
-  /// l'itinéraire » selon le contexte).
-  final String libelleDefinirItineraire;
-
-  final VoidCallback? onSupprimer;
-
-  /// Affiche les coordonnées géographiques du point bleu de position.
-  final VoidCallback? onVoirDetails;
-
-  final bool afficherDefinirItineraire;
-
-  final VoidCallback onInteractionStart;
-
-  final VoidCallback onInteractionEnd;
-
-  const _BoutonsActions({
-
-    this.onDefinirItineraire,
-
-    this.libelleDefinirItineraire = 'Définir itinéraire',
-
-    this.onSupprimer,
-
-    this.onVoirDetails,
-
-    this.afficherDefinirItineraire = true,
-
-    required this.onInteractionStart,
-
-    required this.onInteractionEnd,
-
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Listener(
-      onPointerDown: (_) => onInteractionStart(),
-      onPointerUp: (_) => onInteractionEnd(),
-      onPointerCancel: (_) => onInteractionEnd(),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (afficherDefinirItineraire)
-            _BoutonAction(
-              onPressed: onDefinirItineraire,
-              icone: Icons.route,
-              libelle: libelleDefinirItineraire,
-              couleur: Colors.black,
-            ),
-          if (afficherDefinirItineraire) const SizedBox(width: 8),
-          // Le point bleu de position affiche « Détails » + « Supprimer ».
-          // Le point bleu de position affiche « Détails » + « Supprimer ».
-          if (onVoirDetails != null) ...[
-            _BoutonAction(
-              onPressed: onVoirDetails,
-              icone: Icons.info_outline,
-              libelle: 'Détails',
-              couleur: Colors.black,
-            ),
-            const SizedBox(width: 8),
-          ],
-          _BoutonAction(
-            onPressed: onSupprimer,
-            icone: Icons.delete,
-            libelle: 'Supprimer',
-            couleur: Colors.black,
-          ),
-        ],
-      ),
-    );
-  }
-
-}
-
-class _BoutonAction extends StatelessWidget {
-
-  static const double paddingHorizontal = 12;
-
-  static const double paddingVertical = 8;
-
-  static const double iconeTaille = 18;
-
-  static const double ecartIcone = 6;
-
-  static const double tailleTexte = 12;
-
-  static double largeurPour(
-    String texte,
-    TextStyle styleBase,
-    TextScaler textScaler,
-  ) {
-    final tp = TextPainter(
-      text: TextSpan(text: texte, style: styleBase),
-      textDirection: TextDirection.ltr,
-      textScaler: textScaler,
-      maxLines: 1,
-    )..layout();
-    return tp.width + (2 * paddingHorizontal) + iconeTaille + ecartIcone + 4;
-  }
-
-  static double hauteurPour(
-    TextStyle styleBase,
-    TextScaler textScaler,
-  ) {
-    final tp = TextPainter(
-      text: TextSpan(text: 'Ag', style: styleBase),
-      textDirection: TextDirection.ltr,
-      textScaler: textScaler,
-      maxLines: 1,
-    )..layout();
-    return max(iconeTaille, tp.height) + (2 * paddingVertical);
-  }
-
-  final VoidCallback? onPressed;
-
-  final IconData icone;
-
-  final String libelle;
-
-  final Color couleur;
-
-  const _BoutonAction({
-
-    this.onPressed,
-
-    required this.icone,
-
-    required this.libelle,
-
-    required this.couleur,
-
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final actif = onPressed != null;
-    final couleurBtn = actif ? couleur : Colors.grey;
-    return Material(
-      color: actif ? Colors.white : Colors.grey.shade200,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(22),
-        side: BorderSide(
-          color: actif ? Colors.black : Colors.grey,
-          width: 1.5,
-        ),
-      ),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(22),
-        onTap: onPressed,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(
-            horizontal: paddingHorizontal,
-            vertical: paddingVertical,
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(icone, size: iconeTaille, color: couleurBtn),
-              const SizedBox(width: ecartIcone),
-              Flexible(
-                child: Text(
-                  libelle,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: tailleTexte,
-                    fontWeight: FontWeight.w600,
-                    color: couleurBtn,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-}
-
-class _MarqueurPoi extends StatelessWidget {
-  final IconData icone;
-  final Color couleur;
-  final String nom;
-  const _MarqueurPoi({
-    required this.icone,
-    required this.couleur,
-    required this.nom,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 28,
-          height: 28,
-          decoration: BoxDecoration(
-            color: Colors.white,
-            shape: BoxShape.circle,
-            border: Border.all(color: couleur, width: 2),
-            boxShadow: const [
-              BoxShadow(
-                color: Colors.black26,
-                blurRadius: 3,
-                offset: Offset(0, 1),
-              ),
-            ],
-          ),
-          child: Icon(icone, size: 15, color: couleur),
-        ),
-        if (nom.isNotEmpty)
-          Container(
-            margin: const EdgeInsets.only(top: 2),
-            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-            constraints: const BoxConstraints(maxWidth: 104),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(3),
-            ),
-            child: Text(
-              nom,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 9,
-                fontWeight: FontWeight.w600,
-                color: Colors.black87,
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-class _BoutonModeCarte extends StatelessWidget {
-  final VoidCallback onPressed;
-  const _BoutonModeCarte({
-    required this.onPressed,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Colors.white,
-      elevation: 3,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(22),
-        side: const BorderSide(color: Colors.black26),
-      ),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(22),
-        onTap: onPressed,
-        child: const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                Icons.layers,
-                size: 18,
-                color: Colors.black87,
-              ),
-              SizedBox(width: 6),
-              Text(
-                "Cartes",
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.black87,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _OptionModeCarte extends StatelessWidget {
-  final IconData icone;
-  final String libelle;
-  final bool selectionne;
-  final bool sombre;
-  final VoidCallback onTap;
-  const _OptionModeCarte({
-    required this.icone,
-    required this.libelle,
-    required this.selectionne,
-    this.sombre = false,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final couleurTexte = sombre ? KinColors.texteSombre : Colors.black87;
-    return ListTile(
-      leading: Icon(icone, color: couleurTexte),
-      title: Text(
-        libelle,
-        style: TextStyle(fontSize: 15, color: couleurTexte),
-      ),
-      trailing: selectionne
-          ? const Icon(Icons.check_circle, color: KinColors.primary)
-          : null,
-      onTap: onTap,
-    );
-  }
-}
-

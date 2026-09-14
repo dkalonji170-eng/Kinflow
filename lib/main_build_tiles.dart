@@ -4,10 +4,10 @@
 // Usage (sur ta machine, une seule fois) :
 //   flutter run -d linux -t lib/main_build_tiles.dart
 //
-// Télécharge toutes les régions (Afrique z2-6, RDC z7-9, Kinshasa z10-16,
-// satellite + étiquettes z13-16) puis exporte l'archive FMTC vers
-// `build/kinshasa.fmtc`. Copie ensuite ce fichier dans `assets/` et
-// reconstruis l'app : les tuiles seront déjà présentes à la première ouverture.
+// Télécharge les fonds clairs (Afrique z2-6, RDC z7-9, Kinshasa z10-16)
+// puis exporte l'archive FMTC vers `build/kinshasa.fmtc`. Copie ensuite ce
+// fichier dans `assets/` et reconstruis l'app : les tuiles seront déjà
+// présentes à la première ouverture.
 //
 // Option : définir la variable d'environnement KINFLOW_TILES_OUT pour choisir
 // le dossier de sortie.
@@ -31,10 +31,12 @@ Future<void> main() async {
   await store.manage.create();
   print('[BuildTiles] Magasin prêt.');
 
-  print('[BuildTiles] Téléchargement des régions...');
+  print('[BuildTiles] Téléchargement des fonds clairs...');
   await telechargerTachesKinflow(
     store: store,
-    parallelThreads: 4,
+    parallelThreads: 2,
+    rateLimit: 20,
+    regions: listTachesClair,
     onProgression: (nom, effectue, total) {
       print('[BuildTiles] $nom : $effectue/$total tuiles');
     },

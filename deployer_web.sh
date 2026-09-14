@@ -26,6 +26,15 @@ if [ "$1" = "zip" ]; then
   echo "▶ Création de $ZIP (prêt pour Netlify / Vercel)..."
   rm -f "$ZIP"
   cd build/web
+  # L'archive de la carte claire (si présente) est servie à la racine :
+  # l'app la télécharge une seule fois (voir TileArchiveService).
+  for src in ../kinshasa.fmtc ../../assets/kinshasa.fmtc; do
+    if [ -s "$src" ]; then
+      cp "$src" ./kinshasa.fmtc
+      echo "▶ Archive de la carte claire incluse ($src)"
+      break
+    fi
+  done
   if command -v zip >/dev/null 2>&1; then
     zip -rq "../../$ZIP" .
   elif command -v python3 >/dev/null 2>&1; then
@@ -43,6 +52,7 @@ z.close()
   fi
   cd ../..
   echo "✓ Terminé ! Dépose $ZIP sur https://app.netlify.com/drop"
+  echo "  L'app récupérera la carte complète sur https://kinflow.netlify.app/kinshasa.fmtc"
   exit 0
 fi
 

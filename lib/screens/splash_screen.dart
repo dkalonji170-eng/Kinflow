@@ -4,7 +4,7 @@ import 'home_screen.dart';
 import 'auth_screen.dart';
 import '../services/diagnostics_service.dart';
 import '../services/supabase_service.dart';
-import '../theme_provider.dart';
+import '../theme/theme_provider.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});

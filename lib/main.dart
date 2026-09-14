@@ -4,7 +4,7 @@ import 'package:flutter/foundation.dart' show kIsWeb, PlatformDispatcher;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:provider/provider.dart';
-import 'theme_provider.dart';
+import 'theme/theme_provider.dart';
 import 'theme/kinflow_theme.dart';
 import 'screens/auth_screen.dart';
 import 'services/tile_download_service.dart';

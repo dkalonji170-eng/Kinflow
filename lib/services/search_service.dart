@@ -6,6 +6,48 @@ import '../models/search_result.dart';
 import '../models/place_info.dart';
 import 'data_usage_service.dart';
 import 'diagnostics_service.dart';
+import 'road_service.dart' show OverpassGate;
+
+/// Disjoncteur partagé pour les appels Overpass de la recherche.
+class _CircuitBreakerRecherche {
+  static int _echecsConsecutifs = 0;
+  static DateTime? _ouvertJusquau;
+  static const _seuilEchecs = 6;
+  static const _cooldownBase = Duration(seconds: 30);
+  static var _cooldownMultiplier = 1;
+
+  static bool get ouvert {
+    if (_ouvertJusquau == null) return false;
+    if (DateTime.now().isAfter(_ouvertJusquau!)) {
+      _ouvertJusquau = null;
+      return false;
+    }
+    return true;
+  }
+
+  static void enregistrerSucces() {
+    _echecsConsecutifs = 0;
+    _cooldownMultiplier = 1;
+  }
+
+  static void enregistrerEchec() {
+    _echecsConsecutifs++;
+    if (_echecsConsecutifs >= _seuilEchecs) {
+      final cooldown = _cooldownBase * _cooldownMultiplier;
+      _ouvertJusquau = DateTime.now().add(cooldown);
+      _cooldownMultiplier = (_cooldownMultiplier * 2).clamp(1, 8);
+      Journal.a('RECHERCHE',
+          'Disjoncteur Overpass ouvert, pause de ${cooldown.inSeconds} s', {
+        'echecs_consecutifs': _echecsConsecutifs,
+      });
+    }
+  }
+}
+
+Duration _ajouterJitterRecherche(Duration base) {
+  final jitterMs = math.Random().nextInt(1000);
+  return base + Duration(milliseconds: jitterMs);
+}
 
 class _TypePoi {
   final List<String> patterns;
@@ -196,6 +238,97 @@ class SearchService {
   static const int _limiteResultats = 30;
   static const int _tailleMaxCacheRecherches = 40;
   static const String _userAgent = 'KinFlow-App/1.0';
+
+  /// Miroirs Overpass pour la recherche : le serveur principal est vite
+  /// limité en débit (429/504) ; on bascule sur les suivants à chaque échec.
+  static const List<String> _endpointsOverpass = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.openstreetmap.ru/api/interpreter',
+  ];
+
+  /// Dernier miroir utilisé, partagé par toutes les requêtes Overpass du
+  /// service : chaque échec fait avancer l'index pour répartir la charge.
+  static int _indexMiroirOverpass = 0;
+
+  static const int _maxTentativesOverpass = 4;
+  static const Duration _baseBackoffOverpass = Duration(seconds: 2);
+
+  /// Envoie une requête Overpass sur les miroirs avec rotation et repli
+  /// exponentiel en cas de surcharge (429/504), de délai dépassé ou d'échec
+  /// réseau. Renvoie la première réponse 200, ou null après épuisement.
+  Future<http.Response?> _posterOverpass(String body, Duration timeout) async {
+    if (_CircuitBreakerRecherche.ouvert) return null;
+
+    for (var tentative = 0; tentative < _maxTentativesOverpass; tentative++) {
+      final endpoint = _endpointsOverpass[
+          (_indexMiroirOverpass + tentative) % _endpointsOverpass.length];
+      // File d'attente globale Overpass : la recherche ne passe jamais devant
+      // les routes/POIs de la carte quand le serveur souffre.
+      await OverpassGate.attendreCreneau();
+      if (_CircuitBreakerRecherche.ouvert) return null;
+      try {
+        final reponse = await HttpMeter.post(
+          CategorieData.recherche,
+          endpoint,
+          headers: {'User-Agent': _userAgent},
+          body: {'data': body},
+          encode: true,
+          timeout: timeout,
+        );
+
+        if (reponse.statusCode == 200) {
+          _indexMiroirOverpass = (_indexMiroirOverpass + tentative + 1) %
+              _endpointsOverpass.length;
+          _CircuitBreakerRecherche.enregistrerSucces();
+          return reponse;
+        }
+
+        final resoumettre =
+            reponse.statusCode == 429 || reponse.statusCode == 504;
+        if (!resoumettre) {
+          Journal.a('RECHERCHE', 'Overpass a répondu avec un code anormal', {
+            'code_http': reponse.statusCode,
+            'miroir': endpoint,
+          });
+          return null;
+        }
+
+        _CircuitBreakerRecherche.enregistrerEchec();
+        final retryAfter = int.tryParse(reponse.headers['retry-after'] ?? '');
+        final delai = retryAfter != null && retryAfter > 0
+            ? Duration(seconds: retryAfter)
+            : _ajouterJitterRecherche(_baseBackoffOverpass * (1 << tentative));
+        Journal.a('RECHERCHE',
+            'Surcharge Overpass, nouvelle tentative dans ${delai.inSeconds} s', {
+          'code_http': reponse.statusCode,
+          'tentative': tentative + 1,
+          'miroir': endpoint,
+        });
+        await Future<void>.delayed(delai);
+      } on TimeoutException {
+        _CircuitBreakerRecherche.enregistrerEchec();
+        if (tentative >= _maxTentativesOverpass - 1) {
+          _indexMiroirOverpass =
+              (_indexMiroirOverpass + 1) % _endpointsOverpass.length;
+          rethrow;
+        }
+        final delai = _ajouterJitterRecherche(_baseBackoffOverpass * (1 << tentative));
+        await Future<void>.delayed(delai);
+      } on http.ClientException {
+        _CircuitBreakerRecherche.enregistrerEchec();
+        if (tentative >= _maxTentativesOverpass - 1) {
+          _indexMiroirOverpass =
+              (_indexMiroirOverpass + 1) % _endpointsOverpass.length;
+          rethrow;
+        }
+        final delai = _ajouterJitterRecherche(_baseBackoffOverpass * (1 << tentative));
+        await Future<void>.delayed(delai);
+      }
+    }
+    throw Exception('Overpass: échec après $_maxTentativesOverpass tentatives');
+  }
 
   /// Recherche un lieu en fusionnant TROIS services EN LIGNE : Photon
   /// (~100-300 ms, fournit les premières suggestions pendant la frappe),
@@ -461,22 +594,9 @@ class SearchService {
         : _requeteNom(_regexInsensibleAccents(terme));
 
     try {
-      final response = await HttpMeter.post(
-        CategorieData.recherche,
-        'https://overpass-api.de/api/interpreter',
-        headers: {'User-Agent': _userAgent},
-        body: {'data': query},
-        encode: true,
-        timeout: const Duration(seconds: 10),
-      );
-
-      if (response.statusCode != 200) {
-        Journal.a('RECHERCHE', 'Overpass a répondu avec un code anormal', {
-          'code_http': response.statusCode,
-        });
-        return const [];
-      }
-      final data = json.decode(response.body);
+      final reponse = await _posterOverpass(query, const Duration(seconds: 10));
+      if (reponse == null) return const [];
+      final data = json.decode(reponse.body);
       if (data is! Map) return const [];
       final elements = data['elements'] as List? ?? const [];
 
@@ -839,19 +959,9 @@ way["highway"]["name"](around:$_rayonVoiesProches,$lat,$lon);
 out tags geom;
 ''';
     try {
-      final response = await HttpMeter.post(
-        CategorieData.recherche,
-        'https://overpass-api.de/api/interpreter',
-        headers: {'User-Agent': _userAgent},
-        body: {'data': query},
-        encode: true,
-        timeout: const Duration(seconds: 15),
-      );
-
-      if (response.statusCode != 200) {
-        return const (rue: '', avenue: '');
-      }
-      final data = json.decode(response.body);
+      final reponse = await _posterOverpass(query, const Duration(seconds: 15));
+      if (reponse == null) return const (rue: '', avenue: '');
+      final data = json.decode(reponse.body);
       if (data is! Map) return const (rue: '', avenue: '');
       final elements = data['elements'] as List? ?? const [];
       return _voiesLesPlusProches(elements, lat, lon);

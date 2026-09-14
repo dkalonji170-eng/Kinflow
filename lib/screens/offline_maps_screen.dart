@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../main.dart'
     show tileDownloadService, initFmtc, waitForFmtc, fmtcSucceeded;
 import '../services/diagnostics_service.dart';
+import '../services/tile_archive_service.dart';
 import '../services/tile_regions.dart';
 
 class _CarteOffline {
@@ -86,9 +87,14 @@ class _OfflineMapsScreenState extends State<OfflineMapsScreen> {
   double _progress = 0;
   String _status = '';
 
+  double _archiveProgress = 0;
+  bool _archiveEnCours = false;
+  bool _archiveDejaFaite = false;
+
   StreamSubscription<double>? _progressSub;
   StreamSubscription<String>? _statusSub;
   StreamSubscription<String>? _tacheTermineeSub;
+  StreamSubscription<double>? _archiveSub;
 
   @override
   void initState() {
@@ -104,6 +110,9 @@ class _OfflineMapsScreenState extends State<OfflineMapsScreen> {
       _sauvegarderTelechargees();
       _rafraichirStats();
     });
+    _archiveSub = TileArchiveService.instance.progress.listen((p) {
+      if (mounted) setState(() => _archiveProgress = p);
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) => _initialiser());
   }
 
@@ -118,10 +127,14 @@ class _OfflineMapsScreenState extends State<OfflineMapsScreen> {
       await _chargerTelechargees();
       await _rafraichirStats();
       await _calculerTailles();
+      final archiveDejaToujours = kIsWeb ||
+          await TileArchiveService.instance.dejaTelechargee ||
+          await TileArchiveService.instance.dejaComplete;
       if (!mounted) return;
       setState(() {
         _pret = kIsWeb || fmtcSucceeded;
         _initialisationEnCours = false;
+        _archiveDejaFaite = archiveDejaToujours;
       });
     } catch (e) {
       debugPrint('[KinFlow] Erreur init cartes hors ligne: $e');
@@ -186,6 +199,7 @@ class _OfflineMapsScreenState extends State<OfflineMapsScreen> {
     _progressSub?.cancel();
     _statusSub?.cancel();
     _tacheTermineeSub?.cancel();
+    _archiveSub?.cancel();
     super.dispose();
   }
 
@@ -201,6 +215,53 @@ class _OfflineMapsScreenState extends State<OfflineMapsScreen> {
     Journal.i('TUILES', 'Téléchargement de toutes les régions demandé');
     setState(() => _progress = 0);
     unawaited(tileDownloadService.start());
+  }
+
+  /// Télécharge l'archive complète de la carte claire UNE SEULE FOIS puis
+  /// l'importe : ensuite, plus aucune tuile n'est rechargée à chaque
+  /// utilisation.
+  Future<void> _telechargerCarteComplete() async {
+    if (_archiveEnCours || _archiveDejaFaite) return;
+    Journal.i('TUILES', 'Téléchargement de l\'archive complète demandé');
+    setState(() {
+      _archiveEnCours = true;
+      _archiveProgress = 0;
+    });
+    try {
+      final nb = await TileArchiveService.instance.telechargerUneFois();
+      if (!mounted) return;
+      setState(() {
+        _archiveEnCours = false;
+        _archiveDejaFaite = true;
+      });
+      if (nb != null) {
+        final maintenant = DateTime.now();
+        _telechargees['Afrique'] = maintenant;
+        _telechargees['RDC'] = maintenant;
+        _telechargees['Kinshasa'] = maintenant;
+        await _sauvegarderTelechargees();
+        await _rafraichirStats();
+        await _calculerTailles();
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Carte claire complète disponible hors ligne.'),
+        ),
+      );
+    } catch (e) {
+      debugPrint('[KinFlow] Échec téléchargement carte complète: $e');
+      if (!mounted) return;
+      setState(() => _archiveEnCours = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Le téléchargement de la carte a échoué.\n'
+            'Vérifie la connexion puis réessaie.',
+          ),
+        ),
+      );
+    }
   }
 
   Future<void> _effacerTout() async {
@@ -240,9 +301,11 @@ class _OfflineMapsScreenState extends State<OfflineMapsScreen> {
     try {
       await tileDownloadService.cancel();
       await _store.manage.reset();
+      await TileArchiveService.instance.marquerEfface();
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove('cartes_offline');
       _telechargees.clear();
+      if (mounted) setState(() => _archiveDejaFaite = false);
       await _rafraichirStats();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -293,6 +356,7 @@ class _OfflineMapsScreenState extends State<OfflineMapsScreen> {
               children: [
                 if (tileDownloadService.isDownloading) _enTeteProgression(),
                 _enTeteStockage(),
+                _banniereCarteComplete(),
                 Expanded(
                   child: ListView.separated(
                     itemCount: _cartes.length,
@@ -305,6 +369,87 @@ class _OfflineMapsScreenState extends State<OfflineMapsScreen> {
                 _barreActions(),
               ],
             ),
+    );
+  }
+
+  Widget _banniereCarteComplete() {
+    if (kIsWeb || TileArchiveService.archiveUrl.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final colorScheme = Theme.of(context).colorScheme;
+    if (_archiveDejaFaite) {
+      return Container(
+        width: double.infinity,
+        color: colorScheme.primaryContainer,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        child: Row(
+          children: [
+            const Icon(Icons.check_circle, color: Colors.green, size: 20),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Carte claire complète : plus rien à charger.',
+                style: TextStyle(
+                  color: colorScheme.onPrimaryContainer,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return Container(
+      width: double.infinity,
+      color: colorScheme.surfaceContainerHighest,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Carte claire complète (Afrique, RDC, Kinshasa)',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '≈ 110 Mo, à télécharger une seule fois. Ensuite la carte '
+            'fonctionne hors ligne, sans recharger les tuiles.',
+            style: TextStyle(color: colorScheme.onSurfaceVariant, fontSize: 11),
+          ),
+          const SizedBox(height: 8),
+          if (_archiveEnCours) ...[
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: (_archiveProgress / 100).clamp(0, 1),
+                minHeight: 6,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Téléchargement... ${_archiveProgress.toStringAsFixed(0)} %',
+              style: TextStyle(
+                color: colorScheme.onSurfaceVariant,
+                fontSize: 11,
+              ),
+            ),
+          ] else
+            Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton.icon(
+                onPressed: _archiveEnCours || tileDownloadService.isDownloading
+                    ? null
+                    : () => unawaited(_telechargerCarteComplete()),
+                icon: const Icon(Icons.download, size: 18),
+                label: const Text(
+                  'Télécharger une fois',
+                  style: TextStyle(fontSize: 11),
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 

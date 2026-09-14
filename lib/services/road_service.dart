@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math' show max, min;
+import 'dart:math' show max, min, Random;
 import 'package:flutter/foundation.dart' show compute, debugPrint;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:http/http.dart' as http;
@@ -8,6 +8,81 @@ import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/road_segment.dart';
 import 'diagnostics_service.dart';
+
+/// Disjoncteur partagé pour les appels Overpass : après un certain nombre
+/// d'échecs consécutifs, on suspend les tentatives pendant un temps donné
+/// pour ne pas marteler un serveur déjà surchargé. Réinitialisé à chaque
+/// succès.
+class _CircuitBreakerOverpass {
+  static int _echecsConsecutifs = 0;
+  static DateTime? _ouvertJusquau;
+
+  /// Seuil d'échecs avant ouverture du disjoncteur.
+  static const _seuilEchecs = 6;
+
+  /// Durée de suspension après ouverture (augmente à chaque ouverture).
+  static const _cooldownBase = Duration(seconds: 30);
+  static var _cooldownMultiplier = 1;
+
+  static bool get ouvert {
+    if (_ouvertJusquau == null) return false;
+    if (DateTime.now().isAfter(_ouvertJusquau!)) {
+      _ouvertJusquau = null;
+      return false;
+    }
+    return true;
+  }
+
+  static void enregistrerSucces() {
+    _echecsConsecutifs = 0;
+    _cooldownMultiplier = 1;
+  }
+
+  static void enregistrerEchec() {
+    _echecsConsecutifs++;
+    if (_echecsConsecutifs >= _seuilEchecs) {
+      final cooldown = _cooldownBase * _cooldownMultiplier;
+      _ouvertJusquau = DateTime.now().add(cooldown);
+      _cooldownMultiplier = (_cooldownMultiplier * 2).clamp(1, 8);
+      Journal.a('CARTE',
+          'Disjoncteur Overpass ouvert, pause de ${cooldown.inSeconds} s', {
+        'echecs_consecutifs': _echecsConsecutifs,
+      });
+    }
+  }
+}
+
+/// Ajoute un jitter aléatoire à un délai pour éviter les tempêtes
+/// (thundering herd) quand plusieurs requêtes échouent simultanément.
+Duration _ajouterJitter(Duration base) {
+  final jitterMs = Random().nextInt(1000);
+  return base + Duration(milliseconds: jitterMs);
+}
+
+/// Garde-fou GLOBAL sur les départs de requêtes Overpass de toute l'app
+/// (routes, POIs, recherche, voies proches, couloir d'itinéraire) : au plus
+/// un départ de requête toutes les [_intervalle], quel que soit le module.
+///
+/// Sans ce verrou, le panning, le chargeur de POIs et un calcul d'itinéraire
+/// peuvent marteler les miroirs EN PARALLÈLE : chaque échec relance alors
+/// plusieurs boucles de reprise qui s'amplifient mutuellement (429/504).
+class OverpassGate {
+  /// Espacement minimum entre deux départs de requêtes Overpass.
+  static const Duration _intervalle = Duration(milliseconds: 2000);
+
+  /// Prochain créneau autorisé pour un départ de requête.
+  static DateTime _prochainCreneau = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// Attend le prochain créneau puis réserve le suivant : les requêtes
+  /// concurrentes se rangent en file et partent en série, jamais en rafale.
+  static Future<void> attendreCreneau() async {
+    final maintenant = DateTime.now();
+    if (_prochainCreneau.isAfter(maintenant)) {
+      await Future<void>.delayed(_prochainCreneau.difference(maintenant));
+    }
+    _prochainCreneau = DateTime.now().add(_intervalle);
+  }
+}
 
 class _EntreeCache {
   final List<RoadSegment> segments;
@@ -31,6 +106,7 @@ class RoadService {
     'https://overpass-api.de/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
     'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.openstreetmap.ru/api/interpreter',
   ];
 
   static int _indexMiroir = 0;
@@ -50,7 +126,10 @@ class RoadService {
       'unclassified|residential|living_street|service|road';
 
   static const _cacheMax = 40;
-  static const _dureeFraicheur = Duration(minutes: 30);
+  // Le réseau routier de Kinshasa évolue peu : on garde les zones téléchargées
+  // 7 jours au lieu de 30 minutes, ce qui évite de recontacter Overpass à
+  // chaque itinéraire déjà demandé.
+  static const _dureeFraicheur = Duration(days: 7);
 
   /// v3 : la requête est désormais filtrée sur l'aire administrative de
   /// Kinshasa — les entrées v2 contiennent des routes de Brazzaville.
@@ -128,9 +207,13 @@ class RoadService {
   }
 
   static const _maxTentatives = 3;
-  static const _baseBackoff = Duration(seconds: 2);
+  static const _baseBackoff = Duration(seconds: 3);
 
   Future<List<RoadSegment>> _telecharger(String regex, LatLngBounds bounds) async {
+    if (_CircuitBreakerOverpass.ouvert) {
+      throw Exception('Overpass: disjoncteur ouvert, pause de secours');
+    }
+
     final query = '''
 [out:json][timeout:25];
 area["boundary"="administrative"]["admin_level"="4"]["name"="Kinshasa"]->.kin;
@@ -141,9 +224,10 @@ out geom;
 ''';
 
     for (var tentative = 0; tentative < _maxTentatives; tentative++) {
-      // Bascule vers le miroir suivant à chaque tentative : après un 429/504
-      // ou un timeout, on n'écrase pas le même serveur surchargé.
       final endpoint = _endpoints[(_indexMiroir + tentative) % _endpoints.length];
+      // File d'attente globale Overpass : même un réseau sain ne doit jamais
+      // envoyer plus d'une requête toutes les 2 s.
+      await OverpassGate.attendreCreneau();
       try {
         final reponse = await http
             .post(
@@ -155,7 +239,8 @@ out geom;
 
         if (reponse.statusCode == 200) {
           _indexMiroir = (_indexMiroir + tentative + 1) % _endpoints.length;
-          return compute(_parser, json.decode(reponse.body));
+          _CircuitBreakerOverpass.enregistrerSucces();
+          return compute(_decoderEtParser, reponse.body);
         }
 
         final resoumettre = reponse.statusCode == 429 ||
@@ -164,12 +249,13 @@ out geom;
           throw Exception('Overpass: HTTP ${reponse.statusCode}');
         }
 
+        _CircuitBreakerOverpass.enregistrerEchec();
         final retryAfter = int.tryParse(
           reponse.headers['retry-after'] ?? '',
         );
         final delai = retryAfter != null && retryAfter > 0
             ? Duration(seconds: retryAfter)
-            : _baseBackoff * (1 << tentative);
+            : _ajouterJitter(_baseBackoff * (1 << tentative));
         Journal.a('CARTE', 'Surcharge Overpass, nouvelle tentative dans ${delai.inSeconds} s', {
           'code_http': reponse.statusCode,
           'tentative': tentative + 1,
@@ -177,19 +263,21 @@ out geom;
         });
         await Future<void>.delayed(delai);
       } on TimeoutException {
+        _CircuitBreakerOverpass.enregistrerEchec();
         if (tentative >= _maxTentatives - 1) rethrow;
-        final delai = _baseBackoff * (1 << tentative);
+        final delai = _ajouterJitter(_baseBackoff * (1 << tentative));
         Journal.a('CARTE', 'Délai dépassé Overpass, nouvelle tentative dans ${delai.inSeconds} s', {
           'tentative': tentative + 1,
           'miroir': endpoint,
         });
         await Future<void>.delayed(delai);
       } on http.ClientException {
+        _CircuitBreakerOverpass.enregistrerEchec();
         if (tentative >= _maxTentatives - 1) {
           _indexMiroir = (_indexMiroir + 1) % _endpoints.length;
           rethrow;
         }
-        final delai = _baseBackoff * (1 << tentative);
+        final delai = _ajouterJitter(_baseBackoff * (1 << tentative));
         await Future<void>.delayed(delai);
       }
     }
@@ -329,6 +417,11 @@ out geom;
             ),
         ],
       );
+
+  /// Décodage JSON + parsing exécutés ENTIÈREMENT dans l'isolat : le gros
+  /// payload Overpass (plusieurs Mo pour un couloir dense) ne bloque plus
+  /// jamais le thread UI, cause de gel au premier calcul d'itinéraire.
+  static List<RoadSegment> _decoderEtParser(String brut) => _parser(json.decode(brut));
 
   static List<RoadSegment> _parser(dynamic json) {
     final resultats = <RoadSegment>[];

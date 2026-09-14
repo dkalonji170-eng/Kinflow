@@ -20,6 +20,13 @@ class RouteResult {
   /// point (arrivée directement sur la route).
   final int indexFinRoute;
 
+  /// Identifiants (id OSM) des segments de circulation empruntés par le
+  /// tracé bleu → vert (ordonnancement libre). Renseigné par le moteur
+  /// local : la carte affiche l'itinéraire en sélectionnant EXACTEMENT ces
+  /// polylignes colorées déjà chargées et en masquant toutes les autres.
+  /// Vide (repli OSRM) : la carte se rabat sur [points].
+  final List<int> segmentsIds;
+
   const RouteResult({
     required this.points,
     required this.distanceMeters,
@@ -27,6 +34,7 @@ class RouteResult {
     this.severites,
     this.indexDebutRoute = 0,
     this.indexFinRoute = -1,
+    this.segmentsIds = const [],
   });
 
   /// Borne de début de la portion routée (colorée), toujours valide.

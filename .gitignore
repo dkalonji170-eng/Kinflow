@@ -45,4 +45,15 @@ app.*.map.json
 /android/app/release
 
 # Binaire résiduel du projet (inutile dans le dépôt)
-/-
+/kinflow
+
+# Artefacts de compilation / déploiement web
+/kinflow-web.zip
+/kinflow_web/
+/export
+
+# Rapports de build Android
+android/build/
+
+# Rapports compilés (éviter de versionner les documents générés)
+*.docx

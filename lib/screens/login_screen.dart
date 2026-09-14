@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/supabase_service.dart';
-import '../theme_provider.dart';
+import '../theme/theme_provider.dart';
 import 'home_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -67,57 +67,67 @@ class _LoginScreenState extends State<LoginScreen> {
         title: const Text('Connexion'),
         centerTitle: true,
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const SizedBox(height: 24),
-            const Text(
-              'Entrez votre nom et votre code',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 24),
-            TextField(
-              controller: _nomController,
-              textCapitalization: TextCapitalization.words,
-              decoration: const InputDecoration(
-                labelText: 'Nom',
-                border: OutlineInputBorder(),
+      body: SingleChildScrollView(
+        // Le clavier peut masquer le bas du formulaire : on laisse défiler
+        // le contenu et on ajoute la hauteur du clavier en bas pour que le
+        // bouton « Se connecter » reste accessible (et visible) sans
+        // écraser la colonne (dépassement). C'est aussi ce qui évite le bug
+        // au retour clavier (bouton retour du téléphone).
+        padding: EdgeInsets.only(
+          bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const SizedBox(height: 24),
+              const Text(
+                'Entrez votre nom et votre code',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
-            ),
-            const SizedBox(height: 15),
-            TextField(
-              controller: _codeController,
-              textCapitalization: TextCapitalization.characters,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 24,
-                letterSpacing: 4,
-                fontWeight: FontWeight.bold,
+              const SizedBox(height: 24),
+              TextField(
+                controller: _nomController,
+                textCapitalization: TextCapitalization.words,
+                decoration: const InputDecoration(
+                  labelText: 'Nom',
+                  border: OutlineInputBorder(),
+                ),
               ),
-              decoration: const InputDecoration(
-                labelText: 'Code',
-                hintText: 'XXXX-XXXX',
+              const SizedBox(height: 15),
+              TextField(
+                controller: _codeController,
+                textCapitalization: TextCapitalization.characters,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 24,
+                  letterSpacing: 4,
+                  fontWeight: FontWeight.bold,
+                ),
+                decoration: const InputDecoration(
+                  labelText: 'Code',
+                  hintText: 'XXXX-XXXX',
+                ),
+                onSubmitted: (_) => _connecter(),
               ),
-              onSubmitted: (_) => _connecter(),
-            ),
-            const SizedBox(height: 24),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                foregroundColor: couleur.onSurface,
+              const SizedBox(height: 24),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  foregroundColor: couleur.onSurface,
+                ),
+                onPressed: _chargement ? null : _connecter,
+                child: _chargement
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Se connecter'),
               ),
-              onPressed: _chargement ? null : _connecter,
-              child: _chargement
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Text('Se connecter'),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

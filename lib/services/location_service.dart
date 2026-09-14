@@ -23,7 +23,20 @@ class LocationService {
   /// chaque échec est consigné dans le journal de diagnostic.
   Future<Position?> obtenirPosition() async {
     Journal.i('POSITION', 'Demande de position envoyée au GPS');
+    try {
+      return await _obtenirPositionInterne();
+    } catch (e) {
+      // Certains téléphones rejettent une PermissionException, une
+      // PlatformException ou « User denied Geolocation » au niveau du canal :
+      // on la capture pour ne jamais la laisser remonter en erreur non gérée.
+      Journal.e('POSITION', 'Erreur du service de localisation', {
+        'erreur': '$e',
+      });
+      return null;
+    }
+  }
 
+  Future<Position?> _obtenirPositionInterne() async {
     bool serviceActif =
         await Geolocator.isLocationServiceEnabled();
 
@@ -63,31 +76,22 @@ class LocationService {
 
 
     final debut = DateTime.now();
-    try {
-
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.bestForNavigation,
-          timeLimit: Duration(seconds: 15),
-        ),
-      );
-      final duree = DateTime.now().difference(debut).inMilliseconds;
-      Journal.s('POSITION', 'Fix GPS obtenu', {
-        'latitude': position.latitude,
-        'longitude': position.longitude,
-        'precision_m': position.accuracy,
-        'vitesse_ms': position.speed,
-        'cap_deg': position.heading,
-        'duree_ms': duree,
-      });
-      return position;
-
-    } catch (e) {
-      Journal.e('POSITION', 'Fix GPS impossible', {'erreur': '$e'});
-      return null;
-
-    }
-
+    final position = await Geolocator.getCurrentPosition(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        timeLimit: Duration(seconds: 15),
+      ),
+    );
+    final duree = DateTime.now().difference(debut).inMilliseconds;
+    Journal.s('POSITION', 'Fix GPS obtenu', {
+      'latitude': position.latitude,
+      'longitude': position.longitude,
+      'precision_m': position.accuracy,
+      'vitesse_ms': position.speed,
+      'cap_deg': position.heading,
+      'duree_ms': duree,
+    });
+    return position;
   }
 
 }

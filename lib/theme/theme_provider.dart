@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
-import 'services/diagnostics_service.dart';
-import 'services/supabase_service.dart';
+import '../services/diagnostics_service.dart';
+import '../services/supabase_service.dart';
 
 class ThemeProvider extends ChangeNotifier {
   bool modeSombre = false;

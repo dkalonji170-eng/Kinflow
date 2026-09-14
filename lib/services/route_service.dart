@@ -1,19 +1,45 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:latlong2/latlong.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/route_result.dart';
 import 'data_usage_service.dart';
 import 'diagnostics_service.dart';
 
 class RouteService {
+  /// Serveurs OSRM. Le serveur public principal applique vite des quotas
+  /// (429) : le miroir openstreetmap.de prend le relais en parallèle. Un
+  /// round de secours relance toutes les requêtes si aucun serveur n'a
+  /// répondu, au cas où le 429 est tombé pendant qu'un créneau se libère.
   static const List<String> _endpoints = [
     'https://router.project-osrm.org',
     'https://routing.openstreetmap.de/routed-car',
-    'https://routing.fossgis.de/routed-car',
   ];
 
+  /// Le serveur OSRM public peut être lent depuis certaines régions : on lui
+  /// laisse davantage de temps qu'aux petites requêtes de la carte. Le timeout
+  /// est volontairement large pour absorber les connexions instables et les
+  /// petits débits (la réponse d'itinéraire reste une petite charge JSON).
+  static const _timeoutRequete = Duration(seconds: 30);
+
+  /// Nombre de rounds de tentative : en cas d'échec total, on respire puis on
+  /// relance, pour traverser un pic de quotas (429) passager comme une
+  /// période de connexion instable. Les requêtes étant en parallèle, les
+  /// rounds supplémentaires ne ralentissent jamais le cas réseau sain.
+  static const _maxRounds = 3;
+  static const _attenteEntreRounds = Duration(seconds: 3);
+
   static const String _userAgent = 'KinFlow-App/1.0';
+
+  static const _cacheMaxMemoire = 20;
+
+  /// Le cache OSRM est aussi persisté localement : un itinéraire déjà demandé
+  /// revient instantanément, sans aucun appel réseau, même après un
+  /// redémarrage de l'app.
+  static const _prefPrefixe = 'kinflow_osrm_cache_v1_';
+  static const _prefMax = 50;
 
   final Map<String, RouteResult> _cache = {};
 
@@ -26,8 +52,15 @@ class RouteService {
     final cle = _cleCache(points);
     final enCache = _cache[cle];
     if (enCache != null) {
-      Journal.i('OSRM', 'Itinéraire servi depuis le cache');
+      Journal.i('OSRM', 'Itinéraire servi depuis le cache mémoire');
       return enCache;
+    }
+
+    final persiste = await _trouverPersistant(cle);
+    if (persiste != null) {
+      _cache[cle] = persiste;
+      Journal.i('OSRM', 'Itinéraire servi depuis le cache local');
+      return persiste;
     }
 
     Journal.i('OSRM', 'Requête envoyée aux serveurs OSRM', {
@@ -41,16 +74,28 @@ class RouteService {
         .join(';');
 
     // Toutes les requêtes partent en parallèle : on garde la première
-    // réponse valide, sans attendre les autres endpoints.
-    final resultat = await _premierSucces([
+    // réponse valide, sans attendre les autres endpoints. Si aucun serveur
+    // n'a répondu (quota épuisé, panne), on respire et on relance une fois.
+    var resultat = await _premierSucces([
       for (final base in _endpoints) _essayer(base, coord),
     ]);
+    for (var round = 1; resultat == null && round < _maxRounds; round++) {
+      Journal.a('OSRM',
+          'Aucun serveur disponible, nouveau round dans ${_attenteEntreRounds.inSeconds} s', {
+        'round': round + 1,
+      });
+      await Future<void>.delayed(_attenteEntreRounds * round);
+      resultat = await _premierSucces([
+        for (final base in _endpoints) _essayer(base, coord),
+      ]);
+    }
 
     if (resultat != null) {
-      while (_cache.length > 20) {
+      while (_cache.length > _cacheMaxMemoire) {
         _cache.remove(_cache.keys.first);
       }
       _cache[cle] = resultat;
+      unawaited(_ecrirePersistant(cle, resultat));
     } else {
       Journal.a('OSRM', 'Aucun des serveurs OSRM n\'a donné d\'itinéraire');
     }
@@ -67,7 +112,7 @@ class RouteService {
         CategorieData.itineraire,
         url.toString(),
         headers: {'User-Agent': _userAgent},
-        timeout: const Duration(seconds: 8),
+        timeout: _timeoutRequete,
       );
 
       if (response.statusCode != 200) {
@@ -139,6 +184,72 @@ class RouteService {
   String _cleCache(List<LatLng> points) {
     String arr(double v) => v.toStringAsFixed(3);
     return points.map((p) => '${arr(p.latitude)},${arr(p.longitude)}').join('|');
+  }
+
+  Future<RouteResult?> _trouverPersistant(String cle) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final brut = prefs.getString(_prefPrefixe + cle);
+      if (brut == null) return null;
+      final resultat = _resultatDepuisJson(json.decode(brut));
+      if (resultat == null) return null;
+      return resultat;
+    } catch (e) {
+      debugPrint('[KinFlow] Lecture cache OSRM échouée: $e');
+      return null;
+    }
+  }
+
+  Future<void> _ecrirePersistant(String cle, RouteResult r) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _prefPrefixe + cle,
+        json.encode(_resultatVersJson(r)),
+      );
+      await _prunePersistant(prefs);
+    } catch (e) {
+      debugPrint('[KinFlow] Écriture cache OSRM échouée: $e');
+    }
+  }
+
+  Future<void> _prunePersistant(SharedPreferences prefs) async {
+    final cles =
+        prefs.getKeys().where((k) => k.startsWith(_prefPrefixe)).toList();
+    if (cles.length <= _prefMax) return;
+    cles.sort();
+    for (final k in cles.take(cles.length - _prefMax)) {
+      await prefs.remove(k);
+    }
+  }
+
+  Map<String, dynamic> _resultatVersJson(RouteResult r) => {
+        'points': [
+          for (final p in r.points) {'lat': p.latitude, 'lon': p.longitude},
+        ],
+        'distanceMeters': r.distanceMeters,
+        'durationSeconds': r.durationSeconds,
+        'indexDebutRoute': r.indexDebutRoute,
+        'indexFinRoute': r.indexFinRoute,
+      };
+
+  RouteResult? _resultatDepuisJson(dynamic brut) {
+    final j = brut as Map<String, dynamic>;
+    final pointsJson = (j['points'] as List? ?? const []);
+    if (pointsJson.length < 2) return null;
+    return RouteResult(
+      points: [
+        for (final p in pointsJson)
+          LatLng(
+            ((p as Map)['lat'] as num).toDouble(),
+            (p['lon'] as num).toDouble(),
+          ),
+      ],
+      distanceMeters: (j['distanceMeters'] as num?)?.toDouble() ?? 0,
+      durationSeconds: (j['durationSeconds'] as num?)?.toDouble() ?? 0,
+      indexDebutRoute: (j['indexDebutRoute'] as num?)?.toInt() ?? 0,
+      indexFinRoute: (j['indexFinRoute'] as num?)?.toInt() ?? -1,
+    );
   }
 
   List<LatLng> _decoderPolyline(String polyline) {

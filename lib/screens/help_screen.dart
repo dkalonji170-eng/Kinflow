@@ -34,7 +34,7 @@ class HelpScreen extends StatelessWidget {
           const ListTile(
             leading: Icon(Icons.phone),
             title: Text("Téléphone"),
-            subtitle: Text("+243 972278340"),
+            subtitle: Text("+243 972278341"),
           ),
           const Divider(),
           ListTile(

@@ -1,11 +1,14 @@
+import 'dart:async';
+import 'dart:isolate';
 import 'dart:math' as math;
-import 'package:flutter/foundation.dart' show compute, debugPrint;
+import 'package:flutter/foundation.dart' show compute, debugPrint, kIsWeb;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 
 import '../models/road_segment.dart';
 import '../models/route_result.dart';
 import 'diagnostics_service.dart';
+import 'offline_routes.dart';
 import 'road_service.dart';
 import 'traffic_simulator.dart';
 import 'traffic_stats_service.dart';
@@ -55,10 +58,17 @@ class _ArgumentsItineraire {
   final List<_PointRoute> points;
   final List<_ZoneRoute> zones;
 
+  /// Port de sortie vers l'isolat principal : le moteur y envoie un message
+  /// chaque fois qu'il doit chercher au-delà du premier palier de routes
+  /// (première fournée de lignes jugée non valable). L'interface affiche
+  /// alors « réflexion profonde » pendant le calcul. Null sans abonné.
+  final SendPort? porteEvenements;
+
   const _ArgumentsItineraire({
     required this.segments,
     required this.points,
     required this.zones,
+    this.porteEvenements,
   });
 }
 
@@ -129,6 +139,28 @@ class _Tas {
     }
     return racine;
   }
+}
+
+/// Un chemin trouvé par Dijkstra dans le graphe : sa suite de nœuds (le
+/// premier est le départ, le dernier l'arrivée) et les arêtes empruntées
+/// dans l'ordre. [cout] est le coût de la phase 1 (distance + pénalités
+/// géométriques, SANS facteur de trafic).
+class _Chemin {
+  final List<int> noeuds;
+  final List<_Arete> aretes;
+  final double cout;
+
+  const _Chemin(this.noeuds, this.aretes, this.cout);
+}
+
+/// Candidat au classement final : les arêtes de chaque jambe du parcours
+/// (départ → étape éventuelle → arrivée) et les tronçons de chaussée utilisés
+/// (pour ne jamais réemprunter une rue déjà prise par une autre jambe).
+class _Candidat {
+  final List<List<_Arete>> jambes;
+  final Set<int> troncons;
+
+  const _Candidat(this.jambes, this.troncons);
 }
 
 /// Graphe des rues : chaque segment devient une arête entre ses deux bouts,
@@ -234,6 +266,7 @@ class ItineraireService {
     LatLng arrivee, {
     List<ZoneTrafic> zones = const [],
     List<LatLng> etapes = const [],
+    void Function()? onRechercheElargie,
   }) async {
     // On ne charge que le couloir entre les points du parcours (avec marge),
     // pas toute la ville : l'itinéraire apparaît vite.
@@ -245,22 +278,85 @@ class ItineraireService {
     // grands axes, qui suffisent à relier deux points éloignés.
     final lointain = (couloir.north - couloir.south) > 0.08 ||
         (couloir.east - couloir.west) > 0.08;
-    final List<RoadSegment> segments;
+
+    // L'itinéraire se calcule sur le VRAI réseau routier, servi par Overpass
+    // (détail au point de départ, grands axes si la destination est loin).
+    // Le graphe embarqué (vraies routes OSM de Kinshasa, ~670 Ko, décodé une
+    // seule fois puis gardé en mémoire) est préparé EN MÊME TEMPS : sur une
+    // connexion faible, où Overpass répond lentement ou jamais (timeouts,
+    // 429, réseau public africain saturé), on affiche en quelques secondes un
+    // itinéraire correct au lieu d'attendre la fin de la chaîne de tentatives
+    // (parfois plusieurs minutes). Sur une connexion saine, Overpass gagne
+    // normalement la course.
+    final secours = _segmentsSecours(couloir);
+    final reseau = _roads.obtenirRoutes(couloir, detailsComplets: !lointain);
+    // Si on répond d'abord avec le secours, le futur réseau est abandonné :
+    // on avale son éventuelle erreur, sinon elle serait « non traitée ».
+    reseau.then((_) {}, onError: (_) {});
+
+    List<RoadSegment> segments;
     try {
-      segments = await _roads.obtenirRoutes(
-        couloir,
-        detailsComplets: !lointain,
-      );
-    } catch (e) {
-      // Réseau Overpass indisponible : on renvoie null pour que l'appelant
-      // bascule sur OSRM au lieu de laisser le calcul bloqué.
+      segments = await reseau.timeout(_budgetSecours(lointain));
+    } on TimeoutException {
+      // Connexion faible : Overpass n'a pas répondu dans le budget. On sert
+      // immédiatement l'itinéraire calculé sur le graphe embarqué.
+      Journal.a('MOTEUR LOCAL', 'Connexion faible : itinéraire sur le graphe '
+          'embarqué', {
+        'budget_s': _budgetSecours(lointain).inSeconds,
+      });
+      segments = await _secoursOuReseau(secours, reseau);
+    } on Exception catch (e) {
+      // Réseau Overpass indisponible : on essaie d'abord le graphe embarqué.
       Journal.e('MOTEUR LOCAL', 'Chargement des routes impossible', {
         'erreur': '$e',
         'mode': lointain ? 'grands axes' : 'détail complet',
       });
       debugPrint('[KinFlow] Échec chargement routes itinéraire: $e');
-      return null;
+      segments = await _secoursOuReseau(secours, reseau);
     }
+    return _calculerLocal(
+        segments, lointain, zones, etapes, depart, arrivee,
+        onRechercheElargie: onRechercheElargie);
+  }
+
+  /// Budget de patience avant de servir le graphe embarqué : une connexion
+  /// trop lente ne rattrape pas son retard à force de tentatives ; autant
+  /// afficher vite un bon itinéraire local qu'attendre un réseau défaillant.
+  static Duration _budgetSecours(bool lointain) =>
+      Duration(seconds: lointain ? 10 : 6);
+
+  /// Segments du graphe embarqué couvrant [couloir] : zéro connexion, zéro
+  /// méga-octet téléchargé.
+  Future<List<RoadSegment>> _segmentsSecours(LatLngBounds couloir) async =>
+      await OfflineRoutes.segmentsPour(couloir) ?? const [];
+
+  /// Repli : les segments locaux s'ils sont utilisables, sinon on laisse le
+  /// réseau finir (mêmes délais qu'avant la course) ; `[]` signale l'échec
+  /// total (l'appelant retombera sur OSRM ou affichera l'erreur).
+  Future<List<RoadSegment>> _secoursOuReseau(
+      Future<List<RoadSegment>> secours,
+      Future<List<RoadSegment>> reseau) async {
+    final locaux = await secours;
+    if (locaux.isNotEmpty) return locaux;
+    try {
+      final s = await reseau;
+      if (s.isNotEmpty) return s;
+    } on Exception {
+      // Échec réseau déjà journalisé par l'appelant.
+    }
+    return const [];
+  }
+
+  /// Lance le calcul Dijkstra en isolat sur [segments] déjà chargés.
+  Future<RouteResult?> _calculerLocal(
+    List<RoadSegment> segments,
+    bool lointain,
+    List<ZoneTrafic> zones,
+    List<LatLng> etapes,
+    LatLng depart,
+    LatLng arrivee, {
+    void Function()? onRechercheElargie,
+  }) async {
     if (segments.length < 2) {
       Journal.a('MOTEUR LOCAL', 'Réseau routier trop pauvre pour calculer', {
         'segments_recus': segments.length,
@@ -268,12 +364,23 @@ class ItineraireService {
       return null;
     }
 
+    final parcours = [depart, ...etapes, arrivee];
     Journal.i('MOTEUR LOCAL', 'Calcul Dijkstra lancé en isolat', {
       'segments': segments.length,
       'zones_trafic': zones.length,
       'etapes': etapes.length,
       'mode': lointain ? 'grands axes' : 'détail complet',
     });
+    // Port de retour de l'isolat : chaque élargissement de la recherche
+    // (première fournée ne convenant pas) y est rapporté à l'interface.
+    // En Web, dart:isolate n'existe pas : compute replie sur le fil
+    // principal et l'événement d'élargissement n'est simplement pas émis.
+    ReceivePort? porte;
+    StreamSubscription<dynamic>? ecoute;
+    if (!kIsWeb && onRechercheElargie != null) {
+      porte = ReceivePort();
+      ecoute = porte.listen((_) => onRechercheElargie());
+    }
     try {
       final resultat = await compute(
         _calculerChemin,
@@ -285,6 +392,7 @@ class ItineraireService {
           zones: [
             for (final z in zones) _zoneRoutePour(z),
           ],
+          porteEvenements: porte?.sendPort,
         ),
       );
       if (resultat == null) {
@@ -298,6 +406,9 @@ class ItineraireService {
       });
       debugPrint('[KinFlow] Échec calcul chemin local: $e');
       return null;
+    } finally {
+      ecoute?.cancel();
+      porte?.close();
     }
   }
 
@@ -352,10 +463,15 @@ RouteResult? _calculerChemin(_ArgumentsItineraire args) {
 
   // Snap de chaque point du parcours sur le réseau de rues.
   final snaps = <_Snap>[];
+  final raccords = <List<_Snap>>[];
   for (final p in parcours) {
     final snap = _segmentLePlusProche(p, segments);
     if (snap == null) return null;
     snaps.add(snap);
+    // En plus de la rue la plus proche, on relie aussi les rues voisines :
+    // si le point tombe dans une impasse isolée du graphe (garage, allée),
+    // Dijkstra rejoint quand même la chaussée principale au lieu d'échouer.
+    raccords.add(_raccordsElargis(p, snap, segments));
   }
 
   // Découpe chaque rue en tronçons entre carrefours : un grand boulevard
@@ -375,25 +491,44 @@ RouteResult? _calculerChemin(_ArgumentsItineraire args) {
     final longueur = _longueur(t.points);
     if (longueur <= 0) continue;
     final sev = _severitePour(args, simulateur, t.segment, maintenant);
-    final cout = longueur * _facteur(sev);
+    // Phase 1 : le classement des 10 candidats se fait SANS trafic (coût =
+    // distance uniquement). La sévérité reste stockée sur l'arête pour la
+    // phase 2 (classement par distance + trafic) et la coloration du tracé.
+    final cout = longueur;
     final a = graphe.noeudPour(t.points.first);
     final b = graphe.noeudPour(t.points.last);
     graphe.ajouterArete(a, b, t.points, longueur, cout, sev, idTroncon: ti);
   }
 
-  // Nœud virtuel par point du parcours, chacun relié à sa rue de
+  // Nœud virtuel par point du parcours, chacun relié à ses rues de
   // raccrochage : les jambes Dijkstra passent obligatoirement par eux.
+  // Une étape (point intermédiaire) devient un passage OBLIGÉ SUR la
+  // chaussée, au point projeté : comme OSRM/Yango, on route jusqu'à la
+  // projection plutôt qu'à un drapeau hors route, pour éviter un
+  // aller-retour qui dessinerait deux lignes superposées sur la même rue.
   final idsVirtuels = <int>[];
   for (var i = 0; i < parcours.length; i++) {
-    final id = graphe.nouveauNoeud(parcours[i]);
+    final estEtape = 0 < i && i < parcours.length - 1;
+    final id = graphe.nouveauNoeud(estEtape ? snaps[i].projete : parcours[i]);
     idsVirtuels.add(id);
-    _relierSnap(
-        graphe, args, simulateur, maintenant, id, parcours[i], snaps[i]);
+    if (estEtape) {
+      _relierSnap(
+          graphe, args, simulateur, maintenant, id, snaps[i].projete, snaps[i]);
+      continue;
+    }
+    for (final snap in raccords[i]) {
+      _relierSnap(
+          graphe, args, simulateur, maintenant, id, parcours[i], snap);
+    }
   }
 
   // Départ et arrivée d'une même rue : raccourci direct sans détour par
-  // les nœuds des extrémités de la chaussée.
+  // les nœuds des extrémités de la chaussée. (Une étape n'entre pas dans
+  // ce raccourci : son nœud est déjà sur la chaussée.)
   for (var i = 0; i + 1 < parcours.length; i++) {
+    final aEtape = 0 < i && i < parcours.length - 1;
+    final bEtape = 0 < i + 1 && i + 1 < parcours.length - 1;
+    if (aEtape || bEtape) continue;
     if (snaps[i].segment.id != snaps[i + 1].segment.id) continue;
     final a = parcours[i];
     final b = parcours[i + 1];
@@ -408,36 +543,203 @@ RouteResult? _calculerChemin(_ArgumentsItineraire args) {
       idsVirtuels[i + 1],
       [a, projA, projB, b],
       d,
-      d * _facteur(sev),
+      d,
       sev,
     );
   }
 
-  // Une jambe Dijkstra par paire consécutive : chaque étape est un passage
-  // obligé entre le départ (ou l'étape précédente) et la suite du parcours.
+  // ----- Phase 1 : les chemins les plus rapides, SANS trafic -----
+  // Le coût des arêtes est la distance pure (plus les pénalités géométriques
+  // anti-zigzag) : Yen génère des chemins distincts, les plus courts. On
+  // regarde les couleurs après chaque palier de [_kCheminsMax] : si la
+  // meilleure ligne est propre (≥ 50 % de vert, 0 % de rouge, 0 % de noir,
+  // < 30 % d'orange foncé), on s'arrête ; sinon on cherche 5 nouvelles lignes
+  // (jamais un recalcul des chemins déjà produits), jusqu'au plafond de
+  // [_kCheminsPlafond]. Au-delà, on garde la meilleure quelle que soit sa
+  // couleur. Même logique quand une étape est ajoutée : chaque nouvelle ligne
+  // de la première jambe est étendue aux étapes suivantes, par paliers de 5.
+  // Chaque étape reste un passage obligé ; une jambe ne réutilise jamais les
+  // rues déjà prises par une autre jambe du même candidat.
+  final candidats = <_Candidat>[];
+
+  // Étend une jambe d'étape : les variantes « sans superposition » (aucune rue
+  // déjà empruntée n'est réutilisée, une seule ligne garantie) et « naturelle »
+  // (le plus court, réutilisation permise, conservée seulement si elle ne
+  // replie aucune chaussée déjà dessinée).
+  List<_Candidat> etendre(List<_Candidat> enCours, int i) {
+    final suivants = <_Candidat>[];
+    for (final candidat in enCours) {
+      // Variante « sans superposition » : aucune rue déjà empruntée n'est
+      // réutilisée. Elle garantit une seule ligne à l'écran, mais peut
+      // imposer un détour important quand l'étape est au milieu d'une rue
+      // (le prolongement naturel est interdit).
+      var jambe = _dijkstra(
+        graphe,
+        idsVirtuels[i],
+        idsVirtuels[i + 1],
+        jumeaux,
+        interditTroncons: candidat.troncons,
+      );
+      if (jambe == null && candidat.troncons.isNotEmpty) {
+        // Impossible de joindre l'étape sans repasser par une rue déjà
+        // utilisée (étape sur une rue unique, impasse, réseau filtré) : on
+        // autorise la réutilisation MAIS à fort surcoût. Dijkstra préférera
+        // ainsi tout détour raisonnable plutôt qu'une ligne qui se replie,
+        // et ne double qu'en tout dernier ressort. Les chaussées jumelles
+        // sont pénalisées aussi : sans cela la jambe repartirait sur
+        // l'autoroute parallèle à 4 m, redessinant la même rue.
+        Journal.a(
+          'ITINERAIRE',
+          'Rues disjointes impossibles, surcoût de réutilisation sur la '
+              'jambe $i',
+        );
+        final penalises = <int>{...candidat.troncons};
+        for (final ti in candidat.troncons) {
+          penalises.addAll(jumeaux[ti] ?? const {});
+          final pts = troncons[ti].points;
+          for (var u = 0; u < troncons.length; u++) {
+            if (penalises.contains(u)) continue;
+            if (_distanceMinEchantillonnee(pts, troncons[u].points) > 40) {
+              continue;
+            }
+            if (!_directionsAlignees(pts, troncons[u].points)) continue;
+            penalises.add(u);
+          }
+        }
+        jambe = _dijkstra(
+          graphe,
+          idsVirtuels[i],
+          idsVirtuels[i + 1],
+          jumeaux,
+          tronconsPenalises: penalises,
+        );
+      }
+      if (jambe != null) {
+        suivants.add(_Candidat(
+          [...candidat.jambes, jambe.aretes],
+          {...candidat.troncons, ..._tronconsDe(jambe)},
+        ));
+      }
+
+      // Variante « naturelle » : le plus court, réutilisation des rues
+      // permise. Elle ne contredit jamais la règle de l'itinéraire simple
+      // (une seule ligne) : elle n'est conservée que si elle ne replie
+      // aucune chaussée déjà dessinée. C'est elle qui évite le détour quand
+      // l'étape est au milieu d'une rue, où le prolongement naturel est plus
+      // court que le contournement exigé par l'interdiction ci-dessus.
+      final naturel = _dijkstra(
+        graphe,
+        idsVirtuels[i],
+        idsVirtuels[i + 1],
+        jumeaux,
+      );
+      if (naturel != null) {
+        final candidatNaturel = _Candidat(
+          [...candidat.jambes, naturel.aretes],
+          {...candidat.troncons, ..._tronconsDe(naturel)},
+        );
+        if (_nbReplis(_pointsDe(candidatNaturel)) == 0) {
+          suivants.add(candidatNaturel);
+        }
+      }
+    }
+    // L'ensemble des candidats croît de deux variantes par étape : au-delà
+    // du plafond, on ne garde que les tracés les plus courts (les autres ne
+    // peuvent plus gagner le classement final que de façon négligeable).
+    if (suivants.length > _maxCandidatsEtapes) {
+      suivants.sort(
+          (a, b) => _longueurTotale(a).compareTo(_longueurTotale(b)));
+      suivants.removeRange(_maxCandidatsEtapes, suivants.length);
+    }
+    return suivants;
+  }
+
+  // Une nouvelle ligne de la première jambe devient une ou plusieurs lignes
+  // complètes : une seule sans étape, sinon étendue aux étapes suivantes.
+  void ajouterChemin(_Chemin chemin) {
+    if (parcours.length == 2) {
+      candidats.add(_Candidat([chemin.aretes], _tronconsDe(chemin)));
+      return;
+    }
+    var enCours = <_Candidat>[_Candidat([chemin.aretes], _tronconsDe(chemin))];
+    for (var i = 1; i + 1 < parcours.length && enCours.isNotEmpty; i++) {
+      enCours = etendre(enCours, i);
+    }
+    candidats.addAll(enCours);
+  }
+
+  final generateur = _GenerateurChemins(
+      graphe, idsVirtuels[0], idsVirtuels[1], jumeaux);
+  var trouves = 0;
+  while (trouves < _kCheminsPlafond) {
+    var dansPalier = 0;
+    while (dansPalier < _kCheminsMax && trouves < _kCheminsPlafond) {
+      final chemin = generateur.suivant();
+      if (chemin == null) break;
+      ajouterChemin(chemin);
+      trouves++;
+      dansPalier++;
+    }
+    if (candidats.isNotEmpty &&
+        _couleursPropres(_meilleurCandidat(candidats))) {
+      Journal.i('MOTEUR LOCAL',
+          'Meilleure ligne propre dès le palier de ${candidats.length} '
+          'chemins');
+      break;
+    }
+    if (dansPalier < _kCheminsMax) break; // plus aucune ligne disponible
+    if (trouves >= _kCheminsPlafond) break; // plafond atteint : la
+    // meilleure sera gardée quelle que soit sa couleur.
+    Journal.i('MOTEUR LOCAL', 'Meilleure ligne non propre, recherche '
+        'élargie de $_kCheminsMax lignes', {
+      'candidats': candidats.length,
+    });
+    args.porteEvenements?.send(null);
+  }
+
+  // Aucun tracé possible sur le réseau : repli OSRM (l'appelant renvoie null).
+  if (candidats.isEmpty) {
+    Journal.a('MOTEUR LOCAL',
+        'Aucun chemin trouvé sur le réseau local (points hors route ?)');
+    return null;
+  }
+
+  // ----- Phase 2 : classement « distance + trafic » -----
+  // Pour chaque candidat, on ajoute à son temps de base (vitesse libre) une
+  // majoration selon le trafic réel rencontré (méthode additive). Le meilleur
+  // score est la seule route retenue ; les autres restent masquées.
+  final meilleur = _meilleurCandidat(candidats);
+  final meilleurScore = _scoreCandidat(meilleur);
+  Journal.i('MOTEUR LOCAL',
+      'Itinéraire retenu parmi ${candidats.length} chemins les plus rapides',
+      {'couleurs': _distributionCouleurs(meilleur)});
+  if (candidats.length > 1) {
+    Journal.i('MOTEUR LOCAL', 'Classement distance + trafic effectué', {
+      'candidats': candidats.length,
+      'meilleur_score_s': meilleurScore.round(),
+    });
+  }
+
+  // ----- Assemblage de la géométrie du tracé retenu -----
   var distanceTotale = 0.0;
-  var coutTotal = 0.0;
   final points = <LatLng>[];
   final severites = <double>[];
-  for (var i = 0; i + 1 < parcours.length; i++) {
-    final resultat =
-        _dijkstra(graphe, idsVirtuels[i], idsVirtuels[i + 1], jumeaux);
-    if (resultat == null) return null;
-    final (ptsJambe, distJambe, coutJambe, sevJambe) = resultat;
-    distanceTotale += distJambe;
-    coutTotal += coutJambe;
-    // Au raccord, le point d'étape figure déjà en fin de jambe précédente :
-    // on ne le duplique pas.
-    for (var k = points.isEmpty ? 0 : 1; k < ptsJambe.length; k++) {
-      if (points.isNotEmpty &&
-          _distanceMetres(points.last, ptsJambe[k]) < 3.0) {
-        continue;
+  final tronconsUtilises = <int>{};
+  for (final jambe in meilleur.jambes) {
+    for (final arete in jambe) {
+      if (arete.idTroncon >= 0) tronconsUtilises.add(arete.idTroncon);
+      distanceTotale += arete.longueurMetres;
+      for (final p in arete.points) {
+        if (points.isNotEmpty && _distanceMetres(points.last, p) < 3.0) {
+          continue;
+        }
+        points.add(p);
+        severites.add(arete.severite);
       }
-      points.add(ptsJambe[k]);
-      severites.add(sevJambe[k]);
     }
   }
   if (points.length < 2) return null;
+  final (pointsAlleger, severitesAlleger) = _alleger(points, severites);
 
   // Départ/arrivée tombant dans une parcelle (bâtiment, cour…) : la portion
   // hors route reste dans le tracé mais est bornée pour être dessinée en
@@ -445,31 +747,39 @@ RouteResult? _calculerChemin(_ArgumentsItineraire args) {
   // En deçà du seuil, l'imprécision GPS fait que l'utilisateur est réputé
   // sur la route : pas de pointillés.
   var debutRoute = 0;
-  var finRoute = points.length - 1;
+  var finRoute = pointsAlleger.length - 1;
   if (_distanceMetres(parcours.first, snaps.first.projete) >
       _seuilHorsRouteMetres) {
-    debutRoute =
-        _indexLePlusProche(points, snaps.first.projete, depuisLaFin: false);
+    debutRoute = _indexLePlusProche(
+        pointsAlleger, snaps.first.projete, depuisLaFin: false);
   }
   if (_distanceMetres(parcours.last, snaps.last.projete) >
       _seuilHorsRouteMetres) {
-    finRoute =
-        _indexLePlusProche(points, snaps.last.projete, depuisLaFin: true);
+    finRoute = _indexLePlusProche(
+        pointsAlleger, snaps.last.projete, depuisLaFin: true);
   }
   if (finRoute - debutRoute < 1) {
     // Tracé minuscule entièrement hors route : tout garder coloré plutôt
     // que de ne rien afficher.
     debutRoute = 0;
-    finRoute = points.length - 1;
+    finRoute = pointsAlleger.length - 1;
   }
 
+  // Les segments réellement empruntés (id OSM) : la carte affichera
+  // l'itinéraire en montrant EXACTEMENT ces polylignes de circulation déjà
+  // chargées et en masquant toutes les autres — rien n'est re-tracé.
+  final segmentsIds = <int>{
+    for (final ti in tronconsUtilises) troncons[ti].segment.id,
+  }.toList();
+
   return RouteResult(
-    points: points,
+    points: pointsAlleger,
     distanceMeters: distanceTotale,
-    durationSeconds: coutTotal / 9.0,
-    severites: severites,
+    durationSeconds: meilleurScore,
+    severites: severitesAlleger,
     indexDebutRoute: debutRoute,
     indexFinRoute: finRoute,
+    segmentsIds: segmentsIds,
   );
 }
 
@@ -672,6 +982,39 @@ _Snap? _segmentLePlusProche(LatLng p, List<RoadSegment> segments) {
   return _Snap(meilleur, projete, index);
 }
 
+/// Rues à raccorder au nœud virtuel du point [p] : la rue la plus proche
+/// [proche], puis jusqu'à [maxCandidats] autres rues dont la projection se
+/// trouve dans [_rayonRaccordMetres]. Toutes ces arêtes virtuelles sont des
+/// secours : si la rue la plus proche est un cul-de-sac déconnecté du graphe,
+/// un voisin peut quand même porter l'itinéraire. Le coût réel du raccord
+/// (distance hors route + chemin le long de la chaussée) fait que Dijkstra
+/// choisit naturellement la rue la plus commode.
+const double _rayonRaccordMetres = 60;
+const int _maxRaccords = 5;
+
+List<_Snap> _raccordsElargis(
+  LatLng p,
+  _Snap proche,
+  List<RoadSegment> segments,
+) {
+  final trouve = <_Snap>[proche];
+  final vus = <int>{proche.segment.id};
+  final restants = <(double, _Snap)>[];
+  for (final s in segments) {
+    if (vus.contains(s.id)) continue;
+    final (proj, d, i) = _projeter(p, s.points);
+    if (d > _rayonRaccordMetres) continue;
+    vus.add(s.id);
+    restants.add((d, _Snap(s, proj, i)));
+  }
+  restants.sort((a, b) => a.$1.compareTo(b.$1));
+  for (final entree in restants) {
+    if (trouve.length >= _maxRaccords) break;
+    trouve.add(entree.$2);
+  }
+  return trouve;
+}
+
 /// Relie le nœud virtuel [id] (départ ou arrivée) aux deux bouts de la rue
 /// sur laquelle il est projeté, avec la géométrie et le coût exacts.
 void _relierSnap(
@@ -687,7 +1030,6 @@ void _relierSnap(
   final proj = snap.projete;
   final i = snap.index;
   final sev = _severitePour(args, simulateur, snap.segment, maintenant);
-  final facteur = _facteur(sev);
 
   // Géométrie depuis le point virtuel jusqu'au début de la rue.
   final geoDebut = <LatLng>[
@@ -701,7 +1043,7 @@ void _relierSnap(
     graphe.noeudPour(points.first),
     geoDebut,
     dDebut,
-    dDebut * facteur,
+    dDebut,
     sev,
   );
 
@@ -717,7 +1059,7 @@ void _relierSnap(
     graphe.noeudPour(points.last),
     geoFin,
     dFin,
-    dFin * facteur,
+    dFin,
     sev,
   );
 }
@@ -918,12 +1260,16 @@ double _penaliteChaussee(
   return 0;
 }
 
-(List<LatLng>, double, double, List<double>)? _dijkstra(
+_Chemin? _dijkstra(
   _GrapheRoutes g,
   int depart,
   int arrivee,
-  Map<int, Set<int>> jumeaux,
-) {
+  Map<int, Set<int>> jumeaux, {
+  Set<int> interditTroncons = const {},
+  Set<int> noeudsInterdits = const {},
+  Set<(int, int)> aretesInterdites = const {},
+  Set<int> tronconsPenalises = const {},
+}) {
   final dist = <int, double>{depart: 0};
   final precedent = <int, (int source, _Arete arete)>{};
   final tas = _Tas()..ajouter(0, depart);
@@ -936,8 +1282,31 @@ double _penaliteChaussee(
     if (aretes == null) continue;
     final entree = precedent[n]?.$2;
     for (final arete in aretes) {
+      // Rues déjà empruntées par une jambe précédente : on ne les réutilise
+      // pas. Les arêtes virtuelles (-1, raccords départ/arrivée) restent
+      // toujours permises.
+      if (arete.idTroncon >= 0 &&
+          interditTroncons.contains(arete.idTroncon)) {
+        continue;
+      }
+      // Nœuds de la racine (Yen) : le chemin spur ne repasse jamais par un
+      // nœud déjà sur la racine, hormis le nœud spur lui-même (départ).
+      if (noeudsInterdits.contains(arete.vers)) {
+        continue;
+      }
+      // Arêtes retirées (Yen) : interdiction de traverser un arc précis.
+      if (aretesInterdites.contains((n, arete.vers))) {
+        continue;
+      }
       var penalite = _penaliteVirage(entree, arete);
       penalite += _penaliteChaussee(entree, arete, n, g, jumeaux);
+      // Rue déjà empruntée par une jambe précédente (étape) : réutilisable en
+      // dernier ressort seulement, grâce à un surcoût qui fait pencher Dijkstra
+      // vers tout détour raisonnable plutôt que vers une ligne qui se replie.
+      if (arete.idTroncon >= 0 &&
+          tronconsPenalises.contains(arete.idTroncon)) {
+        penalite += _penaliteReutilisationMetres;
+      }
       final nd = d + arete.cout + penalite;
       if (nd < (dist[arete.vers] ?? double.infinity)) {
         dist[arete.vers] = nd;
@@ -949,34 +1318,307 @@ double _penaliteChaussee(
 
   if (!dist.containsKey(arrivee)) return null;
 
-  final troncons = <_Arete>[];
+  final aretes = <_Arete>[];
   var courant = arrivee;
   while (courant != depart) {
     final (source, arete) = precedent[courant]!;
-    troncons.add(arete);
+    aretes.add(arete);
     courant = source;
   }
 
-  var distanceTotale = 0.0;
-  var coutTotal = 0.0;
-  final points = <LatLng>[];
-  final severites = <double>[];
-  for (final arete in troncons.reversed) {
-    distanceTotale += arete.longueurMetres;
-    coutTotal += arete.cout;
-    for (final p in arete.points) {
-      // Les tronçons consécutifs se raccordent à quelques mètres près :
-      // au-delà, on garde le point pour ne pas casser la ligne.
-      if (points.isNotEmpty && _distanceMetres(points.last, p) < 3.0) {
-        continue;
-      }
-      points.add(p);
-      severites.add(arete.severite);
-    }
+  final aretesOrdonnees = aretes.reversed.toList(growable: false);
+  final noeuds = <int>[depart];
+  for (final arete in aretesOrdonnees) {
+    noeuds.add(arete.vers);
   }
 
-  final (pointsFinaux, severitesFinales) = _alleger(points, severites);
-  return (pointsFinaux, distanceTotale, coutTotal, severitesFinales);
+  return _Chemin(noeuds, aretesOrdonnees, dist[arrivee]!);
+}
+
+/// Nombre de chemins alternatifs cherchés à chaque palier de la phase 1 :
+/// les 5 lignes les plus rapides d'abord, puis on élargit par nouvelles
+/// fournées de [_kCheminsMax] tant que la meilleure ligne n'est pas propre.
+const int _kCheminsMax = 5;
+
+/// Plafond total de chemins cherchés en phase 1 (paliers de 5, jamais de
+/// recalcul des chemins déjà produits). Au-delà, on s'arrête et on retient la
+/// meilleure ligne quelle que soit sa couleur.
+const int _kCheminsPlafond = 25;
+
+/// Surcoût (équivalent-mètres) appliqué quand une jambe réutilise une rue déjà
+/// empruntée par une jambe précédente : Dijkstra préfère un détour tant qu'il
+/// coûte moins que ce surcoût, et ne double une chaussée qu'en dernier ressort.
+const double _penaliteReutilisationMetres = 1200;
+
+/// Plafond de candidats conservés à chaque palier (jambe d'étape) : les deux
+/// variantes (sans superposition + naturelle) font croître l'ensemble vite ;
+/// au-delà, seuls les tracés les plus courts survivent au palier suivant.
+const int _maxCandidatsEtapes = 10;
+
+/// Budget de lancements de Dijkstra pour l'ensemble de la recherche des k
+/// chemins : borne le coût sur les grands réseaux (5 alternatives × longueur
+/// de tracé peut devenir lourd) sans jamais renvoyer zéro chemin — le premier
+/// Dijkstra fait déjà partie des résultats.
+const int _budgetDijkstra = 30;
+
+/// Génère les chemins les plus courts UN PAR UN (Yen incrémental) : chaque
+/// appel de [suivant] reprend exactement l'état de la recherche précédente,
+/// donc jamais de recalcul des chemins déjà produits quand la recherche
+/// s'élargit par paliers de 5.
+class _GenerateurChemins {
+  _GenerateurChemins(
+    this.g,
+    this.depart,
+    this.arrivee,
+    this.jumeaux, {
+    this.interditTroncons = const {},
+  });
+
+  final _GrapheRoutes g;
+  final int depart;
+  final int arrivee;
+  final Map<int, Set<int>> jumeaux;
+  final Set<int> interditTroncons;
+
+  /// Chemins déjà produits, par ordre de coût croissant. Leur dernier sert de
+  /// racine à la recherche du chemin suivant.
+  final List<_Chemin> _trouves = [];
+  final List<_Chemin> _enAttente = [];
+  final Set<String> _vus = {};
+  var _lancees = 0;
+  var _initialise = false;
+
+  /// Prochain chemin le plus court, ou null si le réseau ne peut plus en
+  /// produire. Le premier appel rend le plus court d'entre eux.
+  _Chemin? suivant() {
+    if (!_initialise) {
+      _initialise = true;
+      return _premier();
+    }
+    return _suivant();
+  }
+
+  _Chemin? _premier() {
+    final premier = _dijkstra(g, depart, arrivee, jumeaux,
+        interditTroncons: interditTroncons);
+    if (premier == null) return null;
+    _lancees++;
+    _trouves.add(premier);
+    _vus.add(_signature(premier.noeuds));
+    return premier;
+  }
+
+  _Chemin? _suivant() {
+    final base = _trouves.last;
+    for (var i = 0; i < base.noeuds.length - 1; i++) {
+      if (_lancees >= _budgetDijkstra) break;
+      final spur = base.noeuds[i];
+      final racine = base.noeuds.sublist(0, i + 1);
+      final racineAretes = base.aretes.sublist(0, i);
+
+      // Retrait des arêtes : pour chaque chemin déjà retenu empruntant cette
+      // même racine, on interdit de réutiliser l'arête qui la prolonge.
+      final interdites = <(int, int)>{};
+      for (final c in _trouves) {
+        if (c.noeuds.length <= i) continue;
+        var meme = true;
+        for (var j = 0; j <= i; j++) {
+          if (c.noeuds[j] != racine[j]) {
+            meme = false;
+            break;
+          }
+        }
+        if (meme) interdites.add((c.noeuds[i], c.noeuds[i + 1]));
+      }
+
+      // Retrait des nœuds : le chemin spur ne repasse par aucun nœud de la
+      // racine (sauf le nœud spur lui-même, d'où sublist(0, i)).
+      final noeudsInterdits = <int>{...racine.sublist(0, i)};
+
+      _lancees++;
+      final spurChemin = _dijkstra(g, spur, arrivee, jumeaux,
+          interditTroncons: interditTroncons,
+          noeudsInterdits: noeudsInterdits,
+          aretesInterdites: interdites);
+      if (spurChemin == null) continue;
+
+      final coutRacine =
+          racineAretes.fold(0.0, (acc, a) => acc + a.cout);
+      final total = _Chemin(
+        [...racine, ...spurChemin.noeuds.sublist(1)],
+        [...racineAretes, ...spurChemin.aretes],
+        coutRacine + spurChemin.cout,
+      );
+      if (_vus.contains(_signature(total.noeuds))) continue;
+      _vus.add(_signature(total.noeuds));
+      _enAttente.add(total);
+    }
+
+    if (_enAttente.isEmpty) return null;
+    _enAttente.sort((a, b) => a.cout.compareTo(b.cout));
+    final suivant = _enAttente.removeAt(0);
+    _trouves.add(suivant);
+    return suivant;
+  }
+
+  String _signature(List<int> noeuds) => noeuds.join('>');
+}
+
+/// Tronçons de chaussée auxquels appartiennent les arêtes d'un chemin.
+Set<int> _tronconsDe(_Chemin chemin) => {
+      for (final a in chemin.aretes)
+        if (a.idTroncon >= 0) a.idTroncon,
+    };
+
+/// Points du tracé complet d'un candidat (toutes jambes confondues), avec la
+/// même déduplication d'indices que le classement final.
+List<LatLng> _pointsDe(_Candidat candidat) {
+  final pts = <LatLng>[];
+  for (final jambe in candidat.jambes) {
+    for (final a in jambe) {
+      for (final p in a.points) {
+        if (pts.isNotEmpty && _distanceMetres(pts.last, p) < 3.0) continue;
+        pts.add(p);
+      }
+    }
+  }
+  return pts;
+}
+
+/// Nombre de replis (chaussées repassées au même endroit) d'un tracé : deux
+/// points à au moins [ecart] indices d'écart ne doivent pas se retrouver à
+/// moins de [seuilRepli] m.
+int _nbReplis(List<LatLng> pts) {
+  const ecart = 40;
+  const seuilRepli = 25.0;
+  var replis = 0;
+  for (var i = 0; i + ecart < pts.length; i++) {
+    final p = pts[i];
+    for (var j = i + ecart; j < pts.length; j++) {
+      if (_distanceMetres(p, pts[j]) < seuilRepli) replis++;
+    }
+  }
+  return replis;
+}
+
+/// Longueur totale cumulée des jambes d'un candidat : sert à borner le nombre
+/// de candidats conservés à chaque palier.
+double _longueurTotale(_Candidat candidat) {
+  var total = 0.0;
+  for (final jambe in candidat.jambes) {
+    for (final a in jambe) {
+      total += a.longueurMetres;
+    }
+  }
+  return total;
+}
+
+/// Phase 2 : classement des candidats par score « distance + trafic » : celui
+/// au plus petit score est la seule route retenue.
+_Candidat _meilleurCandidat(List<_Candidat> candidats) {
+  var meilleur = candidats.first;
+  var meilleurScore = double.infinity;
+  for (final candidat in candidats) {
+    final score = _scoreCandidat(candidat);
+    if (score < meilleurScore) {
+      meilleurScore = score;
+      meilleur = candidat;
+    }
+  }
+  return meilleur;
+}
+
+/// Une ligne est « propre » quand ses couleurs tiennent les exigences de
+/// l'utilisateur, mesurées sur la longueur réelle empruntée :
+///  • au moins 50 % de route fluide (vert, sévérité < 1),
+///  • 0 % de rouge (sévérité 2 → 2,5),
+///  • 0 % de noir, route bloquée (sévérité ≥ 2,5),
+///  • moins de 30 % d'orange foncé (sévérité 1,5 → 2).
+/// L'orange clair (1 → 1,5) n'est soumis à aucune contrainte.
+bool _couleursPropres(_Candidat candidat) {
+  var total = 0.0;
+  var verte = 0.0;
+  var orangeFonce = 0.0;
+  var rouge = 0.0;
+  var noire = 0.0;
+  for (final jambe in candidat.jambes) {
+    for (final a in jambe) {
+      final l = a.longueurMetres;
+      total += l;
+      final s = a.severite;
+      if (s < 1.0) {
+        verte += l;
+      } else if (s < 1.5) {
+        // Orange clair : aucune contrainte.
+      } else if (s < 2.0) {
+        orangeFonce += l;
+      } else if (s < 2.5) {
+        rouge += l;
+      } else {
+        noire += l;
+      }
+    }
+  }
+  if (total <= 0) return false;
+  return verte / total >= 0.50 && rouge == 0 && noire == 0 &&
+      orangeFonce / total < 0.30;
+}
+
+/// Répartition par longueur réelle des couleurs d'un candidat, dans les mêmes
+/// tranches que [_couleursPropres] : vert (< 1), orange clair (1 → 1,5),
+/// orange foncé (1,5 → 2), rouge (2 → 2,5), noir (≥ 2,5).
+/// Chaîne lisible « 62,4 % vert · 20,1 % orange clair · 12,0 % orange foncé ·
+/// 5,5 % rouge · 0,0 % noir ».
+String _distributionCouleurs(_Candidat candidat) {
+  var total = 0.0;
+  final longueurs = [0.0, 0.0, 0.0, 0.0, 0.0];
+  for (final jambe in candidat.jambes) {
+    for (final a in jambe) {
+      final l = a.longueurMetres;
+      total += l;
+      final s = a.severite;
+      if (s < 1.0) {
+        longueurs[0] += l;
+      } else if (s < 1.5) {
+        longueurs[1] += l;
+      } else if (s < 2.0) {
+        longueurs[2] += l;
+      } else if (s < 2.5) {
+        longueurs[3] += l;
+      } else {
+        longueurs[4] += l;
+      }
+    }
+  }
+  if (total <= 0) return 'aucune longueur';
+  String pct(double metres) => '${(metres / total * 100).toStringAsFixed(1)} %';
+  return '${pct(longueurs[0])} vert · ${pct(longueurs[1])} orange clair · '
+      '${pct(longueurs[2])} orange foncé · ${pct(longueurs[3])} rouge · '
+      '${pct(longueurs[4])} noir';
+}
+
+/// Phase 2 : score « distance + trafic » d'un candidat. Temps de base à
+/// vitesse libre (distance ÷ 9 m/s) + majoration selon l'état de circulation
+/// réel rencontré (méthode additive : pour un bouchon, (facteur − 1) ×
+/// distance ÷ 9 m/s). Le candidat au plus petit score est la seule route
+/// retenue.
+double _scoreCandidat(_Candidat candidat) {
+  var base = 0.0;
+  var majoration = 0.0;
+  for (final jambe in candidat.jambes) {
+    for (final a in jambe) {
+      base += a.longueurMetres / 9.0;
+      majoration += a.longueurMetres * (_facteur(a.severite) - 1.0) / 9.0;
+    }
+  }
+  // Pénalité « une seule ligne » : un tracé qui repasse à moins de
+  // [seuilRepli] m d'un point déjà dessiné au moins [ecart] indices plus tôt
+  // (jambe de départ qui se replie sur la jambe d'arrivée) est fortement
+  // pénalisé au classement. Les chemins de Yen et les variantes naturelles se
+  // départagent alors en faveur de la variante sans double tracé, même si elle
+  // coûte quelques mètres de plus.
+  base += _nbReplis(_pointsDe(candidat)) * 500.0;
+  return base + majoration;
 }
 
 /// Allège le tracé final sans en changer la forme visible : supprime les

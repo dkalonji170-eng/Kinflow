@@ -199,11 +199,17 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
                 children: [
                   const Icon(Icons.data_usage, size: 18),
                   const SizedBox(width: 8),
-                  const Text(
-                    'Consommation de données (depuis l\'ouverture)',
-                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+                  const Flexible(
+                    child: Text(
+                      'Consommation de données (depuis l\'ouverture)',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
                   ),
-                  const Spacer(),
+                  const SizedBox(width: 8),
                   Text(
                     '↓ ${DataUsageService.enMo(totalRecus)}'
                     '  ↑ ${DataUsageService.enMo(totalEnvoyes)}',
