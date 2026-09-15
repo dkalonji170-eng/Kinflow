@@ -1370,15 +1370,12 @@ class _GenerateurChemins {
     this.g,
     this.depart,
     this.arrivee,
-    this.jumeaux, {
-    this.interditTroncons = const {},
-  });
+    this.jumeaux);
 
   final _GrapheRoutes g;
   final int depart;
   final int arrivee;
   final Map<int, Set<int>> jumeaux;
-  final Set<int> interditTroncons;
 
   /// Chemins déjà produits, par ordre de coût croissant. Leur dernier sert de
   /// racine à la recherche du chemin suivant.
@@ -1400,7 +1397,7 @@ class _GenerateurChemins {
 
   _Chemin? _premier() {
     final premier = _dijkstra(g, depart, arrivee, jumeaux,
-        interditTroncons: interditTroncons);
+        interditTroncons: const {});
     if (premier == null) return null;
     _lancees++;
     _trouves.add(premier);
@@ -1437,7 +1434,7 @@ class _GenerateurChemins {
 
       _lancees++;
       final spurChemin = _dijkstra(g, spur, arrivee, jumeaux,
-          interditTroncons: interditTroncons,
+          interditTroncons: const {},
           noeudsInterdits: noeudsInterdits,
           aretesInterdites: interdites);
       if (spurChemin == null) continue;
