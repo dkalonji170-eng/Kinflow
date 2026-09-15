@@ -145,10 +145,14 @@ VueItineraireResultat? calculerVueItineraire({
 
   // Centre final : projeté du point bleu décalé en sens inverse, pour que le
   // bleu tombe exactement sur son ancrage (centré, deux tiers vers le bas).
+  // [projDepart] est exprimé dans le repère du zoom de départ [zRef] : il doit
+  // être remis à l'échelle du zoom final (×[echelle]) avant d'en soustraire le
+  // décalage d'ancrage mesuré en pixels de ce zoom final — sinon le centre
+  // visé part loin du tracé (rarement visible, souvent hors carte).
   final centre = camera.unproject(
     math.Point<double>(
-      projDepart.x - invRotX(dxAncre, dyAncre),
-      projDepart.y - invRotY(dxAncre, dyAncre),
+      projDepart.x * echelle - invRotX(dxAncre, dyAncre),
+      projDepart.y * echelle - invRotY(dxAncre, dyAncre),
     ),
     zoom,
   );
