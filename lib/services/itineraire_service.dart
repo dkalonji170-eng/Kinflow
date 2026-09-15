@@ -267,7 +267,7 @@ class ItineraireService {
 
   final RoadService _roads;
 
-  Future<RouteResult?> calculer(
+  Future<List<RouteResult>?> calculer(
     LatLng depart,
     LatLng arrivee, {
     List<ZoneTrafic> zones = const [],
@@ -356,7 +356,7 @@ class ItineraireService {
   }
 
   /// Lance le calcul Dijkstra en isolat sur [segments] déjà chargés.
-  Future<RouteResult?> _calculerLocal(
+  Future<List<RouteResult>?> _calculerLocal(
     List<RoadSegment> segments,
     bool lointain,
     List<ZoneTrafic> zones,
@@ -457,7 +457,7 @@ class ItineraireService {
       );
 }
 
-RouteResult? _calculerChemin(_ArgumentsItineraire args) {
+List<RouteResult>? _calculerChemin(_ArgumentsItineraire args) {
   final simulateur = TrafficSimulator();
   final maintenant = DateTime.now();
 
@@ -717,26 +717,76 @@ RouteResult? _calculerChemin(_ArgumentsItineraire args) {
 
   // ----- Phase 2 : classement « distance + trafic » -----
   // Pour chaque candidat, on ajoute à son temps de base (vitesse libre) une
-  // majoration selon le trafic réel rencontré (méthode additive). Le meilleur
-  // score est la seule route retenue ; les autres restent masquées.
-  final meilleur = _meilleurCandidat(candidats);
-  final meilleurScore = _scoreCandidat(meilleur);
+  // majoration selon le trafic réel rencontré (méthode additive). Les
+  // [_nbAlternativesRetenues] meilleurs scores sont conservés : le premier
+  // est affiché, les suivants restent proposés au « Changer d'itinéraire »
+  // (cycle 1 → 2 → 3 → 1) sans aucun recalcul.
+  final classes = List.of(candidats)
+    ..sort((a, b) => _scoreCandidat(a).compareTo(_scoreCandidat(b)));
+  final meilleur = classes.first;
   Journal.i('MOTEUR LOCAL',
       'Itinéraire retenu parmi ${candidats.length} chemins les plus rapides',
       {'couleurs': _distributionCouleurs(meilleur)});
   if (candidats.length > 1) {
     Journal.i('MOTEUR LOCAL', 'Classement distance + trafic effectué', {
       'candidats': candidats.length,
-      'meilleur_score_s': meilleurScore.round(),
+      'score_1er_s': _scoreCandidat(classes.first).round(),
+      'score_2eme_s': classes.length > 1
+          ? _scoreCandidat(classes[1]).round()
+          : null,
     });
   }
 
-  // ----- Assemblage de la géométrie du tracé retenu -----
+  // ----- Assemblage des géométries des tracés retenus -----
+  // Chaque candidat classé devient une route complète (points allégés,
+  // sévérités, bornes hors-route, segments empruntés). Les doublons (mêmes
+  // rues dans le même ordre) sont écartés : deux lignes identiques
+  // n'apporteraient rien au changement d'itinéraire.
+  final routes = <RouteResult>[];
+  for (final candidat in classes) {
+    if (routes.length >= _nbAlternativesRetenues) break;
+    final route = _assemblerRoute(candidat,
+        snaps: snaps, parcours: parcours, troncons: troncons);
+    if (route == null) continue;
+    if (_tropProcheDe(route, routes)) continue;
+    routes.add(route);
+  }
+  if (routes.isEmpty) return null;
+  return routes;
+}
+
+/// Vrai si [route] emprunte essentiellement les mêmes rues qu'une des routes
+/// déjà retenues (≥ 85 % de ses segments dans ce qui est déjà au panier) :
+/// deux tracés quasi superposés seraient identiques à l'écran et le cycle
+/// « Changer d'itinéraire » paraîtrait sans effet. On ne garde que des
+/// options qui divergent réellement.
+bool _tropProcheDe(RouteResult route, List<RouteResult> gardees) {
+  if (gardees.isEmpty) return false;
+  if (route.segmentsIds.isEmpty) return false; // douteux : on garde.
+  final dejaRetenus = <int>{
+    for (final g in gardees) ...g.segmentsIds,
+  };
+  var partages = 0;
+  for (final id in route.segmentsIds) {
+    if (dejaRetenus.contains(id)) partages++;
+  }
+  return partages / route.segmentsIds.length >= _partMaxSegmentsCommuns;
+}
+
+/// Assemble la géométrie complète d'un candidat classé en [RouteResult] :
+/// points (allégés), sévérités associées, bornes de la portion hors route,
+/// segments réellement empruntés et durée du score « distance + trafic ».
+RouteResult? _assemblerRoute(
+  _Candidat candidat, {
+  required List<_Snap> snaps,
+  required List<LatLng> parcours,
+  required List<_Troncon> troncons,
+}) {
   var distanceTotale = 0.0;
   final points = <LatLng>[];
   final severites = <double>[];
   final tronconsUtilises = <int>{};
-  for (final jambe in meilleur.jambes) {
+  for (final jambe in candidat.jambes) {
     for (final arete in jambe) {
       if (arete.idTroncon >= 0) tronconsUtilises.add(arete.idTroncon);
       distanceTotale += arete.longueurMetres;
@@ -760,7 +810,7 @@ RouteResult? _calculerChemin(_ArgumentsItineraire args) {
   var debutRoute = 0;
   var finRoute = pointsAlleger.length - 1;
   if (_distanceMetres(parcours.first, snaps.first.projete) >
-      _seuilHorsRouteMetres) {
+      _seuilDepartHorsRouteMetres) {
     debutRoute = _indexLePlusProche(
         pointsAlleger, snaps.first.projete, depuisLaFin: false);
   }
@@ -786,7 +836,7 @@ RouteResult? _calculerChemin(_ArgumentsItineraire args) {
   return RouteResult(
     points: pointsAlleger,
     distanceMeters: distanceTotale,
-    durationSeconds: meilleurScore,
+    durationSeconds: _scoreCandidat(candidat),
     severites: severitesAlleger,
     indexDebutRoute: debutRoute,
     indexFinRoute: finRoute,
@@ -798,6 +848,13 @@ RouteResult? _calculerChemin(_ArgumentsItineraire args) {
 /// jugé « hors route » (bâtiment, parcelle) : son raccord à la chaussée est
 /// dessiné en pointillés noirs, comme chez Yango.
 const double _seuilHorsRouteMetres = 25;
+
+/// Seuil propre au DÉPART, plus sévère que celui de l'arrivée : avec un gros
+/// terrain à Kinshasa et une précision GPS de 15-25 m, rester sur le seuil
+/// commun (25) faisait partir la couleur de l'itinéraire DANS le bâtiment
+/// (départ réputé « sur route »). À 18 m, la portion colorée commence bien à
+/// la chaussée et les pointillés noirs relient le point bleu jusqu'à elle.
+const double _seuilDepartHorsRouteMetres = 18;
 
 /// Index du point de [pts] le plus proche de [cible], cherché parmi les
 /// premiers points (ou les derniers si [depuisLaFin]) : c'est là que la
@@ -1365,6 +1422,20 @@ const double _penaliteReutilisationMetres = 1200;
 /// variantes (sans superposition + naturelle) font croître l'ensemble vite ;
 /// au-delà, seuls les tracés les plus courts survivent au palier suivant.
 const int _maxCandidatsEtapes = 10;
+
+/// Nombre d'itinéraires retenus au classement final et proposés à
+/// l'utilisateur : le meilleur est affiché, les suivants deviennent les
+/// alternatives accessibles d'un simple « Changer d'itinéraire » sans
+/// recalcul (cycle 1 → 2 → 3 → 1).
+const int _nbAlternativesRetenues = 3;
+
+/// Proportion maximale des segments d'une alternative déjà empruntés par les
+/// routes retenues : au-delà, le tracé est jugé quasi identique et le
+/// « Changer d'itinéraire » ne change rien de visible à l'écran (surtout sur
+/// les longues distances). Une alternative n'est acceptée que si elle emprunte
+/// au moins 15 % de rues nouvelles — quitte à sauter une option au score
+/// légèrement meilleur qui serait superposée à une déjà retenue.
+const double _partMaxSegmentsCommuns = 0.85;
 
 /// Budget de lancements de Dijkstra pour l'ensemble de la recherche des k
 /// chemins : borne le coût sur les grands réseaux (5 alternatives × longueur

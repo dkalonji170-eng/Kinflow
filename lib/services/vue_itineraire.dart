@@ -32,6 +32,7 @@ VueItineraireResultat? calculerVueItineraire({
   required int finRoute,
   double zoomMin = 11.0,
   double zoomMax = 19.0,
+  double zoomPlancherAbsolu = 5.0,
   double margeGauche = 56.0,
   double margeDroite = 56.0,
   double margeHaut = 96.0,
@@ -90,6 +91,22 @@ VueItineraireResultat? calculerVueItineraire({
   }
   ajouterAuCadre(points.last);
 
+  // Garde-fou anti parasite : un point anormalement loin du tracé (raccord
+  // hors route très long, fix GPS égaré, épingle lointaine) élargirait la
+  // boîte englobante jusqu'à l'océan et le centre calculé partirait hors
+  // carte. On retire du cadre tout point plus éloigné du segment droit
+  // départ → arrivée que ~3 fois la portée du trajet (mini 3 km) : un tracé
+  // urbain tortueux reste toujours dans cette enveloppe, un parasite situé à
+  // des dizaines de kilomètres n'a aucune chance.
+  final toleranceMetres = math.max(porteeMetres * 3.0, 3000.0);
+  final aCadrerFiltre = <LatLng>[];
+  for (final p in aCadrer) {
+    if (_distanceAuSegmentMetres(p, depart, arrivee) <= toleranceMetres) {
+      aCadrerFiltre.add(p);
+    }
+  }
+  if (aCadrerFiltre.length < 2) return null;
+
   // Le point bleu est cloué au centre horizontal, aux deux tiers de la
   // hauteur visible : la même disposition que le recentrage « Ma position ».
   final w = taille.x;
@@ -116,7 +133,7 @@ VueItineraireResultat? calculerVueItineraire({
   var maxSx = double.negativeInfinity;
   var minSy = double.infinity;
   var maxSy = double.negativeInfinity;
-  for (final p in aCadrer) {
+  for (final p in aCadrerFiltre) {
     final proj = camera.project(p, zRef);
     final dx = proj.x - projDepart.x;
     final dy = proj.y - projDepart.y;
@@ -140,22 +157,58 @@ VueItineraireResultat? calculerVueItineraire({
   var echelle = contraintes.reduce(math.min) * facteurRespiration;
   if (!echelle.isFinite || echelle <= 0) echelle = 1.0;
 
-  final zoom =
-      (zRef + math.log(echelle) / math.ln2).clamp(zoomMin, zoomMax).toDouble();
+  // Zoom final. [zoomMin] est le plancher des cadrages ordinaires, mais un
+  // tracé trop long pour tenir dans la vue à ce zoom descend en dessous : la
+  // vue d'ensemble doit montrer tout le tracé. Un plancher technique absolu
+  // évite de basculer dans une vue « monde » ; [zoomMax] reste un plafond
+  // technique absolu.
+  final zoomBrut = zRef + math.log(echelle) / math.ln2;
+  final zoom = (zoomBrut < zoomMin
+          ? zoomBrut.clamp(zoomPlancherAbsolu, zoomMax)
+          : zoomBrut.clamp(zoomMin, zoomMax))
+      .toDouble();
 
   // Centre final : projeté du point bleu décalé en sens inverse, pour que le
   // bleu tombe exactement sur son ancrage (centré, deux tiers vers le bas).
   // [projDepart] est exprimé dans le repère du zoom de départ [zRef] : il doit
-  // être remis à l'échelle du zoom final (×[echelle]) avant d'en soustraire le
-  // décalage d'ancrage mesuré en pixels de ce zoom final — sinon le centre
-  // visé part loin du tracé (rarement visible, souvent hors carte).
+  // être remis à l'échelle du zoom FINAL retenu (×[echelleFinal] = 2^Δzoom),
+  // et non à l'échelle brute [echelle] — quand le zoom a été plafonné, les
+  // deux diffèrent d'un facteur qui, appliqué aux pixels mondiaux du point
+  // bleu (des millions de pixels depuis l'origine mercator), enverrait le
+  // centre calculé à des milliers de kilomètres du tracé.
+  final echelleFinal = math.pow(2.0, zoom - zRef).toDouble();
   final centre = camera.unproject(
     math.Point<double>(
-      projDepart.x * echelle - invRotX(dxAncre, dyAncre),
-      projDepart.y * echelle - invRotY(dxAncre, dyAncre),
+      projDepart.x * echelleFinal - invRotX(dxAncre, dyAncre),
+      projDepart.y * echelleFinal - invRotY(dxAncre, dyAncre),
     ),
     zoom,
   );
 
   return VueItineraireResultat(centre: centre, zoom: zoom, rotation: rotation);
+}
+
+/// Distance perpendiculaire (en mètres) de [p] au segment [a]-[b], calculée
+/// en projection équirectangulaire locale (négligeable sur des portées de
+/// quelques kilomètres). Version bornée au segment : un point passé l'une des
+/// extrémités est mesuré depuis cette extrémité.
+double _distanceAuSegmentMetres(LatLng p, LatLng a, LatLng b) {
+  const rayon = 111320.0;
+  final cosLat = math.cos((a.latitude + b.latitude) * 0.5 * math.pi / 180);
+  final bx = (b.longitude - a.longitude) * rayon * cosLat;
+  final by = (b.latitude - a.latitude) * rayon;
+  final px = (p.longitude - a.longitude) * rayon * cosLat;
+  final py = (p.latitude - a.latitude) * rayon;
+  final len2 = bx * bx + by * by;
+  if (len2 <= 0) {
+    final dx = p.longitude - a.longitude;
+    final dy = p.latitude - a.latitude;
+    final dlonM = dx * rayon * cosLat;
+    final dlatM = dy * rayon;
+    return math.sqrt(dlonM * dlonM + dlatM * dlatM);
+  }
+  final t = ((px * bx + py * by) / len2).clamp(0.0, 1.0);
+  final dx = px - t * bx;
+  final dy = py - t * by;
+  return math.sqrt(dx * dx + dy * dy);
 }

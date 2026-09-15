@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:math'
     show Point, cos, exp, max, min;
-import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
+import 'package:flutter/foundation.dart' show listEquals, debugPrint, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter_map/flutter_map.dart' hide LatLngTween;
@@ -26,7 +26,8 @@ import '../services/poi_service.dart'
         prioritePoi,
         zoomMinPois,
         zoomNomPois;
-import '../services/rendu_itineraire.dart' show decouperItineraireParEtat;
+import '../services/rendu_itineraire.dart'
+    show construireRaccordDepart, decouperItineraireParEtat;
 import '../services/road_service.dart';
 import '../services/diagnostics_service.dart';
 import '../services/data_usage_service.dart';
@@ -272,6 +273,12 @@ class TrafficMap extends StatefulWidget {
   /// ou en repli OSRM.
   final List<int>? itineraireSegmentIds;
 
+  /// Géométries des alternatives pré-calculées « Changer d'itinéraire » :
+  /// dessinées en lignes fines grises SOUS le tracé actif (bleu/vert épais),
+  /// pour montrer d'un coup d'œil où elles divergent. Null si aucune — ou
+  /// quand le départ a été quitté (les options figées n'ont plus de sens).
+  final List<List<LatLng>>? itineraireAlternatives;
+
   /// Pin vert de la destination de l'itinéraire en cours (null sinon) :
   /// reste visible même quand un autre lieu est ensuite recherché.
   final LatLng? pointDestination;
@@ -362,6 +369,8 @@ class TrafficMap extends StatefulWidget {
     this.itineraireFinRoute = -1,
 
     this.itineraireSegmentIds,
+
+    this.itineraireAlternatives,
 
     this.pointDestination,
 
@@ -527,6 +536,8 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   List<Polyline> _polylignesTrafic = [];
   List<Polyline> _polylignesTraficCache = [];
   List<Polyline> _polylignesItineraire = [];
+  List<Polyline> _polylignesAlternatives = [];
+  List<Polyline> _polylignesRaccordDepart = [];
 
   /// Raccord en pointillés noirs reliant l'étape à l'itinéraire quand elle est
   /// posée hors réseau routier (bâtiment, parcelle). Vide sinon.
@@ -690,6 +701,15 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       });
     }
 
+    // Cycle « Changer d'itinéraire » : de nouvelles alternatives (ou plus
+    // aucune) doivent être redessinées en fines lignes grises sous le tracé.
+    if (!identical(
+        oldWidget.itineraireAlternatives, widget.itineraireAlternatives)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _reconstruirePolylignes();
+      });
+    }
+
     final newPos = widget.positionActuelle;
     if (newPos != null) {
       final newLatLng = LatLng(newPos.latitude, newPos.longitude);
@@ -710,8 +730,11 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
         // trafic est affiché. La caméra lissée absorbe la discontinuité.
         nettoyerAnimation();
         _displayedPosition = newLatLng;
+        // Le raccord pointillé suit le point bleu en direct pendant le suivi.
+        _majRaccordDepart();
       } else if (oldPos == null) {
         _displayedPosition = newLatLng;
+        _majRaccordDepart();
       } else {
         // Une nouvelle mesure GPS arrive parfois en plein milieu de
         // l'animation précédente (distanceFilter=1m en déplacement) :
@@ -1964,10 +1987,14 @@ OptionModeCarte(
     if (zoom < zoomMinGlobal) {
       if (_polylignesTrafic.isNotEmpty ||
           _polylignesItineraire.isNotEmpty ||
+          _polylignesAlternatives.isNotEmpty ||
+          _polylignesRaccordDepart.isNotEmpty ||
           _raccordEtape.isNotEmpty) {
         setState(() {
           _polylignesTrafic = [];
           _polylignesItineraire = [];
+          _polylignesAlternatives = [];
+          _polylignesRaccordDepart = [];
           _raccordEtape = [];
         });
       }
@@ -1989,6 +2016,26 @@ OptionModeCarte(
       _polylignesItineraire = [];
     }
     _raccordEtape = _construireRaccordEtape(pointsItineraire);
+    _majRaccordDepart();
+
+    // Les alternatives « Changer d'itinéraire » : lignes fines grises derrière
+    // le tracé actif, pour visualiser en un coup d'œil où elles divergent.
+    final alternatives = widget.itineraireAlternatives;
+    _polylignesAlternatives = (alternatives == null)
+        ? []
+        : [
+            for (final pts in alternatives)
+              if (pts.length >= 2)
+                Polyline(
+                  points: pts,
+                  strokeWidth: 3.5,
+                  color: _fondSombre
+                      ? Colors.white.withValues(alpha: 0.28)
+                      : Colors.blueGrey.withValues(alpha: 0.35),
+                  // Lignes de fond volontairement discrètes, sans bordure.
+                  borderStrokeWidth: 0,
+                ),
+          ];
 
     // Lignes de trafic masquées pendant un itinéraire : on garde la dernière
     // version construite en cache pour la restaurer instantanément au
@@ -2245,6 +2292,26 @@ OptionModeCarte(
     final pos = widget.positionActuelle;
     if (pos == null) return null;
     return LatLng(pos.latitude, pos.longitude);
+  }
+
+  /// Re-dessine les pointillés noirs du DÉPART de l'itinéraire à l'endroit du
+  /// point bleu VIVANT : appelé à chaque fix GPS accepté et à chaque trame de
+  /// l'animation du pin, pour que le raccord suive le point bleu même quand il
+  /// saute. Rare et bon marché (une seule polyligne).
+  void _majRaccordDepart() {
+    final points = widget.itinerairePoints;
+    final raccord = (points == null || points.length < 2)
+        ? const <Polyline>[]
+        : construireRaccordDepart(
+            points: points,
+            debutRoute: widget.itineraireDebutRoute,
+            debutVisuel: widget.itineraireDebutVisuel,
+            fondSombre: _fondSombre,
+            departAncre: departAncreVivant(),
+          );
+    if (!listEquals(_polylignesRaccordDepart, raccord)) {
+      _polylignesRaccordDepart = raccord;
+    }
   }
 
   List<Polyline> _decouperPourLabel(
@@ -2808,9 +2875,13 @@ OptionModeCarte(
                 widget.itinerairePoints != null)
               PolylineLayer(polylines: [
                 ..._polylignesTrafic,
-                // La ligne de l'itinéraire calculé reste toujours visible,
-                // même si le cache des rues du couloir n'est pas encore prêt.
+                ..._polylignesAlternatives,
                 ..._polylignesItineraire,
+                // Pointillés de départ : ancrés au point bleu vivant, au-dessus
+                // du tracé pour rester visibles même si le pin s'intersecte avec
+                // l'itinéraire.
+                ..._polylignesRaccordDepart,
+                ..._raccordEtape,
                 // Raccord en pointillés noirs d'une étape hors réseau routier.
                 ..._raccordEtape,
               ]),

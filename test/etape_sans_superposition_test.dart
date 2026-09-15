@@ -38,7 +38,7 @@ void main() {
       );
       expect(r, isNotNull,
           reason: 'un tracé doit exister pour une étape sur le réseau');
-      final pts = r!.points;
+      final pts = r!.first.points;
 
       // Le tracé passe par le drapeau (projection sur la chaussée, comme
       // OSRM/Yango) avant l'arrivée.

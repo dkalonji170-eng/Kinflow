@@ -135,36 +135,13 @@ List<Polyline> decouperItineraireParEtat({
   }
   fermer();
 
-  // Pointillés noirs de raccord : quand le point de départ ou d'arrivée tombe
-  // hors chaussée, la portion qui le relie à la route est dessinée en
-  // pointillés, comme chez Yango. Seuls les raccords encore visibles (pas
-  // encore parcourus pendant le suivi réel) sont émis.
-  //
-  // Le raccord de départ part de la position BLEUE VIVANTE ([departAncre])
-  // quand elle est connue : si l'utilisateur bouge, le pin saute mais les
-  // pointillés sautent avec lui (direction libre, ce n'est pas une route, c'est
-  // ce que l'utilisateur doit parcourir pour atteindre la chaussée). Sans
-  // position vivante, il reste fixé aux points de départ du tracé calculé.
+  // Pointillés noirs de l'ARRIVÉE : quand la destination tombe hors chaussée,
+  // la portion qui la relie à la route est dessinée en pointillés, comme chez
+  // Yango. Seul le raccord d'arrivée est émis ici : celui du DÉPART vit dans
+  // construireRaccordDepart(), car il doit suivre la position bleue en direct.
   const epaisseurPointilles = 3.2;
   final couleurPointilles =
       Colors.black.withValues(alpha: fondSombre ? 0.95 : 0.8);
-  // Raccord de départ visible uniquement tant que rien n'a été masqué
-  // derrière l'utilisateur (debutVisuel == 0) : sinon il serait déjà derrière
-  // lui.
-  if (debutVisuelBorne == 0 && debutRoute > 0) {
-    polylignes.insert(
-      0,
-      Polyline(
-        points: departAncre != null
-            ? <LatLng>[departAncre, points[debutRoute]]
-            : points.sublist(0, debutRoute + 1),
-        strokeWidth: epaisseurPointilles,
-        color: couleurPointilles,
-        pattern: StrokePattern.dotted(),
-        strokeCap: StrokeCap.round,
-      ),
-    );
-  }
   if (finRoute < fin && finRoute >= debutVisuelBorne) {
     polylignes.add(
       Polyline(
@@ -178,4 +155,63 @@ List<Polyline> decouperItineraireParEtat({
   }
 
   return polylignes;
+}
+
+/// Au-delà de cette distance de la position bleue vivante au point d'ancrage
+/// de l'itinéraire, le départ est jugé hors chaussée : un raccord en
+/// pointillés noirs est dessiné. Voulu plus tolérant que la borne du moteur :
+/// ces pointillés-là suivent le point bleu EN DIRECT, là où le GPS le pose
+/// (même un saut dans la parcelle), sans attendre le prochain recalcul.
+const double _seuilRaccordDepartMetres = 18;
+
+/// Raccords en POINTILLÉS NOIRS qui relient la position bleue vivante à la
+/// chaussée quand l'itinéraire commence hors route (bâtiment, parcelle).
+/// Simple modèle visuel — PAS une route — montrant qu'il faut aller jusqu'à
+/// la chaussée. Émis uniquement tant que rien du départ n'a été parcouru
+/// ([debutVisuel] == 0) et tant que le point bleu reste éloigné de la route.
+///
+/// - [departAncre] fourni (GPS vivant) : droite [departAncre → roadStart], à
+///   jour à chaque fix — le point bleu saute, les pointillés sautent avec lui.
+/// - Sans [departAncre] : on retombe sur le raccord calculé (portion hors
+///   route du tracé), borné par la décision du moteur ([debutRoute] > 0).
+List<Polyline> construireRaccordDepart({
+  required List<LatLng> points,
+  required int debutRoute,
+  required int debutVisuel,
+  required bool fondSombre,
+  LatLng? departAncre,
+}) {
+  if (points.length < 2) return const [];
+  if (debutVisuel > 0) return const [];
+  final roadStart = points[debutRoute.clamp(0, points.length - 1)];
+  const epaisseurPointilles = 3.2;
+  final couleurPointilles =
+      Colors.black.withValues(alpha: fondSombre ? 0.95 : 0.8);
+
+  if (departAncre == null) {
+    // Aucune position vivante : raccord statique du tracé calculé, émis
+    // seulement si le moteur a jugé le départ hors route.
+    if (debutRoute <= 0) return const [];
+    return [
+      Polyline(
+        points: points.sublist(0, debutRoute + 1),
+        strokeWidth: epaisseurPointilles,
+        color: couleurPointilles,
+        pattern: StrokePattern.dotted(),
+        strokeCap: StrokeCap.round,
+      ),
+    ];
+  }
+
+  final distance = const Distance().distance(departAncre, roadStart);
+  if (distance <= _seuilRaccordDepartMetres) return const [];
+  return [
+    Polyline(
+      points: <LatLng>[departAncre, roadStart],
+      strokeWidth: epaisseurPointilles,
+      color: couleurPointilles,
+      pattern: StrokePattern.dotted(),
+      strokeCap: StrokeCap.round,
+    ),
+  ];
 }

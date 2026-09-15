@@ -163,10 +163,20 @@ class _TrafficScreenState extends State<TrafficScreen>
   RouteResult? _itineraire;
   bool _chargementItineraire = false;
 
-  /// Segments (id OSM) des itinéraires déjà affichés, interdits au moteur
-  /// local lors du changement d'itinéraire : chaque relance cherche une route
-  /// réellement différente, jamais la même.
-  final Set<int> _segmentsInterditsItineraire = {};
+  /// Toutes les routes classées par le moteur local pour ce trajet, de la
+  /// meilleure à la moins bonne (ordinairement 3). Le « Changer d'itinéraire »
+  /// passe de l'une à l'autre instantanément, sans recalcul.
+  List<RouteResult> _optionsItineraire = const [];
+
+  /// Index de la route affichée dans [_optionsItineraire] : 0 = meilleure.
+  /// Le cycle 1 → 2 → 3 → 1 revient sur la première après la dernière.
+  int _indexItineraire = 0;
+
+  /// Géométries des options NON affichées (celles que « Changer d'itinéraire »
+  /// fera apparaître) : la carte les dessine en fines lignes grises sous le
+  /// tracé actif. Référence stable — la carte compare par identité pour ne
+  /// rebâtir les polylignes que quand le cycle change réellement.
+  List<List<LatLng>> _itineraireAlternativesAffichees = const [];
 
   /// Vrai quand le moteur local a dû chercher au-delà du premier palier de
   /// routes (les 5 premières lignes ne convenant pas) : l'indicateur de
@@ -180,6 +190,22 @@ class _TrafficScreenState extends State<TrafficScreen>
   bool _travaillerCarteSuspendu = false;
 
   LatLng? _arriveeItineraire;
+
+  /// Point de départ sur lequel l'itinéraire en cours a été calculé. Les
+  /// alternatives « Changer d'itinéraire » y sont figées : elles perdent tout
+  /// sens dès que le conducteur s'est réellement éloigné de ce point.
+  LatLng? _departItineraire;
+
+  /// Vrai quand le conducteur a quitté son point de départ (distance >
+  /// [_seuilDepartItineraireMetres]) : « Changer d'itinéraire » (alternatives
+  /// figées sur l'ancien départ) devient « Recalculer ». Monotone : ne redevient
+  /// disponible que par un recalcul ou une annulation.
+  bool _departItineraireQuitte = false;
+
+  /// Distance (mètres) au-delà de laquelle le départ de l'itinéraire est
+  /// considéré quitté : précision GPS (~10-25 m) × 2 + marge de quelques pas.
+  static const double _seuilDepartItineraireMetres = 60;
+
   final List<LatLng> _etapes = [];
   bool _lignesTraficAvantItineraire = true;
 
@@ -632,6 +658,19 @@ class _TrafficScreenState extends State<TrafficScreen>
 
           setState(() {
             positionActuelle = position;
+
+            // Le conducteur a quitté son point de départ (> 60 m) : les
+            // alternatives « Changer d'itinéraire » sont figées sur l'ancien
+            // départ, le bouton devient « Recalculer ». Monotone : il ne
+            // redevient « Changer » qu'après un recalcul ou une annulation.
+            final departItineraire = _departItineraire;
+            if (!_departItineraireQuitte && departItineraire != null) {
+              if (const Distance()
+                      .distance(_positionAcceptee!.$1, departItineraire) >
+                  _seuilDepartItineraireMetres) {
+                _departItineraireQuitte = true;
+              }
+            }
 
             // Tout fix ACCEPTÉ ici est un réel déplacement (vitesse effective
             // ≥ 0,45 m/s) : le cap GPS est alors exploitable pour la règle
@@ -1134,14 +1173,12 @@ class _TrafficScreenState extends State<TrafficScreen>
 
   Future<void> calculerItineraire(
     LatLng depart,
-    LatLng arrivee, {
-    bool chercherAlternative = false,
-  }) async {
+    LatLng arrivee,
+  ) async {
     if (_chargementItineraire) return;
     final premierItineraire = _itineraire == null;
 
     setState(() {
-      if (!chercherAlternative) _segmentsInterditsItineraire.clear();
       _chargementItineraire = true;
       _rechercheItineraireElargie = false;
       _travaillerCarteSuspendu = true;
@@ -1175,16 +1212,13 @@ class _TrafficScreenState extends State<TrafficScreen>
     // plus « vert ». Le tracé suit donc exactement les routes colorées.
     // OSRM (qui suit son propre réseau et ignore les embouteillages signalés)
     // n'est qu'un secours quand le réseau local ne couvre pas le parcours.
-    RouteResult? resultat;
+    List<RouteResult>? resultats;
 
     final calculLocal = itineraireService.calculer(
       depart,
       arrivee,
       zones: _zonesTrafic,
       etapes: List.of(_etapes),
-      segmentsInterdits: _segmentsInterditsItineraire.isEmpty
-          ? null
-          : Set.of(_segmentsInterditsItineraire),
       onRechercheElargie: () {
         if (mounted) {
           setState(() => _rechercheItineraireElargie = true);
@@ -1198,7 +1232,7 @@ class _TrafficScreenState extends State<TrafficScreen>
       etapes: List.of(_etapes),
     );
 
-    resultat = await _prefererLocal(calculLocal, calculOsrm);
+    resultats = await _prefererLocal(calculLocal, calculOsrm);
 
     if (!mounted) return;
 
@@ -1210,14 +1244,9 @@ class _TrafficScreenState extends State<TrafficScreen>
       return;
     }
 
-    // Une alternative demande une route VRAIMENT différente : le moteur
-    // local doit la produire (segments connus). Le secours OSRM rejoue la
-    // même voie sans tenir compte des interdictions : on le refuse ici.
-    if (chercherAlternative &&
-        resultat != null &&
-        resultat.segmentsIds.isEmpty) {
-      resultat = null;
-    }
+    final resultat = resultats != null && resultats.isNotEmpty
+        ? resultats.first
+        : null;
 
     // Un trajet plus court que la distance minimale est refusé : départ et
     // arrivée quasi confondus, navigation sans objet. Motif « distance trop
@@ -1245,16 +1274,19 @@ class _TrafficScreenState extends State<TrafficScreen>
       _chargementItineraire = false;
       _travaillerCarteSuspendu = false;
       if (resultat != null) {
-        // L'itinéraire qu'on remplace devient interdit : la prochaine
-        // alternative passera par d'autres rues.
-        if (_itineraire != null) {
-          _segmentsInterditsItineraire.addAll(_itineraire!.segmentsIds);
-        }
+        _optionsItineraire = resultats!;
+        _indexItineraire = 0;
+        _itineraireAlternativesAffichees = [
+          for (var i = 1; i < _optionsItineraire.length; i++)
+            _optionsItineraire[i].points,
+        ];
         _itineraire = resultat;
         _itineraireSegmentIds = resultat.segmentsIds.isEmpty
             ? null
             : resultat.segmentsIds;
         _arriveeItineraire = arrivee;
+        _departItineraire = depart;
+        _departItineraireQuitte = false;
         // La vue d'ensemble montre déjà le point vert (destination) en haut :
         // le bouton « Ma position » doit savoir qu'on regarde la destination,
         // sinon son premier appui fait un saut inutile (il croit qu'on
@@ -1292,21 +1324,6 @@ class _TrafficScreenState extends State<TrafficScreen>
     });
 
     if (resultat == null) {
-      if (chercherAlternative) {
-        Journal.a('ITINERAIRE', 'Aucune alternative trouvée');
-        setState(() {
-          afficherLignesTrafic = false;
-          _travaillerCarteSuspendu = false;
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              "Aucun autre itinéraire disponible. L'itinéraire actuel reste affiché.",
-            ),
-          ),
-        );
-        return;
-      }
       Journal.e('ITINERAIRE', 'Calcul impossible : aucun itinéraire obtenu');
       // La recherche a échoué, aucun itinéraire affiché : on rend au bouton
       // son état précédent et on relance le travail de la carte.
@@ -1344,29 +1361,31 @@ class _TrafficScreenState extends State<TrafficScreen>
   /// et privilégie naturellement le tracé le plus fluide. OSRM ([osrm]) n'est
   /// attendu qu'en secours, si le réseau local ne couvre pas le parcours.
   /// Si les deux échouent, renvoie null.
-  Future<RouteResult?> _prefererLocal(
-    Future<RouteResult?> local,
+  Future<List<RouteResult>?> _prefererLocal(
+    Future<List<RouteResult>?> local,
     Future<RouteResult?> osrm,
   ) async {
-    final resultatLocal = await local.catchError((e) {
+    final resultatsLocal = await local.catchError((e) {
       debugPrint('[KinFlow] Calcul itinéraire local échoué: $e');
       Journal.e('ITINERAIRE', 'Erreur du moteur local', {'erreur': '$e'});
-      return null as RouteResult?;
+      return null as List<RouteResult>?;
     });
-    if (resultatLocal != null) {
+    if (resultatsLocal != null && resultatsLocal.isNotEmpty) {
       // OSRM tournait en parallèle ; on ne l'attend plus, son résultat
       // éventuel est jeté (et ses erreurs avalées).
       unawaited(osrm.catchError((_) => null as RouteResult?));
+      final premier = resultatsLocal.first;
       Journal.s(
         'ITINERAIRE',
         'Itinéraire calculé sur les lignes de circulation',
         {
-          'points': resultatLocal.points.length,
-          'distance_m': resultatLocal.distanceMeters.round(),
-          'duree_s': resultatLocal.durationSeconds.round(),
+          'points': premier.points.length,
+          'distance_m': premier.distanceMeters.round(),
+          'duree_s': premier.durationSeconds.round(),
+          'options': resultatsLocal.length,
         },
       );
-      return resultatLocal;
+      return resultatsLocal;
     }
 
     Journal.a(
@@ -1391,8 +1410,11 @@ class _TrafficScreenState extends State<TrafficScreen>
         'distance_m': resultatOsrm.distanceMeters.round(),
         'duree_s': resultatOsrm.durationSeconds.round(),
       });
+      // OSRM ne fournit qu'une seule route, sans alternatives : une liste à un
+      // seul élément (le « Changer d'itinéraire » reste sans effet).
+      return [resultatOsrm];
     }
-    return resultatOsrm;
+    return null;
   }
 
   /// Les zones de trafic (« signalements collaboratifs ») sont reçues par la
@@ -1478,8 +1500,13 @@ class _TrafficScreenState extends State<TrafficScreen>
       _generationItineraire++;
       lieuRecherche = _arriveeItineraire;
       _itineraire = null;
+      _optionsItineraire = const [];
+      _indexItineraire = 0;
+      _itineraireAlternativesAffichees = const [];
       _itineraireSegmentIds = null;
       _arriveeItineraire = null;
+      _departItineraire = null;
+      _departItineraireQuitte = false;
       _debutVisuelItineraire = -1;
       _etapes.clear();
       _vueItineraireEnAttente = null;
@@ -1514,21 +1541,74 @@ class _TrafficScreenState extends State<TrafficScreen>
     });
   }
 
-  /// Change d'itinéraire : on interdit les rues du tracé affiché et on
-  /// relance le moteur local — le nouveau tracé passe donc par d'autres
-  /// rues. Si aucune alternative n'existe, l'itinéraire actuel reste affiché
-  /// (le message d'échec dédié l'explique à l'utilisateur).
-  void _chercherItineraireAlternatif() {
-    final itineraire = _itineraire;
-    if (itineraire == null || itineraire.segmentsIds.isEmpty) return;
+  /// Change d'itinéraire : on passe à l'option pré-calculée suivante
+  /// (2ème, 3ème…) instantanément, sans recalcul. Après la dernière, le cycle
+  /// revient sur la première (1 → 2 → 3 → 1). Sans option supplémentaire, le
+  /// bouton est inerte.
+  void _changerItineraire() {
+    final options = _optionsItineraire;
+    if (options.length < 2) return;
     if (_chargementItineraire) return;
-    _segmentsInterditsItineraire.addAll(itineraire.segmentsIds);
-    Journal.i('ITINERAIRE', 'Recherche d\'un itinéraire alternatif', {
-      'rues_interdites': _segmentsInterditsItineraire.length,
+    final suivant = options[(_indexItineraire + 1) % options.length];
+    Journal.i('ITINERAIRE', 'Changement d\'itinéraire (option '
+        '${_indexItineraire + 1}/${options.length})', {
+      'distance_m': suivant.distanceMeters.round(),
+      'duree_s': suivant.durationSeconds.round(),
     });
-    final depart = itineraire.points.first;
-    final arrivee = _arriveeItineraire ?? itineraire.points.last;
-    unawaited(calculerItineraire(depart, arrivee, chercherAlternative: true));
+    setState(() {
+      _indexItineraire = (_indexItineraire + 1) % options.length;
+      _itineraireAlternativesAffichees = [
+        for (var i = 1; i < options.length; i++)
+          options[(_indexItineraire + i) % options.length].points,
+      ];
+      _itineraire = suivant;
+      _itineraireSegmentIds = suivant.segmentsIds.isEmpty
+          ? null
+          : suivant.segmentsIds;
+      _debutVisuelItineraire = -1;
+      _banniereDistanceRestante = suivant.distanceMeters;
+      _banniereDureeRestante = suivant.durationSeconds;
+      _bannierePalier = 0;
+      modeNavigation = false;
+      _repriseNavTimer?.cancel();
+      _repriseNavTimer = null;
+      _pointsHorsTraceConsecutifs = 0;
+      _dialogueDeviationOuvert = false;
+      _deviationRefusee = false;
+      actionsSurDestination = false;
+      actionsSurEtape = false;
+      afficherActionsPosition = false;
+    });
+    _ajusterVueSurItineraire(suivant.points);
+  }
+
+  /// Recalcule l'itinéraire depuis la position actuelle du conducteur, qui a
+  /// quitté le point de départ (> 60 m) : les alternatives « Changer
+  /// d'itinéraire » sont figées sur l'ancien départ et n'ont plus de sens.
+  void _recalculerItineraire() {
+    final destination = _arriveeItineraire;
+    final position = positionActuelle;
+    if (destination == null || position == null || _chargementItineraire) {
+      return;
+    }
+    Journal.i('ITINERAIRE', 'Recalcul depuis la position actuelle', {
+      'destination':
+          '${destination.latitude.toStringAsFixed(5)}, ${destination.longitude.toStringAsFixed(5)}',
+    });
+    final depart = LatLng(position.latitude, position.longitude);
+    _etapesAvantRecherche = List.of(_etapes);
+    calculerItineraire(depart, destination);
+  }
+
+  /// Le bouton du bandeau itinéraire : change d'alternative tant que le
+  /// conducteur est resté à son départ, recalcule depuis la position une fois
+  /// qu'il s'est éloigné (> 60 m).
+  void _onBoutonChangerOuRecalculer() {
+    if (_departItineraireQuitte) {
+      _recalculerItineraire();
+    } else {
+      _changerItineraire();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1746,8 +1826,13 @@ class _TrafficScreenState extends State<TrafficScreen>
         actionsSurPosition = false;
         _generationItineraire++;
         _itineraire = null;
+        _optionsItineraire = const [];
+        _indexItineraire = 0;
+        _itineraireAlternativesAffichees = const [];
         _itineraireSegmentIds = null;
         _arriveeItineraire = null;
+        _departItineraire = null;
+        _departItineraireQuitte = false;
         _debutVisuelItineraire = -1;
         _etapes.clear();
         _travaillerCarteSuspendu = false;
@@ -1755,8 +1840,13 @@ class _TrafficScreenState extends State<TrafficScreen>
       } else if (actionsSurDestination) {
         _generationItineraire++;
         _itineraire = null;
+        _optionsItineraire = const [];
+        _indexItineraire = 0;
+        _itineraireAlternativesAffichees = const [];
         _itineraireSegmentIds = null;
         _arriveeItineraire = null;
+        _departItineraire = null;
+        _departItineraireQuitte = false;
         _debutVisuelItineraire = -1;
         _etapes.clear();
         actionsSurDestination = false;
@@ -2084,6 +2174,11 @@ class _TrafficScreenState extends State<TrafficScreen>
                 itinerairePoints: _itineraire?.points,
                 itineraireSeverites: _itineraire?.severites,
                 itineraireSegmentIds: _itineraireSegmentIds,
+                itineraireAlternatives:
+                    _departItineraireQuitte ||
+                        _itineraireAlternativesAffichees.isEmpty
+                    ? null
+                    : _itineraireAlternativesAffichees,
                 itineraireDebutRoute: _itineraire?.debutRoute ?? 0,
                 itineraireDebutVisuel: _debutVisuelItineraire,
                 itineraireFinRoute: _itineraire?.finRoute ?? -1,
@@ -2422,7 +2517,8 @@ class _TrafficScreenState extends State<TrafficScreen>
                         ],
                       ),
                       if (_itineraire != null &&
-                          _itineraire!.segmentsIds.isNotEmpty) ...[
+                          (_optionsItineraire.length >= 2 ||
+                              _departItineraireQuitte)) ...[
                         const SizedBox(height: 7),
                         Material(
                           color: sombre
@@ -2431,9 +2527,11 @@ class _TrafficScreenState extends State<TrafficScreen>
                           borderRadius: BorderRadius.circular(12),
                           child: InkWell(
                             borderRadius: BorderRadius.circular(12),
-                            onTap: _chargementItineraire
+                            onTap: _chargementItineraire ||
+                                    (_departItineraireQuitte &&
+                                        positionActuelle == null)
                                 ? null
-                                : _chercherItineraireAlternatif,
+                                : _onBoutonChangerOuRecalculer,
                             child: Padding(
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 10,
@@ -2442,23 +2540,18 @@ class _TrafficScreenState extends State<TrafficScreen>
                               child: Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  SizedBox(
-                                    width: 14,
-                                    height: 14,
-                                    child: _chargementItineraire
-                                        ? CircularProgressIndicator(
-                                            strokeWidth: 2,
-                                            color: KinColors.primary,
-                                          )
-                                        : Icon(
-                                            Icons.swap_horiz,
-                                            size: 14,
-                                            color: KinColors.primary,
-                                          ),
+                                  Icon(
+                                    _departItineraireQuitte
+                                        ? Icons.refresh
+                                        : Icons.swap_horiz,
+                                    size: 14,
+                                    color: KinColors.primary,
                                   ),
                                   const SizedBox(width: 5),
                                   Text(
-                                    'Changer d\'itinéraire',
+                                    _departItineraireQuitte
+                                        ? 'Recalculer'
+                                        : 'Changer d\'itinéraire',
                                     style: TextStyle(
                                       fontSize: 11.5,
                                       fontWeight: FontWeight.w700,
@@ -2467,6 +2560,35 @@ class _TrafficScreenState extends State<TrafficScreen>
                                           : KinColors.primaryFonce,
                                     ),
                                   ),
+                                  if (!_departItineraireQuitte) ...[
+                                    const SizedBox(width: 6),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 5,
+                                        vertical: 1,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: sombre
+                                            ? Colors.black.withValues(
+                                                alpha: 0.25)
+                                            : Colors.white.withValues(
+                                                alpha: 0.6),
+                                        borderRadius:
+                                            BorderRadius.circular(7),
+                                      ),
+                                      child: Text(
+                                        '${_indexItineraire + 1}/'
+                                        '${_optionsItineraire.length}',
+                                        style: TextStyle(
+                                          fontSize: 9.5,
+                                          fontWeight: FontWeight.w700,
+                                          color: sombre
+                                              ? Colors.white70
+                                              : KinColors.primaryFonce,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                 ],
                               ),
                             ),

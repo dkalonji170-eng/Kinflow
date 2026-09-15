@@ -153,7 +153,7 @@ void main() {
     expect(resultat, isNotNull,
         reason: 'sans réseau Overpass, l\'itinéraire doit être servi par '
             'l\'asset embarqué (vrai réseau routier de Kinshasa).');
-    expect(resultat!.points.length, greaterThan(10));
+    expect(resultat!.first.points.length, greaterThan(10));
   });
 }
 
