@@ -1129,6 +1129,7 @@ class _TrafficScreenState extends State<TrafficScreen>
 
   Future<void> calculerItineraire(LatLng depart, LatLng arrivee) async {
     if (_chargementItineraire) return;
+    final premierItineraire = _itineraire == null;
 
     setState(() {
       _chargementItineraire = true;
@@ -1141,7 +1142,7 @@ class _TrafficScreenState extends State<TrafficScreen>
       // de trafic sont masquées : seul le tracé de l'itinéraire est visible.
       // On mémorise l'état précédent pour le restaurer à la fin (recalcul
       // compris : seul le premier passage écrase la valeur mémorisée).
-      if (_itineraire == null && !_chargementItineraire) {
+      if (premierItineraire) {
         _lignesTraficAvantItineraire = afficherLignesTrafic;
       }
       afficherLignesTrafic = false;
