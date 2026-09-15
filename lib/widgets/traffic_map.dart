@@ -737,7 +737,13 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
           curve: Curves.easeOut,
         ));
         _positionAnimation!.addListener(() {
-          if (mounted) setState(() {});
+          if (!mounted) return;
+          setState(() {});
+          // Le pin saute : les pointillés de départ de l'itinéraire doivent
+          // sauter avec lui pour rester attachés au pin bleu et à la route.
+          if (widget.itinerairePoints != null) {
+            _reconstruirePolylignes();
+          }
         });
         _positionAnimController!.forward();
         _displayedPosition = newLatLng;
@@ -2226,7 +2232,19 @@ OptionModeCarte(
       severites: widget.itineraireSeverites,
       simulateur: _simulateur,
       zonePourPoint: _zonePourPoint,
+      departAncre: departAncreVivant(),
     );
+  }
+
+  /// Position bleue effective à l'écran : celle de l'animation en cours, sinon
+  /// la dernière affichée, sinon la position GPS reçue. Sert à rattacher les
+  /// pointillés de départ de l'itinéraire au pin bleu, où qu'il soit.
+  LatLng? departAncreVivant() {
+    if (_positionAnimation != null) return _positionAnimation!.value;
+    if (_displayedPosition != null) return _displayedPosition;
+    final pos = widget.positionActuelle;
+    if (pos == null) return null;
+    return LatLng(pos.latitude, pos.longitude);
   }
 
   List<Polyline> _decouperPourLabel(

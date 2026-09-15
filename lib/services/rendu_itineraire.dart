@@ -34,6 +34,7 @@ List<Polyline> decouperItineraireParEtat({
   required List<double>? severites,
   required TrafficSimulator simulateur,
   required ZonePourPoint zonePourPoint,
+  LatLng? departAncre,
   DateTime? moment,
 }) {
   if (points.length < 2) return const [];
@@ -138,6 +139,12 @@ List<Polyline> decouperItineraireParEtat({
   // hors chaussée, la portion qui le relie à la route est dessinée en
   // pointillés, comme chez Yango. Seuls les raccords encore visibles (pas
   // encore parcourus pendant le suivi réel) sont émis.
+  //
+  // Le raccord de départ part de la position BLEUE VIVANTE ([departAncre])
+  // quand elle est connue : si l'utilisateur bouge, le pin saute mais les
+  // pointillés sautent avec lui (direction libre, ce n'est pas une route, c'est
+  // ce que l'utilisateur doit parcourir pour atteindre la chaussée). Sans
+  // position vivante, il reste fixé aux points de départ du tracé calculé.
   const epaisseurPointilles = 3.2;
   final couleurPointilles =
       Colors.black.withValues(alpha: fondSombre ? 0.95 : 0.8);
@@ -148,7 +155,9 @@ List<Polyline> decouperItineraireParEtat({
     polylignes.insert(
       0,
       Polyline(
-        points: points.sublist(0, debutRoute + 1),
+        points: departAncre != null
+            ? <LatLng>[departAncre, points[debutRoute]]
+            : points.sublist(0, debutRoute + 1),
         strokeWidth: epaisseurPointilles,
         color: couleurPointilles,
         pattern: StrokePattern.dotted(),
