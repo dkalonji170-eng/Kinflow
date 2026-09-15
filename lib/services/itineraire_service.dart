@@ -64,11 +64,17 @@ class _ArgumentsItineraire {
   /// alors « réflexion profonde » pendant le calcul. Null sans abonné.
   final SendPort? porteEvenements;
 
+  /// Identifiants OSM des rues à NE PAS emprunter (itinéraire alternatif) :
+  /// les rues déjà prises par l'itinéraire affiché sont retirées du réseau
+  /// avant le calcul, le tracé suivant est donc forcément différent.
+  final Set<int> segmentsInterdits;
+
   const _ArgumentsItineraire({
     required this.segments,
     required this.points,
     required this.zones,
     this.porteEvenements,
+    this.segmentsInterdits = const {},
   });
 }
 
@@ -266,6 +272,7 @@ class ItineraireService {
     LatLng arrivee, {
     List<ZoneTrafic> zones = const [],
     List<LatLng> etapes = const [],
+    Set<int>? segmentsInterdits,
     void Function()? onRechercheElargie,
   }) async {
     // On ne charge que le couloir entre les points du parcours (avec marge),
@@ -316,6 +323,7 @@ class ItineraireService {
     }
     return _calculerLocal(
         segments, lointain, zones, etapes, depart, arrivee,
+        segmentsInterdits: segmentsInterdits,
         onRechercheElargie: onRechercheElargie);
   }
 
@@ -355,6 +363,7 @@ class ItineraireService {
     List<LatLng> etapes,
     LatLng depart,
     LatLng arrivee, {
+    Set<int>? segmentsInterdits,
     void Function()? onRechercheElargie,
   }) async {
     if (segments.length < 2) {
@@ -393,6 +402,7 @@ class ItineraireService {
             for (final z in zones) _zoneRoutePour(z),
           ],
           porteEvenements: porte?.sendPort,
+          segmentsInterdits: segmentsInterdits ?? const {},
         ),
       );
       if (resultat == null) {
@@ -453,6 +463,7 @@ RouteResult? _calculerChemin(_ArgumentsItineraire args) {
 
   final segments = args.segments
       .where((s) => s.points.length >= 2)
+      .where((s) => !args.segmentsInterdits.contains(s.id))
       .toList(growable: false);
   if (segments.length < 2) return null;
 

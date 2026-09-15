@@ -163,6 +163,11 @@ class _TrafficScreenState extends State<TrafficScreen>
   RouteResult? _itineraire;
   bool _chargementItineraire = false;
 
+  /// Segments (id OSM) des itinéraires déjà affichés, interdits au moteur
+  /// local lors du changement d'itinéraire : chaque relance cherche une route
+  /// réellement différente, jamais la même.
+  final Set<int> _segmentsInterditsItineraire = {};
+
   /// Vrai quand le moteur local a dû chercher au-delà du premier palier de
   /// routes (les 5 premières lignes ne convenant pas) : l'indicateur de
   /// calcul affiche alors « Réflexion profonde... ».
@@ -1127,11 +1132,16 @@ class _TrafficScreenState extends State<TrafficScreen>
     await calculerItineraire(depart, destination);
   }
 
-  Future<void> calculerItineraire(LatLng depart, LatLng arrivee) async {
+  Future<void> calculerItineraire(
+    LatLng depart,
+    LatLng arrivee, {
+    bool chercherAlternative = false,
+  }) async {
     if (_chargementItineraire) return;
     final premierItineraire = _itineraire == null;
 
     setState(() {
+      if (!chercherAlternative) _segmentsInterditsItineraire.clear();
       _chargementItineraire = true;
       _rechercheItineraireElargie = false;
       _travaillerCarteSuspendu = true;
@@ -1172,6 +1182,9 @@ class _TrafficScreenState extends State<TrafficScreen>
       arrivee,
       zones: _zonesTrafic,
       etapes: List.of(_etapes),
+      segmentsInterdits: _segmentsInterditsItineraire.isEmpty
+          ? null
+          : Set.of(_segmentsInterditsItineraire),
       onRechercheElargie: () {
         if (mounted) {
           setState(() => _rechercheItineraireElargie = true);
@@ -1195,6 +1208,15 @@ class _TrafficScreenState extends State<TrafficScreen>
         _travaillerCarteSuspendu = false;
       });
       return;
+    }
+
+    // Une alternative demande une route VRAIMENT différente : le moteur
+    // local doit la produire (segments connus). Le secours OSRM rejoue la
+    // même voie sans tenir compte des interdictions : on le refuse ici.
+    if (chercherAlternative &&
+        resultat != null &&
+        resultat.segmentsIds.isEmpty) {
+      resultat = null;
     }
 
     // Un trajet plus court que la distance minimale est refusé : départ et
@@ -1223,6 +1245,11 @@ class _TrafficScreenState extends State<TrafficScreen>
       _chargementItineraire = false;
       _travaillerCarteSuspendu = false;
       if (resultat != null) {
+        // L'itinéraire qu'on remplace devient interdit : la prochaine
+        // alternative passera par d'autres rues.
+        if (_itineraire != null) {
+          _segmentsInterditsItineraire.addAll(_itineraire!.segmentsIds);
+        }
         _itineraire = resultat;
         _itineraireSegmentIds = resultat.segmentsIds.isEmpty
             ? null
@@ -1265,6 +1292,21 @@ class _TrafficScreenState extends State<TrafficScreen>
     });
 
     if (resultat == null) {
+      if (chercherAlternative) {
+        Journal.a('ITINERAIRE', 'Aucune alternative trouvée');
+        setState(() {
+          afficherLignesTrafic = false;
+          _travaillerCarteSuspendu = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              "Aucun autre itinéraire disponible. L'itinéraire actuel reste affiché.",
+            ),
+          ),
+        );
+        return;
+      }
       Journal.e('ITINERAIRE', 'Calcul impossible : aucun itinéraire obtenu');
       // La recherche a échoué, aucun itinéraire affiché : on rend au bouton
       // son état précédent et on relance le travail de la carte.
@@ -1470,6 +1512,23 @@ class _TrafficScreenState extends State<TrafficScreen>
       _etapesAvantRecherche = const [];
       actionsSurEtape = false;
     });
+  }
+
+  /// Change d'itinéraire : on interdit les rues du tracé affiché et on
+  /// relance le moteur local — le nouveau tracé passe donc par d'autres
+  /// rues. Si aucune alternative n'existe, l'itinéraire actuel reste affiché
+  /// (le message d'échec dédié l'explique à l'utilisateur).
+  void _chercherItineraireAlternatif() {
+    final itineraire = _itineraire;
+    if (itineraire == null || itineraire.segmentsIds.isEmpty) return;
+    if (_chargementItineraire) return;
+    _segmentsInterditsItineraire.addAll(itineraire.segmentsIds);
+    Journal.i('ITINERAIRE', 'Recherche d\'un itinéraire alternatif', {
+      'rues_interdites': _segmentsInterditsItineraire.length,
+    });
+    final depart = itineraire.points.first;
+    final arrivee = _arriveeItineraire ?? itineraire.points.last;
+    unawaited(calculerItineraire(depart, arrivee, chercherAlternative: true));
   }
 
   // ---------------------------------------------------------------------------
@@ -2362,6 +2421,58 @@ class _TrafficScreenState extends State<TrafficScreen>
                           ),
                         ],
                       ),
+                      if (_itineraire != null &&
+                          _itineraire!.segmentsIds.isNotEmpty) ...[
+                        const SizedBox(height: 7),
+                        Material(
+                          color: sombre
+                              ? Colors.white.withValues(alpha: 0.06)
+                              : KinColors.primary.withValues(alpha: 0.08),
+                          borderRadius: BorderRadius.circular(12),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(12),
+                            onTap: _chargementItineraire
+                                ? null
+                                : _chercherItineraireAlternatif,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 5,
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  SizedBox(
+                                    width: 14,
+                                    height: 14,
+                                    child: _chargementItineraire
+                                        ? CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: KinColors.primary,
+                                          )
+                                        : Icon(
+                                            Icons.swap_horiz,
+                                            size: 14,
+                                            color: KinColors.primary,
+                                          ),
+                                  ),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    'Changer d\'itinéraire',
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w700,
+                                      color: sombre
+                                          ? const Color(0xFF4CD98E)
+                                          : KinColors.primaryFonce,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                   const SizedBox(width: 4),
