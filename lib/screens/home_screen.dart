@@ -1,12 +1,65 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
+import '../services/supabase_service.dart';
+import 'fil_ville_screen.dart';
 import 'profile_screen.dart';
 import 'settings_screen.dart';
 import 'traffic_screen.dart';
-import 'fil_ville_screen.dart';
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  static const Duration _rafraichissementBadge = Duration(seconds: 60);
+
+  /// Nombre d'infos du Fil Social arrivées depuis la dernière visite :
+  /// affiché en rouge sur le bouton « Social » (0 = pas de badge).
+  int _nouvelles = 0;
+  Timer? _minuteur;
+
+  @override
+  void initState() {
+    super.initState();
+    _actualiserBadge();
+    _minuteur = Timer.periodic(
+      _rafraichissementBadge,
+      (_) => _actualiserBadge(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _minuteur?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _actualiserBadge() async {
+    final service = SupabaseService();
+    final dernierVu = await service.lireDernierVuFil();
+    if (dernierVu == null) {
+      if (!mounted) return;
+      setState(() => _nouvelles = 0);
+      return;
+    }
+    final compteur = await service.compterNouvellesInfos(dernierVu);
+    if (!mounted) return;
+    setState(() => _nouvelles = compteur);
+  }
+
+  Future<void> _ouvrirSocial() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const FilVilleScreen()),
+    );
+    // De retour : le fil a marqué les infos comme vues → le badge retombe à 0.
+    _actualiserBadge();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -93,29 +146,51 @@ class HomeScreen extends StatelessWidget {
                 child: const Text("Voir le trafic"),
               ),
               const SizedBox(height: 12),
-              OutlinedButton.icon(
-                style: OutlinedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 32,
-                    vertical: 16,
-                  ),
-                  foregroundColor: Colors.blue,
-                  side: const BorderSide(color: Colors.blue, width: 1.5),
-                  textStyle: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => const FilVilleScreen(),
+              Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  FilledButton(
+                    style: FilledButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 32,
+                        vertical: 16,
+                      ),
+                      backgroundColor: Colors.green,
+                      foregroundColor: Colors.white,
+                      textStyle: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
-                  );
-                },
-                icon: const Icon(Icons.forum),
-                label: const Text("Social"),
+                    onPressed: _ouvrirSocial,
+                    child: const Text("Social"),
+                  ),
+                  if (_nouvelles > 0)
+                    Positioned(
+                      right: -8,
+                      top: -8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        constraints: const BoxConstraints(minWidth: 20),
+                        decoration: const BoxDecoration(
+                          color: Colors.red,
+                          borderRadius: BorderRadius.all(Radius.circular(12)),
+                        ),
+                        child: Text(
+                          _nouvelles > 99 ? '99+' : '$_nouvelles',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ],
           ),

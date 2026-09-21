@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../config/supabase_config.dart';
 import '../models/information_ville.dart';
@@ -437,6 +438,69 @@ class SupabaseService {
       debugPrint('[KinFlow] Erreur reagirInformation: $_derniereErreur');
       Journal.e('FIL', 'Réaction échouée', {'erreur': _derniereErreur});
       return null;
+    }
+  }
+
+  /// Réagit à un émoji sur une information : le pose s'il n'existe pas,
+  /// le retire s'il existe déjà (bascule). Retourne true si la bascule a
+  /// réussi, null en cas d'échec serveur/réseau.
+  Future<bool?> reagirEmoji(String informationId, String emoji) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('reagir_emoji', params: {
+            'p_id': informationId,
+            'p_emoji': emoji,
+          })
+          .timeout(_timeout);
+      if (resultat is bool) {
+        Journal.s('FIL', 'Émoji enregistré',
+            {'information': informationId, 'emoji': emoji});
+        return resultat;
+      }
+      return null;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur reagirEmoji: $_derniereErreur');
+      Journal.e('FIL', 'Émoji échoué', {'erreur': _derniereErreur});
+      return null;
+    }
+  }
+
+  /// Clé locale de la dernière visite du Fil Social — partagée entre
+  /// l'accueil (badge) et l'écran Social (points rouges).
+  static const String cleDernierVuFil = 'fil_social_dernier_vu';
+
+  Future<DateTime?> lireDernierVuFil() async {
+    final prefs = await SharedPreferences.getInstance();
+    final valeur = prefs.getString(cleDernierVuFil);
+    if (valeur == null) return null;
+    return DateTime.tryParse(valeur);
+  }
+
+  Future<void> marquerFilVu() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(cleDernierVuFil, DateTime.now().toIso8601String());
+  }
+
+  /// Nombre d'infos publiées après la date donnée — pour le badge rouge de
+  /// l'accueil. 0 en cas d'échec (le badge reste discret).
+  Future<int> compterNouvellesInfos(DateTime? depuis) async {
+    try {
+      final client = _client;
+      if (client == null) return 0;
+      final resultat = await client
+          .rpc('compter_infos_recentes', params: {
+            'p_depuis': depuis?.toUtc().toIso8601String(),
+          })
+          .timeout(_timeout);
+      return (resultat as num?)?.toInt() ?? 0;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur compterNouvellesInfos: $e');
+      return 0;
     }
   }
 
