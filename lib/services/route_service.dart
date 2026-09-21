@@ -119,21 +119,44 @@ class RouteService {
         Journal.a('OSRM', 'Un serveur a refusé la requête', {
           'serveur': Uri.parse(base).host,
           'code_http': response.statusCode,
+          'corps': _extrait(response.body),
         });
         return null;
       }
 
-      final data = json.decode(response.body);
+      dynamic data;
+      try {
+        data = json.decode(response.body);
+      } on FormatException {
+        // Corps non-JSON (page d'erreur, captive portal…) : le journaliser
+        // explicitement, sinon l'échec reste totalement muet (c'était le cas
+        // de tous les échecs OSRM du rapport de 08h17).
+        Journal.a('OSRM', 'Réponse illisible (pas de JSON)', {
+          'serveur': Uri.parse(base).host,
+          'corps': _extrait(response.body),
+        });
+        return null;
+      }
       if (data is! Map || data['code'] != 'Ok') {
         Journal.a('OSRM', 'Un serveur n\'a pas pu calculer', {
           'serveur': Uri.parse(base).host,
           'code': data is Map ? '${data['code']}' : 'réponse illisible',
+          'corps': _extrait(response.body),
         });
         return null;
       }
 
       final routes = data['routes'] as List?;
-      if (routes == null || routes.isEmpty) return null;
+      if (routes == null || routes.isEmpty) {
+        // Réponse « 200 Ok » mais sans route : l'échec OSRM le plus traître
+        // (ni refus, ni erreur réseau, ni code != Ok), qui aurait pu passer
+        // inaperçu si on ne l'avait pas rendu visible.
+        Journal.a('OSRM', 'Réponse Ok sans itinéraire', {
+          'serveur': Uri.parse(base).host,
+          'corps': _extrait(response.body),
+        });
+        return null;
+      }
 
       final route = routes.first as Map;
       final geometry = route['geometry']?.toString() ?? '';
@@ -179,6 +202,14 @@ class RouteService {
     }
 
     return completer.future;
+  }
+
+  /// Échantillon compact d'un corps de réponse (espaces aplatris, tronqué à
+  /// 200 caractères) : de quoi diagnostiquer un refus OSRM sans noyer le
+  /// journal dans un gros payload.
+  String _extrait(String corps, [int max = 200]) {
+    final compact = corps.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return compact.length <= max ? compact : '${compact.substring(0, max)}…';
   }
 
   String _cleCache(List<LatLng> points) {

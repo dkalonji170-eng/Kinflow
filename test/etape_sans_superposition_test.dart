@@ -61,4 +61,42 @@ void main() {
       }
     });
   }
+
+  test('deux étapes successives sur le réseau : passage obligé par les deux',
+      () async {
+    const depart = LatLng(-4.3047, 15.3130);
+    const arrivee = LatLng(-4.405, 15.437);
+    const premiere = LatLng(-4.32, 15.34);
+    const seconde = LatLng(-4.33, 15.33);
+    final r = await ItineraireService().calculer(
+      depart,
+      arrivee,
+      etapes: [premiere, seconde],
+    );
+    expect(r, isNotNull,
+        reason: 'un tracé doit exister pour deux étapes sur le réseau');
+    final pts = r!.first.points;
+
+    double minDist(LatLng cible) {
+      var md = double.infinity;
+      for (final p in pts) {
+        final d = dist(p, cible);
+        if (d < md) md = d;
+      }
+      return md;
+    }
+
+    expect(minDist(premiere), lessThan(100),
+        reason: 'l\'itinéraire doit passer à moins de 100 m de la 1ère étape');
+    expect(minDist(seconde), lessThan(100),
+        reason: 'l\'itinéraire doit passer à moins de 100 m de la 2ème étape');
+
+    // Toujours une seule ligne au final, même à deux étapes.
+    for (var i = 0; i + 40 < pts.length; i++) {
+      for (var j = i + 40; j < pts.length; j++) {
+        expect(dist(pts[i], pts[j]), greaterThanOrEqualTo(25),
+            reason: 'tracé replié à l\'indice $i (${pts[i]}) vs $j');
+      }
+    }
+  });
 }

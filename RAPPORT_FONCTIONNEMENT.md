@@ -221,10 +221,72 @@ Dossier `supabase/migrations/` — fichiers envoyés à Supabase par l'éditeur 
 3. `20260807020000_rls_profiles.sql` → activation RLS + politiques sur profiles + `code_unique_disponible`.
 4. `20260807030000_signalements.sql` → table signalements, RLS, `signaler_etat`, `signalements_recents`.
 5. `20260808000000_stats_historiques.sql` → colonnes dérivées, stats_creneau, archivage, consultations.
+6. `20260921000000_informations_ville.sql` → fil de la ville : tables `informations` + `reactions`, `fil_informations()`, `reagir_information()`.
+7. `20260921010000_import_infos_rss.sql` → import automatique : colonne `source_url` (anti-doublon), table `parametres_secrets`, `publier_infos_rss()`.
 
 Pour appliquer une modification dans le code SQL du projet :
 Tableau de bord Supabase → `SQL Editor` → coller le contenu → « Run ».
 (Ou `supabase db push` si la CLI Supabase est installée sur une machine avec le fichier de connexion.)
+
+### 5.6 Le fil de la ville (réseau social d'infos publiées par KinFlow)
+- **Principe** : KinFlow publie les informations sur la ville ; les utilisateurs ne publient
+  **rien** — ils réagissent à chaque info en **VERT** (info confirmée/utile) ou **ROUGE**
+  (info fausse), une réaction par personne. Retaper la même couleur retire la réaction ;
+  taper l'autre couleur la remplace.
+- **Table `informations`** — les infos publiées : `id`, `contenu` (1 à 500 caractères),
+  `latitude`, `longitude` (optionnel), `cree_a`. **Ajouter une info** : Tableau de bord
+  Supabase → Table Editor → `informations` → Insert row (la clé de service contourne la RLS,
+  donc pas besoin de politique INSERT). Les lignes `(Exemple)` créées par la migration sont
+  à supprimer une fois l'app en production.
+- **Table `reactions`** — clé primaire `(information_id, user_id)`, `sens` ∈ {`VERT`, `ROUGE`},
+  `cree_a`. Une seule réaction par identité et par info.
+- **RLS** : aucune politique sur ces deux tables — tout accès passe par des fonctions
+  `SECURITY DEFINER` :
+  - `fil_informations()` → toutes les infos + compteurs verts/rouges + `ma_reaction`
+    (null / `VERT` / `ROUGE`) du visiteur, plus récent d'abord.
+  - `reagir_information(p_id, p_sens)` → pose/remplace/retire la réaction ; retourne le
+    nouvel état (`VERT`, `ROUGE` ou null).
+- **Côté app** : écran « Social » (bouton « Social » sur l'accueil, sous « Voir le trafic ») ;
+  méthodes `SupabaseService.chargerFilInformations()` et `reagirInformation()` ; modèle `InformationVille`.
+- **Mise à jour temps réel** : l'écran se rafraîchit toutes les ~60 s et à la descente du
+  doigt (pull-to-refresh).
+- **Recyclage** : le fil n'affiche que les **48 dernières heures** — les infos plus
+  anciennes disparaissent toutes seules, remplacées par les nouvelles. Le robot
+  supprime physiquement celles de plus de 3 jours (avec leurs réactions).
+
+### 5.7 Le robot RSS « Import Kinshasa » (publication automatique)
+- **Principe** : un robot lit toutes les **30 minutes** les flux RSS des médias congolais,
+  garde les articles pertinents et les publie tout seul dans le fil Social — **sans
+  mention de la source** dans l'app. Volume visé : **20 à 30 infos par jour** pour que le
+  fil se défiler aisément.
+- **Sources branchées** (dans `outils/importer_infos_rss.py`, liste `FLUX`) :
+  Radio Okapi (`/rss.xml`), Actualite.cd (`/feed`), LePotentiel.cd (`/feed`).
+  Sans flux RSS accessible : Beto.cd (anti-robot), **Mediacongo.net** et **7sur7.cd**
+  (pas de flux public) restent à publier manuellement via le Table Editor.
+- **Filtre** (modifiable dans le script) : l'article est gardé s'il parle de **Kinshasa**
+  (ou d'un quartier : Ngaliema, Ngaba, Ndjili, Matonge, Gombe…) ou de l'**actualité
+  nationale** — mais écarté s'il concerne la **guerre à l'Est**, une autre ville/province
+  (Lubumbashi, Kisangani, Matadi…) ou le Congo-Brazzaville. Les titres factices
+  (type « 2026 Kinshasa ») sont éliminés (moins de 20 caractères).
+- **Anti-doublon** : chaque info retient `source_url` (unique) ; un même article ne passe
+  qu'une fois.
+- **Recyclage** : le fil n'affiche que les 48 dernières heures (voir §5.6) ; le robot
+  supprime aussi les infos de plus de 3 jours via `nettoyer_anciennes_infos()`.
+- **Sécurité** : la publication passe par `publier_infos_rss(contenu, url, clé)` — la clé
+  est vérifiée contre la table `parametres_secrets` (inaccessible aux clients). Le
+  filtrage des sujets est fait par le robot ; la base ne valide que clé + longueur +
+  anti-doublon. Un étranger sans la clé ne peut pas polluer le fil.
+- **Mise en route (une seule fois)** :
+  1. SQL Editor Supabase → coller `supabase/migrations/20260921010000_import_infos_rss.sql`
+     → Run (la clé d'import y est définie : `fcb0bf876aacdd68957c159bc685d086`). Si tu
+     avais déjà appliqué une ancienne version de ce fichier, applique la nouvelle à
+     nouveau : elle remplace la fonction sans casser les données.
+  2. GitHub → Settings → Secrets and variables → Actions → New repository secret :
+     nom `CLE_IMPORT_RSS`, valeur = la même clé que ci-dessus.
+  3. Pousser le code (le workflow `.github/workflows/importer_infos.yml` démarre ensuite
+     automatiquement ; bouton « Run workflow » pour un test manuel).
+- **Changer la clé** : mettre la même nouvelle valeur dans la migration (table
+  `parametres_secrets`) **et** dans le secret GitHub `CLE_IMPORT_RSS`.
 
 ---
 

@@ -5,6 +5,7 @@
 list(APPEND FLUTTER_PLUGIN_LIST
   app_links
   connectivity_plus
+  flutter_tts
   geolocator_windows
   objectbox_flutter_libs
   url_launcher_windows

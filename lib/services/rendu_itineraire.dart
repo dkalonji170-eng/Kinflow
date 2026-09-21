@@ -135,23 +135,31 @@ List<Polyline> decouperItineraireParEtat({
   }
   fermer();
 
+  const epaisseurPointilles = 3.2;
+  final couleurPointilles =
+      Colors.black.withValues(alpha: fondSombre ? 0.95 : 0.8);
+
   // Pointillés noirs de l'ARRIVÉE : quand la destination tombe hors chaussée,
   // la portion qui la relie à la route est dessinée en pointillés, comme chez
   // Yango. Seul le raccord d'arrivée est émis ici : celui du DÉPART vit dans
   // construireRaccordDepart(), car il doit suivre la position bleue en direct.
-  const epaisseurPointilles = 3.2;
-  final couleurPointilles =
-      Colors.black.withValues(alpha: fondSombre ? 0.95 : 0.8);
+  // Si la destination est trop éloignée (> 500 m), le long pointillé n'a plus
+  // de sens visuel : on ne le trace pas.
   if (finRoute < fin && finRoute >= debutVisuelBorne) {
-    polylignes.add(
-      Polyline(
-        points: points.sublist(finRoute, fin + 1),
-        strokeWidth: epaisseurPointilles,
-        color: couleurPointilles,
-        pattern: StrokePattern.dotted(),
-        strokeCap: StrokeCap.round,
-      ),
-    );
+    final roadEnd = points[finRoute];
+    final destination = points[fin];
+    final distanceHorsRoute = const Distance().distance(roadEnd, destination);
+    if (distanceHorsRoute <= _distanceMaxRaccordArriveeMetres) {
+      polylignes.add(
+        Polyline(
+          points: points.sublist(finRoute, fin + 1),
+          strokeWidth: epaisseurPointilles,
+          color: couleurPointilles,
+          pattern: StrokePattern.dotted(),
+          strokeCap: StrokeCap.round,
+        ),
+      );
+    }
   }
 
   return polylignes;
@@ -163,6 +171,12 @@ List<Polyline> decouperItineraireParEtat({
 /// ces pointillés-là suivent le point bleu EN DIRECT, là où le GPS le pose
 /// (même un saut dans la parcelle), sans attendre le prochain recalcul.
 const double _seuilRaccordDepartMetres = 18;
+
+/// Distance maximale (en mètres) entre la dernière portion routée et la
+/// destination pour que le raccord d'arrivée en pointillés noirs soit dessiné.
+/// Au-delà (destination très éloignée du réseau cartographié, point sauvage),
+/// le long pointillé n'a plus de sens et encombre la vue : on ne le trace pas.
+const double _distanceMaxRaccordArriveeMetres = 500;
 
 /// Raccords en POINTILLÉS NOIRS qui relient la position bleue vivante à la
 /// chaussée quand l'itinéraire commence hors route (bâtiment, parcelle).

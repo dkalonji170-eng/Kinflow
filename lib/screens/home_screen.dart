@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'profile_screen.dart';
 import 'settings_screen.dart';
 import 'traffic_screen.dart';
+import 'fil_ville_screen.dart';
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -90,6 +91,31 @@ class HomeScreen extends StatelessWidget {
                   );
                 },
                 child: const Text("Voir le trafic"),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 32,
+                    vertical: 16,
+                  ),
+                  foregroundColor: Colors.blue,
+                  side: const BorderSide(color: Colors.blue, width: 1.5),
+                  textStyle: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const FilVilleScreen(),
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.forum),
+                label: const Text("Social"),
               ),
             ],
           ),

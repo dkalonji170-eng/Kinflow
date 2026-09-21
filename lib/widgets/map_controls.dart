@@ -280,7 +280,16 @@ class BoutonPoserEpingle extends StatelessWidget {
 class BoutonPoser extends StatelessWidget {
   final VoidCallback onPressed;
 
-  const BoutonPoser({super.key, required this.onPressed});
+  /// Vrai pour la pose d'un lieu personnel (maison/travail) : gabarit réduit
+  /// (icône et texte plus petits) pour ne pas dominer la carte qu'on déplace
+  /// sous la prévisualisation. La pose d'épingle garde le gabarit d'origine.
+  final bool compact;
+
+  const BoutonPoser({
+    super.key,
+    required this.onPressed,
+    this.compact = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -293,17 +302,23 @@ class BoutonPoser extends StatelessWidget {
       child: InkWell(
         borderRadius: BorderRadius.circular(20),
         onTap: onPressed,
-        child: const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+        child: Padding(
+          padding: compact
+              ? const EdgeInsets.symmetric(horizontal: 14, vertical: 6)
+              : const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.check, size: 16, color: KinColors.primary),
-              SizedBox(width: 6),
+              Icon(
+                Icons.check,
+                size: compact ? 14 : 16,
+                color: KinColors.primary,
+              ),
+              SizedBox(width: compact ? 5 : 6),
               Text(
                 "Poser",
                 style: TextStyle(
-                  fontSize: 13,
+                  fontSize: compact ? 12 : 13,
                   fontWeight: FontWeight.w600,
                   color: Colors.black87,
                 ),

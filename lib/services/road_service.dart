@@ -209,6 +209,12 @@ class RoadService {
   static const _maxTentatives = 3;
   static const _baseBackoff = Duration(seconds: 3);
 
+  /// Indique si le disjoncteur Overpass suspend actuellement les charges.
+  /// Les appelants (carte, couloir, calcul d'itinéraire) s'en servent pour
+  /// traiter le refus comme un état attendu (ATTENTION) plutôt qu'une erreur,
+  /// et pour sauter directement au graphe embarqué quand il est ouvert.
+  static bool get disjoncteurOuvert => _CircuitBreakerOverpass.ouvert;
+
   Future<List<RoadSegment>> _telecharger(String regex, LatLngBounds bounds) async {
     if (_CircuitBreakerOverpass.ouvert) {
       throw Exception('Overpass: disjoncteur ouvert, pause de secours');
@@ -224,6 +230,14 @@ out geom;
 ''';
 
     for (var tentative = 0; tentative < _maxTentatives; tentative++) {
+      // Le disjoncteur peut s'ouvrir pendant la tentative précédente (timeout
+      // ou 504 en chaîne) : on abrège ici au lieu de marteler un serveur déjà
+      // en pause. Sans ce contrôle, les requêtes déjà en vol continuaient à
+      // frapper pendant la pause et à re-loguer « Disjoncteur ouvert » à
+      // chaque échec (echecs_consecutifs grimpait à 24 dans le journal).
+      if (_CircuitBreakerOverpass.ouvert) {
+        throw Exception('Overpass: disjoncteur ouvert, pause de secours');
+      }
       final endpoint = _endpoints[(_indexMiroir + tentative) % _endpoints.length];
       // File d'attente globale Overpass : même un réseau sain ne doit jamais
       // envoyer plus d'une requête toutes les 2 s.
@@ -235,7 +249,10 @@ out geom;
               headers: {'User-Agent': 'KinFlow-App/1.0 (projet kinflow)'},
               body: {'data': query},
             )
-            .timeout(const Duration(seconds: 30));
+            // Le serveur se donne lui-même [timeout:25]; 15 s côté client
+            // suffisent largement et évitent de longues files de gels quand
+            // les miroirs sont saturés (30 s auparavant).
+            .timeout(const Duration(seconds: 15));
 
         if (reponse.statusCode == 200) {
           _indexMiroir = (_indexMiroir + tentative + 1) % _endpoints.length;

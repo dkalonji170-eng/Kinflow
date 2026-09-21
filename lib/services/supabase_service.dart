@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:http/http.dart' as http;
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../config/supabase_config.dart';
+import '../models/information_ville.dart';
 import 'crash_reporter.dart';
 import 'diagnostics_service.dart';
 
@@ -383,6 +384,59 @@ class SupabaseService {
       Journal.a('CARTE', 'Signalements récents indisponibles',
           {'erreur': '$e'});
       return const [];
+    }
+  }
+
+  /// Le fil de la ville : les informations publiées par KinFlow avec les
+  /// compteurs VERT/ROUGE et la propre réaction du visiteur.
+  /// Vide si la connexion échoue (l'écran réessaie).
+  Future<List<InformationVille>> chargerFilInformations() async {
+    final client = _client;
+    if (client == null) return const [];
+    try {
+      final resultat = await client.rpc('fil_informations').timeout(_timeout);
+      if (resultat is! List) return const [];
+      return [
+        for (final e in resultat)
+          if (e is Map) InformationVille.depuisJson(e.cast<String, dynamic>()),
+      ];
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur chargerFilInformations: $e');
+      Journal.a('FIL', 'Fil de la ville indisponible', {'erreur': '$e'});
+      return const [];
+    }
+  }
+
+  /// Réagit à une information ('VERT' ou 'ROUGE'). Retaper la même couleur
+  /// retire la réaction ; taper l'autre couleur la remplace.
+  /// Retourne le nouvel état ('VERT' ou 'ROUGE'), ou null si la réaction a
+  /// été retirée — ou bien en cas d'échec (serveur/réseau).
+  Future<String?> reagirInformation(String informationId, String sens) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('reagir_information', params: {
+            'p_id': informationId,
+            'p_sens': sens,
+          })
+          .timeout(_timeout);
+      final sensResultat = resultat is String ? resultat : null;
+      if (sensResultat == null) {
+        Journal.a('FIL', 'Réaction retirée ou absente',
+            {'information': informationId});
+      } else {
+        Journal.s('FIL', 'Réaction enregistrée',
+            {'information': informationId, 'sens': sensResultat});
+      }
+      return sensResultat;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur reagirInformation: $_derniereErreur');
+      Journal.e('FIL', 'Réaction échouée', {'erreur': _derniereErreur});
+      return null;
     }
   }
 

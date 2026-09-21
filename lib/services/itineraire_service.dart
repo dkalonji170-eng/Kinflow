@@ -301,6 +301,17 @@ class ItineraireService {
     // on avale son éventuelle erreur, sinon elle serait « non traitée ».
     reseau.then((_) {}, onError: (_) {});
 
+    // Préchargement PARALLÈLE du quartier d'arrivée (trajets longs) : la
+    // petite requête localisée part en même temps que le corridor, sans aucun
+    // impact sur le chemin normal. Si le Dijkstra échoue à rattacher la
+    // destination (voies résidentielles hors grands axes), la cellule est
+    // déjà là (ou arrive en ≤ 2 s) et on retente une fois au lieu de tomber
+    // sur OSRM — le second passage n'existe que dans un cas déjà en échec et
+    // ne ralentit jamais le chemin normal.
+    final futurQuartier = lointain && !RoadService.disjoncteurOuvert
+        ? _quartierArrivee(arrivee)
+        : Future<List<RoadSegment>>.value(const []);
+
     List<RoadSegment> segments;
     try {
       segments = await reseau.timeout(_budgetSecours(lointain));
@@ -314,17 +325,55 @@ class ItineraireService {
       segments = await _secoursOuReseau(secours, reseau);
     } on Exception catch (e) {
       // Réseau Overpass indisponible : on essaie d'abord le graphe embarqué.
-      Journal.e('MOTEUR LOCAL', 'Chargement des routes impossible', {
-        'erreur': '$e',
-        'mode': lointain ? 'grands axes' : 'détail complet',
-      });
+      // Quand le disjoncteur est ouvert, c'est un état attendu (pause de
+      // secours), pas une erreur : on le signale en ATTENTION pour ne pas
+      // polluer les compteurs rouges du journal.
+      if (RoadService.disjoncteurOuvert) {
+        Journal.a('MOTEUR LOCAL', 'Réseau Overpass suspendu (disjoncteur) : '
+            'itinéraire sur le graphe embarqué', {
+          'mode': lointain ? 'grands axes' : 'détail complet',
+        });
+      } else {
+        Journal.e('MOTEUR LOCAL', 'Chargement des routes impossible', {
+          'erreur': '$e',
+          'mode': lointain ? 'grands axes' : 'détail complet',
+        });
+      }
       debugPrint('[KinFlow] Échec chargement routes itinéraire: $e');
       segments = await _secoursOuReseau(secours, reseau);
     }
-    return _calculerLocal(
+    final resultat = await _calculerLocal(
         segments, lointain, zones, etapes, depart, arrivee,
         segmentsInterdits: segmentsInterdits,
         onRechercheElargie: onRechercheElargie);
+    if (resultat != null) return resultat;
+
+    // Repli « quartier d'arrivée », uniquement sur un long trajet dont le
+    // calcul vient d'échouer (destination souvent posée sur des voies
+    // résidentielles, hors du réseau de grands axes chargé). La cellule a été
+    // préchargée en parallèle du corridor depuis le départ : soit elle est
+    // déjà là, soit on l'attend 2 s au plus. Le chemin de succès, lui, n'est
+    // JAMAIS ralenti — ce bloc n'est atteint qu'après un échec.
+    if (lointain) {
+      List<RoadSegment> supplement;
+      try {
+        supplement =
+            await futurQuartier.timeout(const Duration(seconds: 2));
+      } on TimeoutException {
+        supplement = const [];
+      }
+      if (supplement.isNotEmpty) {
+        final fusionnes = _fusionnerSegments([...segments, ...supplement]);
+        if (fusionnes.length > segments.length) {
+          final nouvelEssai = await _calculerLocal(
+              fusionnes, lointain, zones, etapes, depart, arrivee,
+              segmentsInterdits: segmentsInterdits,
+              onRechercheElargie: onRechercheElargie);
+          if (nouvelEssai != null) return nouvelEssai;
+        }
+      }
+    }
+    return null;
   }
 
   /// Budget de patience avant de servir le graphe embarqué : une connexion
@@ -337,6 +386,45 @@ class ItineraireService {
   /// méga-octet téléchargé.
   Future<List<RoadSegment>> _segmentsSecours(LatLngBounds couloir) async =>
       await OfflineRoutes.segmentsPour(couloir) ?? const [];
+
+  /// Petite cellule (~3,3 km) centrée sur la destination, TOUTES classes de
+  /// rues (résidentielles comprises) : c'est la pièce manquante classique d'un
+  /// long trajet — le corridor est chargé en grands axes, la destination trône
+  /// souvent sur une voirie locale → « points hors route ». Cette cellule,
+  /// légère, passe là où un grand couloir se prend un 504, et elle remplit
+  /// aussi le cache disque de 7 jours : le même trajet devient ensuite
+  /// instantané, sans OSRM.
+  Future<List<RoadSegment>> _quartierArrivee(LatLng arrivee) async {
+    const marge = 0.015;
+    final cellule = LatLngBounds(
+      LatLng(arrivee.latitude - marge, arrivee.longitude - marge),
+      LatLng(arrivee.latitude + marge, arrivee.longitude + marge),
+    );
+    try {
+      final s = await _roads
+          .obtenirRoutes(cellule, detailsComplets: true)
+          .timeout(const Duration(seconds: 8));
+      if (s.isNotEmpty) {
+        Journal.i('MOTEUR LOCAL', 'Quartier d\'arrivée chargé', {
+          'segments': s.length,
+        });
+      }
+      return s;
+    } on Exception catch (e) {
+      debugPrint('[KinFlow] Préchargement quartier d\'arrivée échoué: $e');
+      return const [];
+    }
+  }
+
+  /// Fusionne deux listes de segments en gardant le premier exemplaire de
+  /// chaque id : le corridor et la cellule d'arrivée peuvent se chevaucher.
+  List<RoadSegment> _fusionnerSegments(List<RoadSegment> entres) {
+    final vus = <int>{};
+    return [
+      for (final s in entres)
+        if (vus.add(s.id)) s,
+    ];
+  }
 
   /// Repli : les segments locaux s'ils sont utilisables, sinon on laisse le
   /// réseau finir (mêmes délais qu'avant la course) ; `[]` signale l'échec

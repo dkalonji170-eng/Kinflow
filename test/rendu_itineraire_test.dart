@@ -1,6 +1,7 @@
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:kinflow/services/rendu_itineraire.dart';
+import 'package:kinflow/services/traffic_simulator.dart';
 import 'package:latlong2/latlong.dart';
 
 const _points = <LatLng>[
@@ -60,5 +61,51 @@ void main() {
       departAncre: ancre,
     );
     expect(polylignes, isEmpty);
+  });
+
+  group('pointillés d\'arrivée — limite de distance', () {
+    final simulateur = TrafficSimulator();
+
+    test('pas de pointillés si la destination est trop éloignée (> 500 m)',
+        () {
+      final points = [
+        const LatLng(-4.330, 15.310),
+        const LatLng(-4.335, 15.315),
+        const LatLng(-4.340, 15.320), // ~780 m du dernier point routé
+      ];
+      final polylignes = decouperItineraireParEtat(
+        points: points,
+        debutRoute: 0,
+        finRoute: 1,
+        debutVisuel: 0,
+        fondSombre: false,
+        severites: null,
+        simulateur: simulateur,
+        zonePourPoint: (_) => null,
+      );
+      expect(polylignes, hasLength(1));
+      expect(polylignes.first.pattern, const StrokePattern.solid());
+    });
+
+    test('pointillés dessinés quand la destination est proche (≤ 500 m)', () {
+      final points = [
+        const LatLng(-4.330, 15.310),
+        const LatLng(-4.335, 15.315),
+        const LatLng(-4.3355, 15.3155), // ~78 m du dernier point routé
+      ];
+      final polylignes = decouperItineraireParEtat(
+        points: points,
+        debutRoute: 0,
+        finRoute: 1,
+        debutVisuel: 0,
+        fondSombre: false,
+        severites: null,
+        simulateur: simulateur,
+        zonePourPoint: (_) => null,
+      );
+      expect(polylignes, hasLength(2));
+      expect(polylignes.last.pattern, StrokePattern.dotted());
+      expect(polylignes.last.points.last, points.last);
+    });
   });
 }

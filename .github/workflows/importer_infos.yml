@@ -1,0 +1,17 @@
+name: Fil Social - Import RSS Kinshasa
+
+on:
+  schedule:
+    # Toutes les 30 minutes : nouveaux articles des médias congolais parlant de Kinshasa
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}  # bouton « Run workflow » pour un test manuel
+
+jobs:
+  importer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Importer les infos Kinshasa dans le fil Social
+        env:
+          CLE_IMPORT_RSS: ${{ secrets.CLE_IMPORT_RSS }}
+        run: python3 outils/importer_infos_rss.py
