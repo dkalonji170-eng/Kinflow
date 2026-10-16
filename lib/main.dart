@@ -6,7 +6,7 @@ import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:provider/provider.dart';
 import 'theme/theme_provider.dart';
 import 'theme/kinflow_theme.dart';
-import 'screens/auth_screen.dart';
+import 'screens/splash_screen.dart';
 import 'services/tile_download_service.dart';
 import 'services/tile_seed_service.dart';
 import 'services/supabase_service.dart';
@@ -202,7 +202,10 @@ class MyApp extends StatelessWidget {
 
       themeMode: themeProvider.themeMode,
 
-      home: const AuthScreen(),
+      // L'écran de démarrage vérifie si un compte est déjà lié à cet
+      // appareil : s'il en est un, on ouvre directement l'accueil au lieu
+      // de re-proposer inscription/connexion à chaque lancement.
+      home: const SplashScreen(),
     );
   }
 }
