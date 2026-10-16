@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../widgets/logo_kinflow.dart';
+
 class AboutScreen extends StatelessWidget {
   const AboutScreen({super.key});
 
@@ -13,12 +15,7 @@ class AboutScreen extends StatelessWidget {
         child: Column(
           children: [
             const SizedBox(height: 20),
-            Image.asset(
-              Theme.of(context).brightness == Brightness.dark
-                  ? "assets/kinflow_dark.jpg"
-                  : "assets/kinflow.jpg",
-              height: 90,
-            ),
+            const LogoKinflow(hauteur: 72),
             const SizedBox(height: 20),
             const ListTile(
               leading: Icon(Icons.info),

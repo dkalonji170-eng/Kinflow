@@ -278,6 +278,27 @@ class ItineraireService {
     // On ne charge que le couloir entre les points du parcours (avec marge),
     // pas toute la ville : l'itinéraire apparaît vite.
     final parcours = [depart, ...etapes, arrivee];
+
+    // Le moteur local ne connaît QUE Kinshasa : son réseau Overpass est borné
+    // à la province et son graphe embarqué aussi. Une destination hors de
+    // cette zone (autre ville, autre pays) ne peut produire qu'un trajet
+    // absurde (des milliers de km tracés à l'intérieur de Kinshasa). On
+    // refuse alors de calculer en local et on laisse OSRM — seul moteur
+    // couvrant le monde — s'en charger.
+    if (!parcours.every(
+      (p) => RoadService.dansZoneKinshasa(p.latitude, p.longitude),
+    )) {
+      Journal.a(
+        'MOTEUR LOCAL',
+        'Parcours hors de Kinshasa : moteur local ignoré (OSRM seul)',
+        {
+          'arrivee':
+              '${arrivee.latitude.toStringAsFixed(4)}, ${arrivee.longitude.toStringAsFixed(4)}',
+        },
+      );
+      return null;
+    }
+
     final couloir = _boundsEntre(parcours);
     // Destination lointaine : le couloir couvre une grande partie de la
     // ville. Charger toutes les classes de rues (résidentielles comprises)

@@ -35,6 +35,7 @@ List<Polyline> decouperItineraireParEtat({
   required TrafficSimulator simulateur,
   required ZonePourPoint zonePourPoint,
   LatLng? departAncre,
+  LatLng? arriveeAncre,
   DateTime? moment,
 }) {
   if (points.length < 2) return const [];
@@ -139,20 +140,24 @@ List<Polyline> decouperItineraireParEtat({
   final couleurPointilles =
       Colors.black.withValues(alpha: fondSombre ? 0.95 : 0.8);
 
-  // Pointillés noirs de l'ARRIVÉE : quand la destination tombe hors chaussée,
-  // la portion qui la relie à la route est dessinée en pointillés, comme chez
-  // Yango. Seul le raccord d'arrivée est émis ici : celui du DÉPART vit dans
-  // construireRaccordDepart(), car il doit suivre la position bleue en direct.
+  // Pointillés noirs de l'ARRIVÉE : dès que la destination RÉELLE (le pin
+  // vert) est à l'écart de la chaussée — bâtiment, parcelle, point tapé hors
+  // réseau — on relie le bout routé au pin en pointillés, comme chez Yango.
+  // [arriveeAncre] est fourni par la carte (pin de destination) : c'est lui
+  // qui permet le raccord même avec le moteur OSRM, dont le tracé est déjà
+  // « collé » à la route et ne contient donc aucune queue hors chaussée.
+  // Sans ancre, on retombe sur la fin du tracé ([points.last]).
   // Si la destination est trop éloignée (> 500 m), le long pointillé n'a plus
   // de sens visuel : on ne le trace pas.
-  if (finRoute < fin && finRoute >= debutVisuelBorne) {
+  if (finRoute >= debutVisuelBorne) {
+    final arrivee = arriveeAncre ?? points[fin];
     final roadEnd = points[finRoute];
-    final destination = points[fin];
-    final distanceHorsRoute = const Distance().distance(roadEnd, destination);
-    if (distanceHorsRoute <= _distanceMaxRaccordArriveeMetres) {
+    final distanceHorsRoute = const Distance().distance(roadEnd, arrivee);
+    if (distanceHorsRoute > _seuilRaccordDepartMetres &&
+        distanceHorsRoute <= _distanceMaxRaccordArriveeMetres) {
       polylignes.add(
         Polyline(
-          points: points.sublist(finRoute, fin + 1),
+          points: <LatLng>[roadEnd, arrivee],
           strokeWidth: epaisseurPointilles,
           color: couleurPointilles,
           pattern: StrokePattern.dotted(),

@@ -107,5 +107,51 @@ void main() {
       expect(polylignes.last.pattern, StrokePattern.dotted());
       expect(polylignes.last.points.last, points.last);
     });
+
+    test(
+        'raccord d\'arrivée dessiné depuis le pin quand le tracé s\'arrête sur '
+        'la route (repli OSRM, sans queue hors chaussée)', () {
+      final points = [
+        const LatLng(-4.330, 15.310),
+        const LatLng(-4.335, 15.315), // bout routé (snap OSRM)
+      ];
+      const arrivee = LatLng(-4.3355, 15.3155); // ~78 m du bout routé
+      final polylignes = decouperItineraireParEtat(
+        points: points,
+        debutRoute: 0,
+        finRoute: 1, // le tracé s'arrête déjà sur la route
+        debutVisuel: 0,
+        fondSombre: false,
+        severites: null,
+        simulateur: simulateur,
+        zonePourPoint: (_) => null,
+        arriveeAncre: arrivee,
+      );
+      expect(polylignes, hasLength(2));
+      expect(polylignes.last.pattern, StrokePattern.dotted());
+      expect(polylignes.last.points, [points.last, arrivee]);
+    });
+
+    test('pas de raccord d\'arrivée quand le pin est collé à la route (≤ 18 m)',
+        () {
+      final points = [
+        const LatLng(-4.330, 15.310),
+        const LatLng(-4.335, 15.315),
+      ];
+      const arrivee = LatLng(-4.33509, 15.31508); // ~12 m du bout routé
+      final polylignes = decouperItineraireParEtat(
+        points: points,
+        debutRoute: 0,
+        finRoute: 1,
+        debutVisuel: 0,
+        fondSombre: false,
+        severites: null,
+        simulateur: simulateur,
+        zonePourPoint: (_) => null,
+        arriveeAncre: arrivee,
+      );
+      expect(polylignes, hasLength(1));
+      expect(polylignes.first.pattern, const StrokePattern.solid());
+    });
   });
 }

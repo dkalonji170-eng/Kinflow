@@ -1,6 +1,5 @@
 import 'dart:async';
-import 'dart:math'
-    show Point, cos, exp, max, min, pow;
+import 'dart:math' show Point, cos, exp, max, min, pow;
 import 'package:flutter/foundation.dart' show listEquals, debugPrint, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
@@ -12,10 +11,13 @@ import '../config/carte.dart' show bornesAfrique, zoomMinGlobal;
 import '../main.dart'
     show tileDownloadService, waitForFmtc, initFmtc, fmtcSucceeded;
 import '../models/road_segment.dart';
+import '../models/ami_position.dart';
 import '../models/traffic_state.dart';
 import '../theme/kinflow_theme.dart';
-import '../utils/geo.dart' show deltaRotation, distanceMetresHaversine, normaliserDegre;
+import '../utils/geo.dart'
+    show deltaRotation, distanceMetresHaversine, normaliserDegre;
 import '../utils/latlng_tween.dart';
+import '../utils/temps_relatif.dart';
 import '../services/poi_service.dart'
     show
         Poi,
@@ -37,8 +39,8 @@ import '../services/traffic_stats_service.dart';
 import '../services/supabase_service.dart';
 import '../services/orientation_navigation.dart';
 import 'map_controls.dart';
-import 'map_painters.dart' show PeintreEpingle, PeintreEtape;
-
+import 'map_painters.dart' show PeintreEtape;
+import 'avatar_animal.dart';
 
 class _SegmentsParZone {
   final List<RoadSegment> segments;
@@ -51,11 +53,15 @@ class _SegmentsParZone {
   final bool detailsComplets;
   final Map<int, List<int>> grille;
   _SegmentsParZone(this.segments, this.bounds, this.detailsComplets)
-      : bornes = [for (final s in segments) _boundsGeom(s.points)],
-        grille = _indexerSegments(segments);
+    : bornes = [for (final s in segments) _boundsGeom(s.points)],
+      grille = _indexerSegments(segments);
 }
 
 const double _rayonLabel = 40.0;
+
+/// Rouge « épingle classique » (comme les cartes) pour les épingles posées,
+/// la prévisualisation et le bouton « Épingler ».
+const Color _couleurEpinglette = Color(0xFFE53935);
 
 /// Plafond de tronçons dessinés simultanément : au-delà, les classes de rue
 /// les moins importantes sont abandonnées. Sans ce garde-fou, une vue dense
@@ -105,15 +111,21 @@ const double _seuilRotationContinueDegres = 6.0;
 /// la caméra du point utilisateur (placé plus bas, vers le tiers inférieur).
 const double _navProportionDecalage = 0.22;
 
+/// Mode navigation : distance minimale (mètres) parcourue entre le début et
+/// la fin d'un geste manuel pour considérer l'utilisateur « en mouvement » et
+/// reprendre le recentrage IMMÉDIATEMENT au relâchement. En dessous, la carte
+/// reste là où le geste l'a laissée et attend la prochaine fix GPS réellement
+/// déplacée : le suivi ne doit pas arracher la vue d'un utilisateur immobile
+/// qui vient de consulter la carte.
+const double _seuilMouvementGesteMetres = 5.0;
+
 const double _tailleCellule = 0.01;
 const double _grilleMinLat = -5.0;
 const double _grilleMinLon = 15.05;
 const int _grilleMaxCols = 64;
 
-int _celluleLat(double lat) =>
-    ((lat - _grilleMinLat) / _tailleCellule).floor();
-int _celluleLon(double lon) =>
-    ((lon - _grilleMinLon) / _tailleCellule).floor();
+int _celluleLat(double lat) => ((lat - _grilleMinLat) / _tailleCellule).floor();
+int _celluleLon(double lon) => ((lon - _grilleMinLon) / _tailleCellule).floor();
 int _cleCellule(int r, int c) => r * _grilleMaxCols + c;
 
 LatLngBounds _boundsGeom(List<LatLng> points) {
@@ -144,8 +156,8 @@ Map<int, List<int>> _indexerSegments(List<RoadSegment> segments) {
       }
     }
   }
-return grille;
-  }
+  return grille;
+}
 
 /// Styles de fond de carte, choisis indépendamment du thème clair/sombre
 /// de l'application.
@@ -156,11 +168,10 @@ enum _ModeCarte {
   positron,
   darkMatter,
   voyager,
-  topo;
+  topo,
 }
 
-const String _urlTuiles =
-    'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const String _urlTuiles = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 
 // La carte sombre utilise les mêmes tuiles OSM que la carte claire, mais
 // avec une désaturation + assombrissement appliqués en temps réel.
@@ -178,8 +189,7 @@ const String _urlTuilesDarkMatter =
 const String _urlTuilesVoyager =
     'https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png';
 
-const String _urlTuilesTopo =
-    'https://tile.opentopomap.org/{z}/{x}/{y}.png';
+const String _urlTuilesTopo = 'https://tile.opentopomap.org/{z}/{x}/{y}.png';
 
 const Map<String, double> _zoomMinParClasse = {
   'motorway': 6.0,
@@ -204,7 +214,6 @@ const Map<String, double> _zoomMinParClasse = {
 enum TypeLieuPose { maison, travail }
 
 class TrafficMap extends StatefulWidget {
-
   final MapController mapController;
 
   final Position? positionActuelle;
@@ -274,6 +283,11 @@ class TrafficMap extends StatefulWidget {
   /// aucun marqueur vert de destination n'est dessiné par-dessus elle.
   final bool actionsSurEpingle;
 
+  /// Actions contextuelles ouvertes sur le pin vert de l'ami(e) localisé.
+  /// Les boutons habituels s'affichent quand même ; ce drapeau sert seulement
+  /// à ne pas dessiner l'épingle rouge par-dessus le pin de l'ami(e).
+  final bool actionsSurAmi;
+
   /// Incrémenté à chaque signalement pour rafraîchir les statistiques.
   final int versionZonesTrafic;
 
@@ -310,6 +324,12 @@ class TrafficMap extends StatefulWidget {
   /// ou en repli OSRM.
   final List<int>? itineraireSegmentIds;
 
+  /// Point de DÉPART réel de l'itinéraire (là où l'utilisateur l'a demandé),
+  /// indépendant de la position bleue vivante. Sert d'ancrage aux pointillés
+  /// noirs de départ quand le GPS n'a pas encore parlé — et en repli OSRM, dont
+  /// le tracé ne conserve pas la queue hors chaussée.
+  final LatLng? itineraireDepart;
+
   /// Pin vert de la destination de l'itinéraire en cours (null sinon) :
   /// reste visible même quand un autre lieu est ensuite recherché.
   final LatLng? pointDestination;
@@ -317,6 +337,10 @@ class TrafficMap extends StatefulWidget {
   /// Pins ambre numérotés des étapes obligatoires de l'itinéraire, dans
   /// l'ordre du parcours (aucun si l'itinéraire n'a pas d'étape).
   final List<LatLng> pointEtape;
+
+  /// Amis(es) dont la position est partagée en direct : affichés par un
+  /// marqueur rond (avatar + prénom) au-dessus de la carte.
+  final List<AmiPosition> amis;
 
   /// Libellé du bouton principal des actions : « Définir itinéraire » au
   /// départ, « Ajouter à l'itinéraire » une fois un trajet affiché.
@@ -344,12 +368,7 @@ class TrafficMap extends StatefulWidget {
   /// navigation : permet à l'écran de désactiver le mode.
   final VoidCallback? onNavigationInterrompue;
 
-  /// Thème sombre de l'application : synchronise automatiquement la carte.
-  final bool modeSombre;
-
-
   const TrafficMap({
-
     super.key,
 
     required this.mapController,
@@ -396,6 +415,8 @@ class TrafficMap extends StatefulWidget {
 
     this.actionsSurEpingle = false,
 
+    this.actionsSurAmi = false,
+
     this.versionZonesTrafic = 0,
 
     this.onZonesTrafic,
@@ -412,9 +433,13 @@ class TrafficMap extends StatefulWidget {
 
     this.itineraireSegmentIds,
 
+    this.itineraireDepart,
+
     this.pointDestination,
 
     this.pointEtape = const [],
+
+    this.amis = const [],
 
     this.libelleActionPrincipale = 'Définir itinéraire',
 
@@ -425,28 +450,33 @@ class TrafficMap extends StatefulWidget {
     this.capUtilisateur,
 
     this.onNavigationInterrompue,
-
-    this.modeSombre = false,
-
   });
 
-
   @override
-  State<TrafficMap> createState() =>
-      _TrafficMapState();
-
+  State<TrafficMap> createState() => _TrafficMapState();
 }
 
-
-
 class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
-
   bool chargementCarte = true;
   bool _fmtcReady = false;
   bool _carteRendue = false;
   _ModeCarte _modeCarte = _ModeCarte.claire;
   final ScrollController _menuCartesScroll = ScrollController();
-  FMTCTileProvider? _tileProvider;
+
+  /// Fournisseurs de tuiles FMTC, un par famille de fond (OSM, Carto,
+  /// satellite, topo...). Il en faut un DISTINCT par famille : avec un
+  /// fournisseur unique, le cache d'images de Flutter réassocie les tuiles
+  /// déjà affichées au même identifiant (FMTC #183) et ne recharge jamais le
+  /// nouveau style — la bascule de carte semble alors « prendre une éternité »
+  /// et n'apparaît qu'en se déplaçant. Les familles sont mises en cache pour
+  /// réutiliser le même fournisseur (et donc le même cache mémoire) au retour.
+  final Map<String, FMTCTileProvider> _providersFmtc = {};
+
+  /// Fournisseur réseau partagé (web ou cache FMTC indisponible). Construit une
+  /// seule fois : en recréer un à chaque build fuite un client HTTP et casse la
+  /// session de chargement des tuiles.
+  NetworkTileProvider? _providerReseau;
+
   Timer? _timerConsoTuiles;
   int _tailleCachePrecedenteKiBToOctets = 0;
 
@@ -466,7 +496,8 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
 
   /// Plafond de tronçons dessinés selon l'heure : réduit de nuit pour
   /// alléger le rendu quand le trafic est inexistant.
-  int get _plafondPolylignes => _estNuit() ? _maxPolylignesNuit : _maxPolylignes;
+  int get _plafondPolylignes =>
+      _estNuit() ? _maxPolylignesNuit : _maxPolylignes;
 
   String _lastStatus = '';
   double _downloadProgress = 0;
@@ -487,7 +518,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// C'est un NOTIFIER et non un setState : quand le point bouge, seul le
   /// calque des marqueurs (et le raccord de départ) se reconstruit — les
   /// 600→1600 polylignes de trafic restent intactes.
-  final ValueNotifier<LatLng?> _pointBleuNotifier = ValueNotifier<LatLng?>(null);
+  final ValueNotifier<LatLng?> _pointBleuNotifier = ValueNotifier<LatLng?>(
+    null,
+  );
 
   AnimationController? _camAnim;
   VoidCallback? _apresAnimation;
@@ -535,6 +568,22 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// l'arrêt ferait pivoter la carte immobile.
   LatLng? _navDernierePositionRotationContinue;
 
+  /// Pendant la navigation, un geste manuel (glisser, pincer, pivoter,
+  /// double-clic de zoom, appui long de dézoom) ne COUPE plus le suivi : il
+  /// le suspend le temps du geste, puis la carte attend un réel déplacement
+  /// avant de se recentrer — sinon le suivi arracherait la vue d'un
+  /// utilisateur immobile qui vient de consulter la carte.
+  bool _suiviEnAttenteMouvement = false;
+
+  /// Position GPS au début du geste manuel : comparée à celle du relâchement
+  /// pour décider si l'utilisateur est déjà en mouvement (≥
+  /// [_seuilMouvementGesteMetres]) et reprendre le recentrage aussitôt.
+  LatLng? _positionDebutGeste;
+
+  /// Appui long maintenu (dézoom continu) : suspend l'écriture de la caméra
+  /// par le suivi comme un geste, jusqu'au relâchement du doigt.
+  bool _longPressDezoomActif = false;
+
   Timer? _longPressTimer;
   Timer? _zoomOutTimer;
   Timer? _singleTapTimer;
@@ -580,8 +629,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   final RoadService _roadService = RoadService();
   final TrafficSimulator _simulateur = TrafficSimulator();
   final TrafficStatsService _statsService = TrafficStatsService();
-  final TilePrefetchService _prefetchService =
-      TilePrefetchService(nomMagasin: 'kinshasa');
+  final TilePrefetchService _prefetchService = TilePrefetchService(
+    nomMagasin: 'kinshasa',
+  );
 
   /// Anti-spam molette : le zoom à la molette déclenche une rafale
   /// d'événements (un par cran) — on ne journalise qu'à la fin de la rafale.
@@ -624,6 +674,12 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    // La carte est indépendante du thème de l'application : elle s'ouvre
+    // TOUJOURS en mode clair au premier affichage, quelle que soit l'ambiance
+    // (appli sombre comprise). Ensuite le style ne bouge plus qu'avec le
+    // menu « Cartes » ; basculer l'appli en clair/sombre n'écrase jamais le
+    // choix de l'utilisateur.
+    _modeCarte = _ModeCarte.claire;
     _initTileProvider();
 
     _statusSub = tileDownloadService.status.listen((status) {
@@ -663,24 +719,17 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
 
     // Pendant le calcul d'un itinéraire, tout le travail de la carte
     // (polylignes, routes, POIs, zones, tuiles, timers) est suspendu.
-    if (widget.suspendreTravailCarte &&
-        !oldWidget.suspendreTravailCarte) {
+    if (widget.suspendreTravailCarte && !oldWidget.suspendreTravailCarte) {
       _mettreEnPauseTravailCarte();
     } else if (!widget.suspendreTravailCarte &&
         oldWidget.suspendreTravailCarte) {
       _reprendreTravailCarte();
     }
 
-    if (widget.modeSombre != oldWidget.modeSombre) {
-      final nouveauMode = widget.modeSombre
-          ? _ModeCarte.sombre
-          : _ModeCarte.claire;
-      if (_modeCarte != nouveauMode &&
-          _modeCarte != _ModeCarte.satellite) {
-        setState(() => _modeCarte = nouveauMode);
-        _reconstruirePolylignes();
-      }
-    }
+    // Le style de carte ne suit PAS le thème : basculer l'appli en
+    // clair/sombre ne change plus le fond de carte (indépendance totale,
+    // seul le menu « Cartes » choisit le style). L'alignement initial est
+    // déjà fait dans initState (premier affichage uniquement).
 
     if (widget.versionZonesTrafic != oldWidget.versionZonesTrafic) {
       unawaited(_chargerZonesTrafic());
@@ -752,7 +801,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     // couloir bleu → vert dans le cache local pour pouvoir afficher le tracé
     // comme lignes de circulation colorées (rien n'est re-tracé).
     if (!identical(
-        oldWidget.itineraireSegmentIds, widget.itineraireSegmentIds)) {
+      oldWidget.itineraireSegmentIds,
+      widget.itineraireSegmentIds,
+    )) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         if (widget.itineraireSegmentIds != null &&
@@ -766,6 +817,14 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
 
     final newPos = widget.positionActuelle;
     if (newPos != null) {
+      // Une fix ACCEPTÉE n'arrive qu'après un réel déplacement (filtre
+      // anti-bruit du parent) : elle relance le suivi navigation à la suite
+      // d'un geste manuel. Le recentrage repart de la vue LAISSÉE par le
+      // geste pour glisser vers le point bleu au lieu d'y sauter.
+      if (_suiviEnAttenteMouvement &&
+          !identical(oldWidget.positionActuelle, newPos)) {
+        _reprendreSuiviNavigation();
+      }
       final newLatLng = LatLng(newPos.latitude, newPos.longitude);
       final oldPos = _displayedPosition;
 
@@ -811,13 +870,12 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
           // réagir presque instantanément à chaque fix GPS accepté.
           duration: const Duration(milliseconds: 200),
         );
-        _positionAnimation = LatLngTween(
-          begin: base,
-          end: newLatLng,
-        ).animate(CurvedAnimation(
-          parent: _positionAnimController!,
-          curve: Curves.easeOut,
-        ));
+        _positionAnimation = LatLngTween(begin: base, end: newLatLng).animate(
+          CurvedAnimation(
+            parent: _positionAnimController!,
+            curve: Curves.easeOut,
+          ),
+        );
         _positionAnimation!.addListener(() {
           if (!mounted) return;
           // Raccord mis à jour AVANT le notifier : la reconstruction du
@@ -846,26 +904,26 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       _longPressActif = true;
 
       // Après une localisation, le suivi navigation réécrit la caméra à
-      // chaque frame et ramène le zoom vers sa cible : sans interruption,
+      // chaque frame et ramène le zoom vers sa cible : sans suspension,
       // chaque pas de dézoom serait annulé aussitôt émis. Comme pour un
-      // glissement manuel, l'appui long reprend la main sur la caméra.
+      // glissement manuel, l'appui long suspend le suivi le temps du geste ;
+      // au relâchement, la carte garde le dézoom choisi et se recentrera au
+      // prochain déplacement ([_finGesteManuel]).
       _camAnim?.dispose();
       _camAnim = null;
-      widget.onNavigationInterrompue?.call();
+      _longPressDezoomActif = true;
+      _positionDebutGeste ??= _fixActuelleLatLng;
 
       final center = widget.mapController.camera.pointToLatLng(
         Point(position.dx, position.dy),
       );
 
-      _zoomOutTimer = Timer.periodic(
-        const Duration(milliseconds: 50),
-        (_) {
-          final zoom = widget.mapController.camera.zoom;
-          if (zoom > 2) {
-            widget.mapController.move(center, zoom - 0.12);
-          }
-        },
-      );
+      _zoomOutTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
+        final zoom = widget.mapController.camera.zoom;
+        if (zoom > 2) {
+          widget.mapController.move(center, zoom - 0.12);
+        }
+      });
     });
   }
 
@@ -875,7 +933,10 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     _zoomOutTimer?.cancel();
     _zoomOutTimer = null;
 
-    if (!_longPressActif && !_pointeurBouge && _pointerDownPos != null && _pointerDownTime != null) {
+    if (!_longPressActif &&
+        !_pointeurBouge &&
+        _pointerDownPos != null &&
+        _pointerDownTime != null) {
       final duree = DateTime.now().difference(_pointerDownTime!);
       if (duree.inMilliseconds < 500 && !_doubleTapEnCours) {
         final point = widget.mapController.camera.pointToLatLng(
@@ -903,6 +964,14 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     // enfant n'a pas pu remettre le flag à false — on le nettoie ici pour ne
     // jamais avaler les appuis suivants.
     _appuiBoutonAction = false;
+    // Fin d'un appui long maintenu (dézoom continu) : le dézoom choisi
+    // devient la cible du suivi (pas de retour brusque en arrière) et la
+    // carte attend un déplacement avant de recentrer, comme tout geste.
+    if (_longPressDezoomActif) {
+      _longPressDezoomActif = false;
+      _navZoomCible = widget.mapController.camera.zoom;
+      _finGesteManuel();
+    }
   }
 
   void _annulerSansTap() {
@@ -918,6 +987,15 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     _pointerDownTime = null;
     _pointerDownPos = null;
     _appuiBoutonAction = false;
+    // Un appui long en cours interrompu (second doigt posé, geste annulé) :
+    // le dézoom choisi reste la cible du suivi, le geste en cours prend le
+    // relais (le suivi est déjà suspendu par [_gestesActifs] ou restera en
+    // attente jusqu'au prochain déplacement).
+    if (_longPressDezoomActif) {
+      _longPressDezoomActif = false;
+      _navZoomCible = widget.mapController.camera.zoom;
+      _suiviEnAttenteMouvement = true;
+    }
   }
 
   /// Coupe tout le travail périodique de la carte (polylignes, routes, POIs,
@@ -984,6 +1062,17 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     _statusSub?.cancel();
     _progressSub?.cancel();
     _menuCartesScroll.dispose();
+    // Libère les fournisseurs de tuiles mis en cache. Le TileLayer a déjà
+    // libéré celui du fond actif ; dispose() est idempotent (fermeture d'un
+    // client HTTP déjà fermé), on peut donc tous les libérer sans risque.
+    for (final provider in _providersFmtc.values) {
+      unawaited(provider.dispose());
+    }
+    _providersFmtc.clear();
+    final fournisseurReseau = _providerReseau;
+    if (fournisseurReseau != null) {
+      unawaited(fournisseurReseau.dispose());
+    }
     super.dispose();
   }
 
@@ -999,19 +1088,6 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     if (mounted) {
       setState(() {
         _fmtcReady = true;
-        if (kIsWeb || !fmtcSucceeded) {
-          _tileProvider = null;
-        } else {
-          _tileProvider = FMTCTileProvider(
-            stores: const {'kinshasa': BrowseStoreStrategy.readUpdateCreate},
-            loadingStrategy: BrowseLoadingStrategy.cacheFirst,
-            // Une tuile introuvable ou en erreur réseau renverrait une
-            // exception remontant en erreur Flutter non gérée. On renvoie
-            // une tuile transparente à la place : le rendu affiche le fond
-            // gris via tileBuilder sans jamais planter.
-            errorHandler: (_) => TileProvider.transparentImage,
-          );
-        }
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
         widget.onMapReady();
@@ -1046,8 +1122,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     if (_captureConsoTuilesEnCours) return;
     _captureConsoTuilesEnCours = true;
     try {
-      final taille =
-          await FMTCStore('kinshasa').stats.size;
+      final taille = await FMTCStore('kinshasa').stats.size;
       final octets = (taille * 1024).round();
       final delta = octets - _tailleCachePrecedenteKiBToOctets;
       if (delta > 0) {
@@ -1216,8 +1291,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       // Contrôle la hauteur nous-mêmes : sans cela la feuille est plafonnée
       // et le geste de glissement sert à la fermer, pas à défiler la liste.
       isScrollControlled: true,
-      backgroundColor:
-          sombre ? KinColors.surfaceSombre : Colors.white,
+      backgroundColor: sombre ? KinColors.surfaceSombre : Colors.white,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
@@ -1233,71 +1307,71 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
               controller: _menuCartesScroll,
               padding: EdgeInsets.zero,
               children: [
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text(
-                  'Cartes',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: sombre ? KinColors.texteSombre : Colors.black87,
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    'Cartes',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: sombre ? KinColors.texteSombre : Colors.black87,
+                    ),
                   ),
                 ),
-              ),
-              OptionModeCarte(
-                icone: Icons.light_mode,
-                libelle: 'Claire',
-                selectionne: _modeCarte == _ModeCarte.claire,
-                sombre: sombre,
-                onTap: () => _choisirMode(_ModeCarte.claire),
-              ),
-              OptionModeCarte(
-                icone: Icons.dark_mode,
-                libelle: 'Sombre',
-                selectionne: _modeCarte == _ModeCarte.sombre,
-                sombre: sombre,
-                onTap: () => _choisirMode(_ModeCarte.sombre),
-              ),
-              OptionModeCarte(
-                icone: Icons.satellite_alt,
-                libelle: 'Satellite',
-                selectionne: _modeCarte == _ModeCarte.satellite,
-                sombre: sombre,
-                onTap: () => _choisirMode(_ModeCarte.satellite),
-              ),
-              OptionModeCarte(
-                icone: Icons.wb_sunny,
-                libelle: 'Positron',
-                selectionne: _modeCarte == _ModeCarte.positron,
-                sombre: sombre,
-                onTap: () => _choisirMode(_ModeCarte.positron),
-              ),
-              OptionModeCarte(
-                icone: Icons.nightlight_round,
-                libelle: 'Dark Matter',
-                selectionne: _modeCarte == _ModeCarte.darkMatter,
-                sombre: sombre,
-                onTap: () => _choisirMode(_ModeCarte.darkMatter),
-              ),
-OptionModeCarte(
-              icone: Icons.explore,
-              libelle: 'Voyager',
-              selectionne: _modeCarte == _ModeCarte.voyager,
-              sombre: sombre,
-              onTap: () => _choisirMode(_ModeCarte.voyager),
+                OptionModeCarte(
+                  icone: Icons.light_mode,
+                  libelle: 'Claire',
+                  selectionne: _modeCarte == _ModeCarte.claire,
+                  sombre: sombre,
+                  onTap: () => _choisirMode(_ModeCarte.claire),
+                ),
+                OptionModeCarte(
+                  icone: Icons.dark_mode,
+                  libelle: 'Sombre',
+                  selectionne: _modeCarte == _ModeCarte.sombre,
+                  sombre: sombre,
+                  onTap: () => _choisirMode(_ModeCarte.sombre),
+                ),
+                OptionModeCarte(
+                  icone: Icons.satellite_alt,
+                  libelle: 'Satellite',
+                  selectionne: _modeCarte == _ModeCarte.satellite,
+                  sombre: sombre,
+                  onTap: () => _choisirMode(_ModeCarte.satellite),
+                ),
+                OptionModeCarte(
+                  icone: Icons.wb_sunny,
+                  libelle: 'Positron',
+                  selectionne: _modeCarte == _ModeCarte.positron,
+                  sombre: sombre,
+                  onTap: () => _choisirMode(_ModeCarte.positron),
+                ),
+                OptionModeCarte(
+                  icone: Icons.nightlight_round,
+                  libelle: 'Dark Matter',
+                  selectionne: _modeCarte == _ModeCarte.darkMatter,
+                  sombre: sombre,
+                  onTap: () => _choisirMode(_ModeCarte.darkMatter),
+                ),
+                OptionModeCarte(
+                  icone: Icons.explore,
+                  libelle: 'Voyager',
+                  selectionne: _modeCarte == _ModeCarte.voyager,
+                  sombre: sombre,
+                  onTap: () => _choisirMode(_ModeCarte.voyager),
+                ),
+                OptionModeCarte(
+                  icone: Icons.terrain,
+                  libelle: 'Topographique',
+                  selectionne: _modeCarte == _ModeCarte.topo,
+                  sombre: sombre,
+                  onTap: () => _choisirMode(_ModeCarte.topo),
+                ),
+                const SizedBox(height: 8),
+              ],
             ),
-              OptionModeCarte(
-                icone: Icons.terrain,
-                libelle: 'Topographique',
-                selectionne: _modeCarte == _ModeCarte.topo,
-                sombre: sombre,
-                onTap: () => _choisirMode(_ModeCarte.topo),
-              ),
-              const SizedBox(height: 8),
-            ],
           ),
         ),
-      ),
       ),
     );
   }
@@ -1410,8 +1484,15 @@ OptionModeCarte(
     _navDernierTick = null;
     _navRotationCible = null;
     _navDerniereMesure = null;
-    _navDernierePositionRotationContinue = null;
+    // Ancre de déplacement de l'adaptation continue : posée sur la position
+    // de départ. Aucune rotation ne peut donc se déclencher avant un VRAI
+    // déplacement de 5 m depuis l'entrée du suivi : un cap résiduel (dernier
+    // cap connu avant l'arrêt) ne fait plus pivoter la carte immobile.
+    _navDernierePositionRotationContinue = _fixActuelleLatLng;
     _gestesActifs = 0;
+    _suiviEnAttenteMouvement = false;
+    _longPressDezoomActif = false;
+    _positionDebutGeste = null;
     // Nouvelle session de suivi : référentiel d'orientation remis à zéro.
     // La rotation affichée (vue d'ensemble d'un itinéraire, bouton
     // « Ma position ») devient la référence angulaire : le premier cap GPS
@@ -1430,6 +1511,9 @@ OptionModeCarte(
     _navDernierTick = null;
     _navCentreCourant = null;
     _navDernierePositionRotationContinue = null;
+    _suiviEnAttenteMouvement = false;
+    _longPressDezoomActif = false;
+    _positionDebutGeste = null;
 
     // Pendant le suivi, le point bleu glisse avec la caméra lissée
     // ([_navCentreCourant]) : il n'est PAS sur la position GPS réelle. À
@@ -1444,6 +1528,72 @@ OptionModeCarte(
       _pointBleuNotifier.value = fix;
       _majRaccordDepart();
     }
+  }
+
+  /// Dernière position GPS reçue par le widget (fix brute), en [LatLng], ou
+  /// null tant qu'aucune position n'a été fournie.
+  LatLng? get _fixActuelleLatLng {
+    final p = widget.positionActuelle;
+    if (p == null) return null;
+    return LatLng(p.latitude, p.longitude);
+  }
+
+  /// Fin d'un geste manuel (glisser, pincer, pivoter, double-clic de zoom,
+  /// appui long de dézoom) : le suivi navigation n'est jamais COUPÉ par un
+  /// geste, seulement suspendu le temps du geste. Au relâchement :
+  ///
+  ///  - si l'utilisateur est déjà en mouvement réel (≥ 5 m parcourues depuis
+  ///    le début du geste), la carte se recentre sur le point bleu aussitôt ;
+  ///  - sinon elle reste là où le geste l'a laissée et attend le prochain
+  ///    déplacement ([_reprendreSuiviNavigation] au fil du flux GPS).
+  void _finGesteManuel() {
+    if (!widget.modeNavigation) return;
+    // Défensif (double appel : relâchement du doigt puis événement carte de
+    // fin) : s'il n'y a rien à décider, on ne réécrit pas l'état.
+    if (_positionDebutGeste == null && !_suiviEnAttenteMouvement) return;
+    final debut = _positionDebutGeste;
+    _positionDebutGeste = null;
+    final fix = _fixActuelleLatLng;
+    if (debut != null && fix != null) {
+      final metres = distanceHaversineMetres(
+        debut.latitude,
+        debut.longitude,
+        fix.latitude,
+        fix.longitude,
+      );
+      if (metres >= _seuilMouvementGesteMetres) {
+        _reprendreSuiviNavigation();
+        return;
+      }
+    }
+    _suiviEnAttenteMouvement = true;
+  }
+
+  /// Le suivi navigation reprend son écriture de la caméra après un geste
+  /// manuel : le centre lissé est ré-ancré sur la coordonnée actuellement
+  /// affichée à l'emplacement de suivi (tiers inférieur de l'écran), pour
+  /// que le recentrage soit un glissement continu depuis la vue laissée par
+  /// le geste, et non un saut depuis l'ancien centre figé.
+  void _reprendreSuiviNavigation() {
+    _suiviEnAttenteMouvement = false;
+    _positionDebutGeste = null;
+    final camera = widget.mapController.camera;
+    if (!camera.center.latitude.isFinite) return;
+    final taille = camera.nonRotatedSize;
+    _navCentreCourant = camera.pointToLatLng(
+      Point(
+        taille.x / 2,
+        taille.y / 2 + taille.y * _navProportionDecalageCourante,
+      ),
+    );
+    // Oublier le dernier tick (figé depuis le début du geste) : sinon le
+    // premier tick de reprise convergerait à ~70 % d'un coup (saut) au lieu
+    // du lissage habituel de ~0,3 s.
+    _navDernierTick = null;
+    // Le déplacement qui a motivé la reprise ne doit pas servir d'élan pour
+    // une rotation immédiate : l'ancre repart de la position courante. La
+    // carte ne pivotera qu'après 5 m parcourus DEPUIS la reprise.
+    _navDernierePositionRotationContinue = _fixActuelleLatLng;
   }
 
   /// Boucle de suivi navigation : la caméra glisse en continu vers la
@@ -1462,19 +1612,35 @@ OptionModeCarte(
   void _surTickNavigation(Duration elapsed) {
     if (!mounted ||
         !widget.modeNavigation ||
-        !_fmtcReady ||
         widget.positionActuelle == null) {
       return;
     }
-    // Un geste utilisateur est en cours (pincement, pivotement, double-clic) :
-    // on suspend l'écriture caméra du suivi pour ne pas lui faire opposition.
-    if (_gestesActifs > 0) return;
+    // Le suivi de la position NE DÉPEND PAS du cache de tuiles (FMTC). Sur le
+    // web, FMTC est ignoré et la carte est prête immédiatement ; sur Android,
+    // l'initialisation du cache (ou son échec) retardait `_fmtcReady` et
+    // figeait le point bleu alors que la carte est déjà utilisable. On ne
+    // s'appuie donc que sur la disponibilité réelle de la caméra.
+    final cameraPrete = widget.mapController.camera;
+    if (!cameraPrete.center.latitude.isFinite ||
+        cameraPrete.nonRotatedSize.x <= 0 ||
+        cameraPrete.nonRotatedSize.y <= 0) {
+      return;
+    }
+    // Un geste utilisateur est en cours (glissement, pincement, pivotement,
+    // double-clic, appui long de dézoom) : on suspend l'écriture caméra du
+    // suivi le temps du geste pour ne pas lui faire opposition. Au
+    // relâchement, [_suiviEnAttenteMouvement] garde la main à l'utilisateur
+    // jusqu'à un réel déplacement (le suivi reprend alors, cf.
+    // [_reprendreSuiviNavigation]).
+    if (_gestesActifs > 0 || _longPressDezoomActif) return;
+    if (_suiviEnAttenteMouvement) return;
 
-    final dt = (_navDernierTick == null
-            ? 16
-            : (elapsed - _navDernierTick!).inMilliseconds)
-        .clamp(1, 120)
-        .toInt();
+    final dt =
+        (_navDernierTick == null
+                ? 16
+                : (elapsed - _navDernierTick!).inMilliseconds)
+            .clamp(1, 120)
+            .toInt();
     _navDernierTick = elapsed;
     final k = 1 - exp(-_navFacteurLissage * dt / 1000);
 
@@ -1518,21 +1684,26 @@ OptionModeCarte(
       final capFiltre = _orientationNav.capFiltre;
       if (capFiltre != null) {
         final derniere = _navDernierePositionRotationContinue;
-        final deplacementSuffisant = derniere == null ||
+        final deplacementSuffisant =
+            derniere == null ||
             distanceHaversineMetres(
-              derniere.latitude,
-              derniere.longitude,
-              cible.latitude,
-              cible.longitude,
-            ) >=
+                  derniere.latitude,
+                  derniere.longitude,
+                  cible.latitude,
+                  cible.longitude,
+                ) >=
                 seuilDistanceMetres;
         if (deplacementSuffisant) {
+          // Déplacement réel : l'ancre avance MAINTENANT, qu'on pivote ou
+          // non. Sinon elle resterait figée loin derrière et un simple bruit
+          // de cap à l'arrêt (GPS immobile) finirait par dépasser 5 m et
+          // ferait pivoter la carte toute seule.
+          _navDernierePositionRotationContinue = cible;
           final cibleContinue = normaliserDegre(-capFiltre);
           final cibleEnCours = _navRotationCible ?? _navRotationCourante;
           if (deltaRotation(cibleEnCours, cibleContinue).abs() >=
               _seuilRotationContinueDegres) {
             _navRotationCible = cibleContinue;
-            _navDernierePositionRotationContinue = cible;
           }
         }
       }
@@ -1593,11 +1764,9 @@ OptionModeCarte(
     // Zones mortes : on n'écrit dans la caméra que si quelque chose a
     // réellement changé (évite les micro-écritures qui font trembler).
     final bougeNecessaire =
-        (_navCentreCourant!.latitude - camera.center.latitude).abs() >
-                1e-9 ||
-            (_navCentreCourant!.longitude - camera.center.longitude).abs() >
-                1e-9 ||
-            (zoom - camera.zoom).abs() > 0.001;
+        (_navCentreCourant!.latitude - camera.center.latitude).abs() > 1e-9 ||
+        (_navCentreCourant!.longitude - camera.center.longitude).abs() > 1e-9 ||
+        (zoom - camera.zoom).abs() > 0.001;
     if (bougeNecessaire) {
       widget.mapController.move(_navCentreCourant!, zoom, offset: decalage);
     }
@@ -1620,10 +1789,28 @@ OptionModeCarte(
         event is MapEventRotateStart ||
         event is MapEventDoubleTapZoomStart) {
       _gestesActifs++;
+      _positionDebutGeste ??= _fixActuelleLatLng;
     } else if (event is MapEventMoveEnd ||
         event is MapEventRotateEnd ||
         event is MapEventDoubleTapZoomEnd) {
       if (_gestesActifs > 0) _gestesActifs--;
+      // Fin de TOUS les gestes en cours (le pincement émet Move ET Rotate) :
+      // le suivi reprend ou attend un déplacement selon le mouvement réel.
+      if (_gestesActifs == 0) _finGesteManuel();
+    }
+    // Inertie de lâcher (fling) : après un glissement rapide, flutter_map
+    // continue d'animer la caméra sur l'élan. Le suivi doit rester suspendu
+    // durant cette dérive pour n'offrir AUCUNE résistance ; il ne reprendra
+    // qu'au prochain déplacement réel (carte lâchée + utilisateur en marche).
+    if (widget.modeNavigation && event is MapEventFlingAnimation) {
+      _suiviEnAttenteMouvement = true;
+    }
+    // Zoom à la molette (web/desktop) : pas d'événement « début/fin » de
+    // geste associé — chaque cran est une manipulation directe. Le suivi
+    // reste suspendu pendant et après le zoom pour n'offrir aucune
+    // résistance, et reprend au prochain déplacement réel.
+    if (widget.modeNavigation && event is MapEventScrollWheelZoom) {
+      _suiviEnAttenteMouvement = true;
     }
     _journaliserGeste(event);
     // Pendant la navigation, un zoom manuel (pincement, molette, double-tap)
@@ -1748,7 +1935,8 @@ OptionModeCarte(
     // seuil [_zoomMinLieuxPersonnels], même si les tableaux de POIs, eux, ne
     // bougent pas. Sans cela, le marqueur resterait figé jusqu'au prochain
     // changement de seuil POI.
-    final signature = _seuilPoiParZoom(zoom) * 100 +
+    final signature =
+        _seuilPoiParZoom(zoom) * 100 +
         _espacementPois(zoom).round() +
         ((_lieuxPersonnelsVisibles(zoom)) ? 1000000 : 0);
     if (signature != _signatureZoom) {
@@ -1866,8 +2054,11 @@ OptionModeCarte(
       if (!mounted) return;
 
       _tentativesRoutes = 0;
-      _segmentsCache[_cleSegments(rond, detailsComplets)] =
-          _SegmentsParZone(segments, rond, detailsComplets);
+      _segmentsCache[_cleSegments(rond, detailsComplets)] = _SegmentsParZone(
+        segments,
+        rond,
+        detailsComplets,
+      );
       while (_segmentsCache.length > 40) {
         _segmentsCache.remove(_segmentsCache.keys.first);
       }
@@ -1883,7 +2074,10 @@ OptionModeCarte(
       // secours pendant 30 s à 240 s), pas une erreur. Le repli exponentiel
       // ci-dessous relancera tout seul à la fin de la pause.
       if (RoadService.disjoncteurOuvert) {
-        Journal.a('CARTE', 'Chargement des routes suspendu : disjoncteur Overpass ouvert');
+        Journal.a(
+          'CARTE',
+          'Chargement des routes suspendu : disjoncteur Overpass ouvert',
+        );
       } else {
         Journal.e('CARTE', 'Chargement des routes pour la carte échoué', {
           'erreur': '$e',
@@ -1930,7 +2124,8 @@ OptionModeCarte(
       LatLng(minLat - marge, minLon - marge),
       LatLng(maxLat + marge, maxLon + marge),
     );
-    final lointain = (couloir.north - couloir.south) > 0.08 ||
+    final lointain =
+        (couloir.north - couloir.south) > 0.08 ||
         (couloir.east - couloir.west) > 0.08;
     final detailsComplets = !lointain;
     final rond = _arrondirBounds(couloir);
@@ -1945,8 +2140,11 @@ OptionModeCarte(
         detailsComplets: detailsComplets,
       );
       if (!mounted) return;
-      _segmentsCache[_cleSegments(rond, detailsComplets)] =
-          _SegmentsParZone(segments, rond, detailsComplets);
+      _segmentsCache[_cleSegments(rond, detailsComplets)] = _SegmentsParZone(
+        segments,
+        rond,
+        detailsComplets,
+      );
       while (_segmentsCache.length > 40) {
         _segmentsCache.remove(_segmentsCache.keys.first);
       }
@@ -1976,9 +2174,9 @@ OptionModeCarte(
   /// que seul le dernier zoom était réellement téléchargé — la vue
   /// d'ensemble (souvent z12-z13) restait grise longtemps.
   Future<void> _prechargerTuilesCouloir(List<LatLng> points) async {
-    if (!_fmtcReady || kIsWeb || !mounted) return;
-    // Le réseau seul n'a pas de cache à préchauffer.
-    if (_tileProvider == null) return;
+    // Le préchauffage n'a de sens qu'avec le cache FMTC disponible : sur le
+    // réseau seul (web ou FMTC indisponible), il n'y a pas de cache à remplir.
+    if (!_fmtcReady || kIsWeb || !fmtcSucceeded || !mounted) return;
     // Le satellite est lourd et son itinéraire n'est pas dessiné : on
     // laisse la carte s'afficher normalement sans précharger.
     if (_modeCarte == _ModeCarte.satellite) return;
@@ -2066,8 +2264,11 @@ OptionModeCarte(
       );
       if (!mounted) return;
 
-      _segmentsCache[_cleSegments(rond, detailsComplets)] =
-          _SegmentsParZone(segments, rond, detailsComplets);
+      _segmentsCache[_cleSegments(rond, detailsComplets)] = _SegmentsParZone(
+        segments,
+        rond,
+        detailsComplets,
+      );
       while (_segmentsCache.length > 40) {
         _segmentsCache.remove(_segmentsCache.keys.first);
       }
@@ -2083,10 +2284,7 @@ OptionModeCarte(
         (b.south * f).floorToDouble() / f,
         (b.west * f).floorToDouble() / f,
       ),
-      LatLng(
-        (b.north * f).ceilToDouble() / f,
-        (b.east * f).ceilToDouble() / f,
-      ),
+      LatLng((b.north * f).ceilToDouble() / f, (b.east * f).ceilToDouble() / f),
     );
   }
 
@@ -2098,10 +2296,12 @@ OptionModeCarte(
     final centreLon = (b.east + b.west) / 2;
     final demiLat = (b.north - b.south) / 2 * (1 + facteur);
     final demiLon = (b.east - b.west) / 2 * (1 + facteur);
-    return _arrondirBounds(LatLngBounds(
-      LatLng(centreLat - demiLat, centreLon - demiLon),
-      LatLng(centreLat + demiLat, centreLon + demiLon),
-    ));
+    return _arrondirBounds(
+      LatLngBounds(
+        LatLng(centreLat - demiLat, centreLon - demiLon),
+        LatLng(centreLat + demiLat, centreLon + demiLon),
+      ),
+    );
   }
 
   String _cleSegments(LatLngBounds b, bool detailsComplets) {
@@ -2180,9 +2380,9 @@ OptionModeCarte(
     // secondes.
     final pointsItineraire =
         (widget.itinerairePoints != null &&
-                widget.itinerairePoints!.length >= 2)
-            ? widget.itinerairePoints
-            : null;
+            widget.itinerairePoints!.length >= 2)
+        ? widget.itinerairePoints
+        : null;
     if (pointsItineraire != null) {
       _polylignesItineraire = _decouperItineraireParEtat(pointsItineraire);
     } else {
@@ -2260,9 +2460,7 @@ OptionModeCarte(
       // des sommets espacés de moins d'un pixel, inutiles à peindre.
       final simpl = _simplifier(points, toleranceEcran);
       if (simpl.length < 2) continue;
-      polylignes.addAll(
-        _decouperParEtat(segment, simpl, zoom, maintenant),
-      );
+      polylignes.addAll(_decouperParEtat(segment, simpl, zoom, maintenant));
     }
 
     setState(() {
@@ -2329,6 +2527,27 @@ OptionModeCarte(
     );
   }
 
+  /// Marqueur d'un ami(e) qui partage sa position : un pin vert (goutte
+  /// `location_on`) contenant son avatar, son prénom, puis l'âge de la
+  /// dernière position connue (« il y a 15 minutes »), le tout sous le pin.
+  /// `IgnorePointer` empêche le marqueur de capter les gestes destinés à la
+  /// carte ; l'ancrage fait tomber la POINTE du pin sur la position.
+  ///
+  /// La hauteur de la boîte a grandi (72 → 92) pour loger la ligne du temps
+  /// SANS déplacer le pin : l'alignement vertical est recalculé pour garder la
+  /// même position de pointe à l'écran (même hauteur sous le pin qu'avant).
+  Marker _marqueurAmi(AmiPosition ami) {
+    return Marker(
+      point: ami.position,
+      width: 120,
+      height: 92,
+      alignment: const Alignment(0, 0.59),
+      // Contre-rotation : le pin reste droit quand la carte pivote.
+      rotate: true,
+      child: _MarqueurAmi(ami: ami),
+    );
+  }
+
   /// Découpe un segment en tronçons. Les rues sont colorées selon l'état
   /// simulé (heure de la journée) ; les portions couvertes par une zone de
   /// circulation réelle (puis l'itinéraire) portent la couleur des témoins.
@@ -2344,7 +2563,9 @@ OptionModeCarte(
     bool pourItineraire = false,
   }) {
     final nuit = !pourItineraire && _estNuit();
-    final couleurBase = _fondSombre ? Colors.grey.shade400 : Colors.grey.shade500;
+    final couleurBase = _fondSombre
+        ? Colors.grey.shade400
+        : Colors.grey.shade500;
     final baseOpacite = _fondSombre ? 0.85 : 0.6;
     final epaisseur = _epaisseur(segment.classe, zoom);
 
@@ -2357,8 +2578,9 @@ OptionModeCarte(
     final simEtat = nuit
         ? EtatTrafic.fluide
         : _simulateur.estimer(segment, moment: maintenant);
-    final couleurBaseSim =
-        _fondSombre ? Color.lerp(couleurBase, simEtat.couleur, 0.7)! : simEtat.couleur;
+    final couleurBaseSim = _fondSombre
+        ? Color.lerp(couleurBase, simEtat.couleur, 0.7)!
+        : simEtat.couleur;
     final opaciteBaseSim = _fondSombre ? 0.85 : 1.0;
 
     ({Color couleur, double opacite}) attribut(LatLng milieu) {
@@ -2377,7 +2599,10 @@ OptionModeCarte(
       final couleur = _fondSombre
           ? Color.lerp(couleurBaseSim, zone.etat.couleur, f)!
           : zone.etat.couleur;
-      return (couleur: couleur, opacite: _fondSombre ? (0.35 + 0.65 * f).clamp(0.0, 1.0) : 1.0);
+      return (
+        couleur: couleur,
+        opacite: _fondSombre ? (0.35 + 0.65 * f).clamp(0.0, 1.0) : 1.0,
+      );
     }
 
     final troncons = <({List<LatLng> pts, Color couleur, double opacite})>[];
@@ -2409,7 +2634,14 @@ OptionModeCarte(
 
     return [
       for (final t in troncons)
-        ..._decouperPourLabel(segment, t.pts, t.couleur, epaisseur, zoom, t.opacite),
+        ..._decouperPourLabel(
+          segment,
+          t.pts,
+          t.couleur,
+          epaisseur,
+          zoom,
+          t.opacite,
+        ),
     ];
   }
 
@@ -2433,7 +2665,8 @@ OptionModeCarte(
       severites: widget.itineraireSeverites,
       simulateur: _simulateur,
       zonePourPoint: _zonePourPoint,
-      departAncre: departAncreVivant(),
+      departAncre: departAncreVivant() ?? widget.itineraireDepart,
+      arriveeAncre: widget.pointDestination,
     );
   }
 
@@ -2463,7 +2696,7 @@ OptionModeCarte(
             debutRoute: widget.itineraireDebutRoute,
             debutVisuel: widget.itineraireDebutVisuel,
             fondSombre: _fondSombre,
-            departAncre: departAncreVivant(),
+            departAncre: departAncreVivant() ?? widget.itineraireDepart,
           );
     if (!listEquals(_polylignesRaccordDepart, raccord)) {
       _polylignesRaccordDepart = raccord;
@@ -2479,15 +2712,15 @@ OptionModeCarte(
     double opacite,
   ) {
     Polyline ligne(List<LatLng> pts) => Polyline(
-          points: pts,
-          strokeWidth: largeur,
-          color: couleur.withValues(alpha: opacite.clamp(0.0, 1.0)),
-          borderColor: Colors.black.withValues(alpha: 0.35),
-          // La bordure fait peindre chaque tronçon DEUX fois : en vue ville
-          // (zoom < 12) les lignes sont si fines qu'elle est invisible —
-          // on la supprime pour diviser le coût de rendu par deux.
-          borderStrokeWidth: zoom < 12 ? 0 : 1,
-        );
+      points: pts,
+      strokeWidth: largeur,
+      color: couleur.withValues(alpha: opacite.clamp(0.0, 1.0)),
+      borderColor: Colors.black.withValues(alpha: 0.35),
+      // La bordure fait peindre chaque tronçon DEUX fois : en vue ville
+      // (zoom < 12) les lignes sont si fines qu'elle est invisible —
+      // on la supprime pour diviser le coût de rendu par deux.
+      borderStrokeWidth: zoom < 12 ? 0 : 1,
+    );
 
     if (zoom < 12 || segment.nom.isEmpty || points.length < 2) {
       return [ligne(points)];
@@ -2583,14 +2816,8 @@ OptionModeCarte(
     // 17 → 2.4×, 19 → 3.1×. Même échelle sur toutes les cartes.
     final f = (1 + (zoom - 13) * 0.35).clamp(0.9, 5.0);
     final base = switch (classe) {
-      'motorway' ||
-      'motorway_link' ||
-      'trunk' ||
-      'trunk_link' => 3.5,
-      'primary' ||
-      'primary_link' ||
-      'secondary' ||
-      'secondary_link' => 3.0,
+      'motorway' || 'motorway_link' || 'trunk' || 'trunk_link' => 3.5,
+      'primary' || 'primary_link' || 'secondary' || 'secondary_link' => 3.0,
       'tertiary' || 'tertiary_link' || 'unclassified' || 'road' => 2.2,
       _ => 1.8,
     };
@@ -2606,7 +2833,9 @@ OptionModeCarte(
 
   /// URL du fond de carte selon le mode actif : sert aussi au prétéléchargement
   /// des tuiles du couloir d'itinéraire (même source que la carte affichée).
-  String get _urlDuMode => switch (_modeCarte) {
+  String get _urlDuMode => _urlPourMode(_modeCarte);
+
+  String _urlPourMode(_ModeCarte mode) => switch (mode) {
     _ModeCarte.sombre => _urlTuilesSombre,
     _ModeCarte.satellite => _urlTuilesSatellite,
     _ModeCarte.claire => _urlTuiles,
@@ -2616,13 +2845,48 @@ OptionModeCarte(
     _ModeCarte.topo => _urlTuilesTopo,
   };
 
+  /// Identifiant court et stable d'une famille de fond : deux modes qui
+  /// partagent exactement les mêmes tuiles doivent renvoyer la même famille
+  /// (c'est le cas de « claire » et « sombre », tous deux en OSM).
+  String _familleFond(_ModeCarte mode) => switch (mode) {
+    _ModeCarte.claire || _ModeCarte.sombre => 'osm',
+    _ModeCarte.satellite => 'esri-satellite',
+    _ModeCarte.positron => 'carto-positron',
+    _ModeCarte.darkMatter => 'carto-dark-matter',
+    _ModeCarte.voyager => 'carto-voyager',
+    _ModeCarte.topo => 'opentopomap',
+  };
+
+  /// Fournisseur de tuiles pour le mode demandé. Un fournisseur FMTC DISTINCT
+  /// par famille de fond : c'est ce qui force le cache d'images à recharger les
+  /// tuiles lors d'une bascule de carte (FMTC #183). La distinction est assurée
+  /// par un en-tête factice propre à la famille (ignoré par les serveurs de
+  /// tuiles) ; le reste de la configuration demeure identique.
+  TileProvider _providerTuiles(_ModeCarte mode) {
+    if (!kIsWeb && fmtcSucceeded) {
+      final famille = _familleFond(mode);
+      return _providersFmtc.putIfAbsent(
+        famille,
+        () => FMTCTileProvider(
+          stores: const {'kinshasa': BrowseStoreStrategy.readUpdateCreate},
+          loadingStrategy: BrowseLoadingStrategy.cacheFirst,
+          headers: {'x-kinflow-fond': famille},
+          // Une tuile introuvable ou en erreur réseau renverrait une
+          // exception remontant en erreur Flutter non gérée. On renvoie
+          // une tuile transparente à la place : le rendu affiche le fond
+          // gris via tileBuilder sans jamais planter.
+          errorHandler: (_) => TileProvider.transparentImage,
+        ),
+      );
+    }
+    return _providerReseau ??= NetworkTileProvider(silenceExceptions: true);
+  }
+
   Widget _tuileDeBase(_ModeCarte mode) {
-    final url = _urlDuMode;
     return TileLayer(
-      urlTemplate: url,
+      urlTemplate: _urlPourMode(mode),
       userAgentPackageName: 'com.kinflow.kinflow',
-      tileProvider:
-          _tileProvider ?? NetworkTileProvider(silenceExceptions: true),
+      tileProvider: _providerTuiles(mode),
       errorTileCallback: (tile, error, stackTrace) {
         // Les échecs de téléchargement de tuiles (réseau instable, serveur
         // indisponible) sont déjà rendus par tileBuilder via tile.loadError :
@@ -2659,11 +2923,7 @@ OptionModeCarte(
           return Container(
             color: Colors.grey.shade400,
             alignment: Alignment.center,
-            child: Icon(
-              Icons.cloud_off,
-              color: Colors.grey.shade600,
-              size: 14,
-            ),
+            child: Icon(Icons.cloud_off, color: Colors.grey.shade600, size: 14),
           );
         }
         if (!tile.readyToDisplay) {
@@ -2685,17 +2945,49 @@ OptionModeCarte(
         if (_modeCarte == _ModeCarte.sombre) {
           return ColorFiltered(
             colorFilter: const ColorFilter.matrix([
-              0.2126, 0.7152, 0.0722, 0, 0,
-              0.2126, 0.7152, 0.0722, 0, 0,
-              0.2126, 0.7152, 0.0722, 0, 0,
-              0,      0,      0,      1, 0,
+              0.2126,
+              0.7152,
+              0.0722,
+              0,
+              0,
+              0.2126,
+              0.7152,
+              0.0722,
+              0,
+              0,
+              0.2126,
+              0.7152,
+              0.0722,
+              0,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
             ]),
             child: ColorFiltered(
               colorFilter: const ColorFilter.matrix([
-                0.6, 0, 0, 0, 0,
-                0, 0.6, 0, 0, 0,
-                0, 0,   0.6, 0, 0,
-                0, 0,   0,   1, 0,
+                0.6,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.6,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.6,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
               ]),
               child: widgetTile,
             ),
@@ -2720,12 +3012,13 @@ OptionModeCarte(
     }
   }
 
-  /// Épingle classique « goutte » en relief : corps coloré aux reflets 3D,
-  /// aiguille grise au centre, pointe en bas. Dessinée en CustomPaint.
-  Widget _construireEpingle(Color couleur) {
-    return CustomPaint(
-      size: const Size(50, 50),
-      painter: PeintreEpingle(couleur),
+  /// Épingle classique (punaise) : la même que la prévisualisation et le
+  /// bouton « Épingler ». Sa pointe en bas sert d'ancre géographique.
+  Widget _construireEpingle() {
+    return const Icon(
+      Icons.push_pin,
+      size: 34,
+      color: _couleurEpinglette,
     );
   }
 
@@ -2733,11 +3026,7 @@ OptionModeCarte(
   /// de position sur les téléphones. Utilisée pour la position de l'utilisateur
   /// et le lieu recherché.
   Widget _construireGoutte(Color couleur) {
-    return Icon(
-      Icons.location_on,
-      size: 46,
-      color: couleur,
-    );
+    return Icon(Icons.location_on, size: 46, color: couleur);
   }
 
   /// Étape « Ajouter à l'itinéraire » : un pin ambre numéroté de son rang dans
@@ -2769,68 +3058,43 @@ OptionModeCarte(
   /// restent visibles au zoom donné. En dessous de [_zoomMinLieuxPersonnels]
   /// (dézoom prononcé), ils sont masqués, exactement comme les POIs autour du
   /// même seuil.
-  bool _lieuxPersonnelsVisibles(double zoom) =>
-      zoom >= _zoomMinLieuxPersonnels;
+  bool _lieuxPersonnelsVisibles(double zoom) => zoom >= _zoomMinLieuxPersonnels;
 
-  /// Icône maison (prévisualisation de pose et domicile posé) : le même badge
-  /// que les POIs — pastille blanche bordée de vert, icône verte — avec un
-  /// faible encombrement sur la carte. [taille] : la pose de lieu emploie la
-  /// version agrandie [_taillePoseLieu] pour rester visible au centre.
-  Widget _construireMaison({double taille = 30}) {
+  /// Vert de la famille POI, commun à tous les badges de lieu personnel.
+  static const Color _vertLieuPersonnel = Color(0xFF00B050);
+
+  /// Icône qui distingue les deux lieux personnels : la maison et le travail
+  /// partagent EXACTEMENT le même badge, seul ce pictogramme change.
+  static IconData _iconeLieuPersonnel(TypeLieuPose type) =>
+      type == TypeLieuPose.maison ? Icons.home : Icons.work;
+
+  /// Badge d'un lieu personnel (maison ou travail) : le même badge que les
+  /// POIs — pastille blanche bordée de vert, icône verte — avec un faible
+  /// encombrement sur la carte. Il sert à la fois de prévisualisation pendant
+  /// la pose, de domicile posé et de lieu de travail posé ; [icone] est le SEUL
+  /// élément qui distingue la maison du travail. [taille] : la pose de lieu
+  /// emploie la version agrandie [_taillePoseLieu] pour rester visible au
+  /// centre.
+  Widget _construireBadgeLieu(IconData icone, {double taille = 30}) {
     return Container(
       width: taille,
       height: taille,
       decoration: BoxDecoration(
         color: Colors.white,
         shape: BoxShape.circle,
-        border: Border.all(
-          color: const Color(0xFF00B050),
-          width: 2,
-        ),
+        border: Border.all(color: _vertLieuPersonnel, width: 2),
         boxShadow: const [
-          BoxShadow(
-            color: Colors.black26,
-            blurRadius: 3,
-            offset: Offset(0, 1),
-          ),
+          BoxShadow(color: Colors.black26, blurRadius: 3, offset: Offset(0, 1)),
         ],
       ),
-      child: Icon(
-        Icons.home,
-        color: const Color(0xFF00B050),
-        size: taille * 0.52,
-      ),
+      child: Icon(icone, color: _vertLieuPersonnel, size: taille * 0.52),
     );
   }
 
-  /// Icône lieu de travail : le même badge familial que la maison — pastille
-  /// blanche bordée de vert, mallette verte — aligné sur le gabarit des POIs.
-  Widget _construireTravail({double taille = 30}) {
-    return Container(
-      width: taille,
-      height: taille,
-      decoration: BoxDecoration(
-        color: Colors.white,
-        shape: BoxShape.circle,
-        border: Border.all(
-          color: const Color(0xFF00B050),
-          width: 2,
-        ),
-        boxShadow: const [
-          BoxShadow(
-            color: Colors.black26,
-            blurRadius: 3,
-            offset: Offset(0, 1),
-          ),
-        ],
-      ),
-      child: Icon(
-        Icons.work,
-        color: const Color(0xFF00B050),
-        size: taille * 0.52,
-      ),
-    );
-  }
+  /// Badge d'un [type] de lieu personnel (maison ou travail) à la [taille]
+  /// demandée : même code pour les deux, seul le pictogramme diffère.
+  Widget _construireLieu(TypeLieuPose type, {double taille = 30}) =>
+      _construireBadgeLieu(_iconeLieuPersonnel(type), taille: taille);
 
   /// Distance maximale (mètres) entre un point de la carte (destination,
   /// lieu recherché) et un lieu personnel enregistré pour considérer qu'ils
@@ -2858,22 +3122,17 @@ OptionModeCarte(
 
   /// Le lieu personnel correspondant à la destination affichée sur la carte
   /// (destination d'itinéraire, sinon lieu recherché), ou null.
-  TypeLieuPose? get _typeLieuDestination => _typeLieuPersonnel(
-        widget.pointDestination ?? widget.lieuRecherche,
-      );
+  TypeLieuPose? get _typeLieuDestination =>
+      _typeLieuPersonnel(widget.pointDestination ?? widget.lieuRecherche);
 
   /// Marqueur d'une destination (itinéraire ou lieu recherché) : son BADGE
   /// rond si le point est une maison ou le lieu de travail, sinon le pin vert
   /// habituel.
   Widget _construireMarqueurDestination(LatLng point) {
-    switch (_typeLieuPersonnel(point)) {
-      case TypeLieuPose.maison:
-        return _construireMaison();
-      case TypeLieuPose.travail:
-        return _construireTravail();
-      case null:
-        return _construireGoutte(const Color(0xFF00B050));
-    }
+    final type = _typeLieuPersonnel(point);
+    return type == null
+        ? _construireGoutte(_vertLieuPersonnel)
+        : _construireLieu(type);
   }
 
   /// Vrai quand [a] et [b] désignent quasiment le même point (~10 m) : deux
@@ -2973,14 +3232,11 @@ OptionModeCarte(
       final dy = b.latitude - a.latitude;
       final len2 = dx * dx + dy * dy;
       if (len2 <= 0) continue;
-      final t = (((p.longitude - a.longitude) * dx +
-                  (p.latitude - a.latitude) * dy) /
-              len2)
-          .clamp(0.0, 1.0);
-      final proj = LatLng(
-        a.latitude + t * dy,
-        a.longitude + t * dx,
-      );
+      final t =
+          (((p.longitude - a.longitude) * dx + (p.latitude - a.latitude) * dy) /
+                  len2)
+              .clamp(0.0, 1.0);
+      final proj = LatLng(a.latitude + t * dy, a.longitude + t * dx);
       final d = distanceMetresHaversine(proj, p);
       if (d < minD) {
         minD = d;
@@ -2992,63 +3248,51 @@ OptionModeCarte(
 
   @override
   Widget build(BuildContext context) {
-
     double? decalageBoutons;
     double? largeurBoutons;
     double? hauteurBoutons;
 
     if (widget.afficherActions && widget.pointActions != null) {
-
       final textScaler = MediaQuery.textScalerOf(context);
 
-      final styleBase =
-          DefaultTextStyle.of(context).style.copyWith(
-                fontSize: BoutonAction.tailleTexte,
-                fontWeight: FontWeight.w600,
-              );
+      final styleBase = DefaultTextStyle.of(context).style.copyWith(
+        fontSize: BoutonAction.tailleTexte,
+        fontWeight: FontWeight.w600,
+      );
 
-      final largeur2 =
-          BoutonAction.largeurPour(
-            'Supprimer',
-            styleBase,
-            textScaler,
-          );
+      final largeur2 = BoutonAction.largeurPour(
+        'Supprimer',
+        styleBase,
+        textScaler,
+      );
 
-      final largeurDetails =
-          BoutonAction.largeurPour(
-            'Détails',
-            styleBase,
-            textScaler,
-          );
+      final largeurDetails = BoutonAction.largeurPour(
+        'Détails',
+        styleBase,
+        textScaler,
+      );
 
       if (widget.seulementSupprimer) {
-
         decalageBoutons = 0;
 
         // « Détails » + « Supprimer » pour le point bleu de position,
         // uniquement « Supprimer » pour les pins verts (destination,
         // étape, lieu recherché).
         largeurBoutons =
-            (widget.onVoirDetails != null ? largeurDetails + 8 : 0) +
-            largeur2;
-
+            (widget.onVoirDetails != null ? largeurDetails + 8 : 0) + largeur2;
       } else {
-
-        final largeur1 =
-            BoutonAction.largeurPour(
-              widget.libelleActionPrincipale,
-              styleBase,
-              textScaler,
-            );
+        final largeur1 = BoutonAction.largeurPour(
+          widget.libelleActionPrincipale,
+          styleBase,
+          textScaler,
+        );
 
         decalageBoutons = (largeur2 - largeur1) / 2;
 
         largeurBoutons = largeur1 + 8 + largeur2;
       }
 
-      hauteurBoutons =
-          BoutonAction.hauteurPour(styleBase, textScaler);
-
+      hauteurBoutons = BoutonAction.hauteurPour(styleBase, textScaler);
     }
 
     // Marqueurs « avant » le point bleu : les POIs, calculés UNE fois par
@@ -3060,9 +3304,7 @@ OptionModeCarte(
     ];
 
     return Stack(
-
       children: [
-
         if (!_fmtcReady)
           const Center(
             child: Column(
@@ -3078,7 +3320,7 @@ OptionModeCarte(
             ),
           )
         else
-        Listener(
+          Listener(
             onPointerDown: (e) {
               _pointersDown++;
               _departsPointeurs[e.pointer] = e.localPosition;
@@ -3107,333 +3349,337 @@ OptionModeCarte(
                 _demarrerLongPress(e.localPosition);
               }
             },
-          onPointerMove: (e) {
-            final depart = _departsPointeurs[e.pointer];
-            if (depart == null) return;
-            if ((e.localPosition - depart).distance <= 18) return;
-            _pointeurBouge = true;
-            _longPressTimer?.cancel();
-            _longPressTimer = null;
-            _zoomOutTimer?.cancel();
-            _zoomOutTimer = null;
-            _longPressActif = false;
-            // Un glissement à UN doigt reprend la main sur la caméra : le
-            // mode navigation est coupé, la carte garde son orientation
-            // courante. Un pincement (2 doigts déjà posés) est un zoom :
-            // il ne doit PAS couper le suivi, qui adopte le nouveau zoom
-            // dans [_surEvenementCarte].
-            if (widget.modeNavigation && _pointersDown <= 1) {
-              widget.onNavigationInterrompue?.call();
-            }
-          },
-          onPointerUp: (e) {
-            if (_pointersDown > 0) _pointersDown--;
-            _departsPointeurs.remove(e.pointer);
-            _annulerLongPress();
-          },
-          onPointerCancel: (e) {
-            if (_pointersDown > 0) _pointersDown--;
-            _departsPointeurs.remove(e.pointer);
-            _annulerSansTap();
-          },
-          child: FlutterMap(
+            onPointerMove: (e) {
+              final depart = _departsPointeurs[e.pointer];
+              if (depart == null) return;
+              if ((e.localPosition - depart).distance <= 18) return;
+              _pointeurBouge = true;
+              _longPressTimer?.cancel();
+              _longPressTimer = null;
+              _zoomOutTimer?.cancel();
+              _zoomOutTimer = null;
+              _longPressActif = false;
+              // Un glissement (un doigt comme deux) ne coupe PLUS le suivi
+              // navigation : il le suspend le temps du geste, puis le
+              // relâchement attend un réel déplacement avant de recentrer
+              // (cf. [_finGesteManuel]). Le pincement à deux doigts est un
+              // zoom : le suivi adopte le nouveau zoom dans
+              // [_surEvenementCarte].
+              if (_longPressDezoomActif) {
+                // L'appui long avait déjà lancé un dézoom : le doigt bouge,
+                // le geste devient un glissement ordinaire, le dézoom choisi
+                // reste la cible du suivi.
+                _longPressDezoomActif = false;
+                _navZoomCible = widget.mapController.camera.zoom;
+                _suiviEnAttenteMouvement = true;
+              }
+            },
+            onPointerUp: (e) {
+              if (_pointersDown > 0) _pointersDown--;
+              _departsPointeurs.remove(e.pointer);
+              _annulerLongPress();
+              // Défensif : plus aucun doigt sur l'écran, aucun geste ne peut
+              // être en cours. Un événement de fin manqué (annulation système,
+              // fin de pincement en deux temps…) ne doit pas laisser le suivi
+              // navigation suspendu indéfiniment.
+              if (_departsPointeurs.isEmpty && _gestesActifs > 0) {
+                _gestesActifs = 0;
+                _finGesteManuel();
+              }
+            },
+            onPointerCancel: (e) {
+              if (_pointersDown > 0) _pointersDown--;
+              _departsPointeurs.remove(e.pointer);
+              _annulerSansTap();
+              if (_departsPointeurs.isEmpty && _gestesActifs > 0) {
+                _gestesActifs = 0;
+                _finGesteManuel();
+              }
+            },
+            child: FlutterMap(
+              mapController: widget.mapController,
 
-          mapController: widget.mapController,
+              options: MapOptions(
+                initialCenter: const LatLng(-4.325, 15.322),
 
+                initialZoom: 13,
 
-          options: MapOptions(
+                onMapEvent: _surEvenementCarte,
 
-            initialCenter: const LatLng(
+                interactionOptions: const InteractionOptions(
+                  scrollWheelVelocity: 0.015,
 
-              -4.325,
+                  pinchZoomThreshold: 0.15,
+                ),
+              ),
 
-              15.322,
+              children: [
+                _tuileDeBase(_modeCarte),
 
-            ),
-
-            initialZoom: 13,
-
-            onMapEvent: _surEvenementCarte,
-
-            interactionOptions: const InteractionOptions(
-
-              scrollWheelVelocity: 0.015,
-
-              pinchZoomThreshold: 0.15,
-
-            ),
-
-          ),
-
-
-
-          children: [
-
-            _tuileDeBase(_modeCarte),
-
-
-
-            if (widget.afficherLignesTrafic ||
-                widget.itinerairePoints != null)
-              PolylineLayer(polylines: [
-                ..._polylignesTrafic,
-                ..._polylignesItineraire,
-                // Raccord en pointillés noirs d'une étape hors réseau routier.
-                ..._raccordEtape,
-              ]),
-
-
-
-            // Calque VIVANT du point bleu : pendant le suivi navigation le
-            // ticker fait glisser le point avec la caméra lissée, et pendant
-            // l'animation du pin le tween l'interpole. Reconstruire SEUL ce
-            // sous-arbre à chaque trame (marqueurs + pointillés de départ)
-            // laisse les 600→1600 polylignes de trafic intactes : c'était leur
-            // re-construction par setState par trame qui faisait les ratés.
-            ValueListenableBuilder<LatLng?>(
-              valueListenable: _pointBleuNotifier,
-              builder: (context, pointBleu, _) => Stack(
-                children: [
-                  // Pointillés de départ : ancrés au point bleu vivant,
-                  // au-dessus du tracé pour rester visibles même si le pin
-                  // s'intersecte avec l'itinéraire.
-                  if (_polylignesRaccordDepart.isNotEmpty)
-                    PolylineLayer(polylines: _polylignesRaccordDepart),
-                  MarkerLayer(
-                    markers: [
-                      ...marqueursAvantBleu,
-
-                      // Ordre de peinture = ordre d'empilement : ce marqueur
-                      // est AVANT tous les marqueurs de destination (vert,
-                      // épingle), il passe donc toujours EN DESSOUS d'eux
-                      // quand ils se recouvrent, jamais au-dessus.
-                      if (widget.positionActuelle != null)
-                        Marker(
-                          point: pointBleu ??
-                              (_displayedPosition ??
-                                  LatLng(
-                                    widget.positionActuelle!.latitude,
-                                    widget.positionActuelle!.longitude,
-                                  )),
-                          width: 50,
-                          height: 50,
-                          // Contre-rotation : le marqueur reste visuellement
-                          // droit pendant la rotation de la carte, sans gêner
-                          // son déplacement qui suit la position GPS.
-                          rotate: true,
-                          child: _construireGoutte(Colors.blueAccent),
-                        ),
-
-
-
-                // Lieu recherché : BADGE du lieu personnel si c'est la maison
-                // ou le travail, sinon le pin vert habituel. Quand la
-                // destination de l'itinéraire occupe déjà le même point, seul
-                // son marqueur est dessiné (pas de doublon).
-                if (widget.lieuRecherche != null &&
-                    !_coincide(
-                      widget.lieuRecherche,
-                      widget.pointDestination,
-                    ))
-
-
-                  Marker(
-
-                    point: widget.lieuRecherche!,
-
-                    width: 50,
-
-                    height: 50,
-
-
-                    // Reste droit pendant la rotation de la carte.
-                    rotate: true,
-
-                    child:
-                        _construireMarqueurDestination(widget.lieuRecherche!),
-
+                if (widget.afficherLignesTrafic ||
+                    widget.itinerairePoints != null)
+                  PolylineLayer(
+                    polylines: [
+                      ..._polylignesTrafic,
+                      ..._polylignesItineraire,
+                      // Raccord en pointillés noirs d'une étape hors réseau routier.
+                      ..._raccordEtape,
+                    ],
                   ),
 
+                // Calque VIVANT du point bleu : pendant le suivi navigation le
+                // ticker fait glisser le point avec la caméra lissée, et pendant
+                // l'animation du pin le tween l'interpole. Reconstruire SEUL ce
+                // sous-arbre à chaque trame (marqueurs + pointillés de départ)
+                // laisse les 600→1600 polylignes de trafic intactes : c'était leur
+                // re-construction par setState par trame qui faisait les ratés.
+                ValueListenableBuilder<LatLng?>(
+                  valueListenable: _pointBleuNotifier,
+                  builder: (context, pointBleu, _) => Stack(
+                    children: [
+                      // Pointillés de départ : ancrés au point bleu vivant,
+                      // au-dessus du tracé pour rester visibles même si le pin
+                      // s'intersecte avec l'itinéraire.
+                      if (_polylignesRaccordDepart.isNotEmpty)
+                        PolylineLayer(polylines: _polylignesRaccordDepart),
+                      MarkerLayer(
+                        markers: [
+                          ...marqueursAvantBleu,
 
-                // Destination de l'itinéraire : son marqueur vert reste en
-                // place même quand un autre lieu est ensuite recherché. Si la
-                // destination est la maison ou le travail, c'est leur BADGE
-                // rond (icône domicile/mallette) qui s'affiche, pas un pin.
-                if (widget.pointDestination != null)
+                          // Amis(es) : position partagée en direct. Placés
+                          // au-dessus des POIs mais sous le point bleu et les
+                          // destinations, pour ne jamais masquer le guidage.
+                          for (final ami in widget.amis) _marqueurAmi(ami),
 
-                  Marker(
+                          // Ordre de peinture = ordre d'empilement : ce marqueur
+                          // est AVANT tous les marqueurs de destination (vert,
+                          // épingle), il passe donc toujours EN DESSOUS d'eux
+                          // quand ils se recouvrent, jamais au-dessus.
+                          if (widget.positionActuelle != null)
+                            Marker(
+                              point:
+                                  pointBleu ??
+                                  (_displayedPosition ??
+                                      LatLng(
+                                        widget.positionActuelle!.latitude,
+                                        widget.positionActuelle!.longitude,
+                                      )),
+                              width: 50,
+                              height: 50,
+                              // Contre-rotation : le marqueur reste visuellement
+                              // droit pendant la rotation de la carte, sans gêner
+                              // son déplacement qui suit la position GPS.
+                              rotate: true,
+                              // Isolé dans un RepaintBoundary : le point bleu ne
+                              // se recolle plus en copie fantôme au-dessus/en
+                              // dessous de lui-même quand la caméra pivote et
+                              // zoome en même temps pendant la pose maison/travail
+                              // (doublon visible sur le rendu Web).
+                              child: RepaintBoundary(
+                                child: _construireGoutte(Colors.blueAccent),
+                              ),
+                            ),
 
-                    point: widget.pointDestination!,
+                          // Lieu recherché : BADGE du lieu personnel si c'est la maison
+                          // ou le travail, sinon le pin vert habituel. Quand la
+                          // destination de l'itinéraire occupe déjà le même point, seul
+                          // son marqueur est dessiné (pas de doublon).
+                          if (widget.lieuRecherche != null &&
+                              !_coincide(
+                                widget.lieuRecherche,
+                                widget.pointDestination,
+                              ))
+                            Marker(
+                              point: widget.lieuRecherche!,
 
-                    width: 50,
+                              width: 50,
 
-                    height: 50,
+                              height: 50,
 
-                    rotate: true,
+                              // Reste droit pendant la rotation de la carte.
+                              rotate: true,
 
-                    child:
-                        _construireMarqueurDestination(widget.pointDestination!),
+                              child: _construireMarqueurDestination(
+                                widget.lieuRecherche!,
+                              ),
+                            ),
 
-                  ),
+                          // Destination de l'itinéraire : son marqueur vert reste en
+                          // place même quand un autre lieu est ensuite recherché. Si la
+                          // destination est la maison ou le travail, c'est leur BADGE
+                          // rond (icône domicile/mallette) qui s'affiche, pas un pin.
+                          if (widget.pointDestination != null)
+                            Marker(
+                              point: widget.pointDestination!,
 
-                // Étapes obligatoires de l'itinéraire : un pin ambre
-                // numéroté par étape, dans l'ordre du parcours, distinct du
-                // point vert de la destination qui les suit toutes.
-                for (var i = 0; i < widget.pointEtape.length; i++)
-                  Marker(
-                    point: widget.pointEtape[i],
-                    width: 50,
-                    height: 50,
-                    rotate: true,
-                    child: _construireEtape(i + 1),
-                  ),
+                              width: 50,
 
+                              height: 50,
 
+                              rotate: true,
 
-                // Lieux personnels posés (domicile, travail) : leurs icônes restent
-                // ancrées sur ces lieux, collées à la carte (elles suivent les
-                // déplacements et rotations), tant que l'utilisateur ne les
-                // change ou ne les supprime pas. Masquées pendant une nouvelle
-                // pose, remplacées par l'icône de prévisualisation au centre.
-                // Leur TAILLE suit le zoom ([_BadgeAncrageZoom] lit la caméra) :
-                // gros en zoom in, petit puis invisible en zoom out.
-                if (widget.pointMaison != null &&
-                    _poseLieuActif != TypeLieuPose.maison &&
-                    _typeLieuDestination != TypeLieuPose.maison)
-                  Marker(
-                    point: widget.pointMaison!,
-                    width: _BadgeAncrageZoom.tailleBoite,
-                    height: _BadgeAncrageZoom.tailleBoite,
-                    // Reste droit pendant la rotation de la carte.
-                    rotate: true,
-                    child: _BadgeAncrageZoom(
-                      construire: (taille) => _construireMaison(taille: taille),
-                    ),
-                  ),
+                              child: _construireMarqueurDestination(
+                                widget.pointDestination!,
+                              ),
+                            ),
 
-                if (widget.pointTravail != null &&
-                    _poseLieuActif != TypeLieuPose.travail &&
-                    _typeLieuDestination != TypeLieuPose.travail)
-                  Marker(
-                    point: widget.pointTravail!,
-                    width: _BadgeAncrageZoom.tailleBoite,
-                    height: _BadgeAncrageZoom.tailleBoite,
-                    // Reste droit pendant la rotation de la carte.
-                    rotate: true,
-                    child: _BadgeAncrageZoom(
-                      construire: (taille) => _construireTravail(taille: taille),
-                    ),
-                  ),
+                          // Étapes obligatoires de l'itinéraire : un pin ambre
+                          // numéroté par étape, dans l'ordre du parcours, distinct du
+                          // point vert de la destination qui les suit toutes.
+                          for (var i = 0; i < widget.pointEtape.length; i++)
+                            Marker(
+                              point: widget.pointEtape[i],
+                              width: 50,
+                              height: 50,
+                              rotate: true,
+                              child: _construireEtape(i + 1),
+                            ),
 
-                if (widget.epingle != null)
+                          // Lieux personnels posés (domicile, travail) : leurs icônes restent
+                          // ancrées sur ces lieux, collées à la carte (elles suivent les
+                          // déplacements et rotations), tant que l'utilisateur ne les
+                          // change ou ne les supprime pas. Masquées pendant une nouvelle
+                          // pose, remplacées par l'icône de prévisualisation au centre.
+                          // Leur TAILLE suit le zoom ([_BadgeAncrageZoom] lit la caméra) :
+                          // gros en zoom in, petit puis invisible en zoom out.
+                          if (widget.pointMaison != null &&
+                              _poseLieuActif != TypeLieuPose.maison &&
+                              _typeLieuDestination != TypeLieuPose.maison)
+                            Marker(
+                              key: const ValueKey('badge_maison'),
+                              point: widget.pointMaison!,
+                              width: _BadgeAncrageZoom.tailleBoite,
+                              height: _BadgeAncrageZoom.tailleBoite,
+                              // Reste droit pendant la rotation de la carte.
+                              rotate: true,
+                              // Le badge change de taille à chaque
+                              // mouvement/zoom de caméra. Isolé dans un
+                              // RepaintBoundary, il ne laisse plus filer de
+                              // copie fantôme décalée au-dessus/en dessous
+                              // pendant l'animation de pose (doublon Web).
+                              child: RepaintBoundary(
+                                child: _BadgeAncrageZoom(
+                                  construire: (taille) => _construireLieu(
+                                    TypeLieuPose.maison,
+                                    taille: taille,
+                                  ),
+                                ),
+                              ),
+                            ),
 
+                          if (widget.pointTravail != null &&
+                              _poseLieuActif != TypeLieuPose.travail &&
+                              _typeLieuDestination != TypeLieuPose.travail)
+                            Marker(
+                              key: const ValueKey('badge_travail'),
+                              point: widget.pointTravail!,
+                              width: _BadgeAncrageZoom.tailleBoite,
+                              height: _BadgeAncrageZoom.tailleBoite,
+                              // Reste droit pendant la rotation de la carte.
+                              rotate: true,
+                              // Publie son résultat dans SA propre couche puis
+                              // repaint atomiquement : pendant le mouvement/
+                              // zoom/rotation qui accompagne la pose, le badge
+                              // ne laisse plus de copie fantôme au-dessus/en
+                              // dessous de lui-même (doublon Web).
+                              child: RepaintBoundary(
+                                child: _BadgeAncrageZoom(
+                                  construire: (taille) => _construireLieu(
+                                    TypeLieuPose.travail,
+                                    taille: taille,
+                                  ),
+                                ),
+                              ),
+                            ),
 
-                  Marker(
+                          if (widget.epingle != null)
+                            Marker(
+                              point: widget.epingle!,
 
-                    point: widget.epingle!,
+                              width: 40,
 
+                              height: 40,
 
-                    width: 40,
+                              // Reste droit pendant la rotation de la carte.
+                              rotate: true,
 
-                    height: 40,
+                              child: _construireEpingle(),
+                            ),
 
+                          // Le point vert de destination reste toujours visible,
+                          // y compris pendant un itinéraire actif. Sauf quand les
+                          // actions sont attachées à l'épingle rouge : l'épingle
+                          // reste un repère rouge, on ne la recouvre jamais de vert.
+                          if (widget.pointActions != null &&
+                              !widget.seulementSupprimer &&
+                              !widget.actionsSurEpingle &&
+                              !widget.actionsSurAmi &&
+                              widget.pointActions != widget.epingle &&
+                              widget.pointActions != widget.lieuRecherche)
+                            Marker(
+                              point: widget.pointActions!,
 
-                    // Reste droit pendant la rotation de la carte.
-                    rotate: true,
+                              width: 50,
 
-                    child: _construireEpingle(Colors.red),
+                              height: 50,
 
-                  ),
+                              // Reste droit pendant la rotation de la carte.
+                              rotate: true,
 
-                // Le point vert de destination reste toujours visible,
-                // y compris pendant un itinéraire actif. Sauf quand les
-                // actions sont attachées à l'épingle rouge : l'épingle
-                // reste un repère rouge, on ne la recouvre jamais de vert.
-                if (widget.pointActions != null &&
-                    !widget.seulementSupprimer &&
-                    !widget.actionsSurEpingle &&
-                    widget.pointActions != widget.epingle &&
-                    widget.pointActions != widget.lieuRecherche)
+                              child: _construireEpingle(),
+                            ),
 
-                  Marker(
+                          if (widget.afficherActions &&
+                              widget.pointActions != null &&
+                              !_modePoserEpingle)
+                            Marker(
+                              point: widget.pointActions!,
 
-                    point: widget.pointActions!,
+                              width: largeurBoutons!,
 
-                    width: 50,
+                              height: hauteurBoutons! + 40,
 
-                    height: 50,
+                              // Reste droit pendant la rotation de la carte.
+                              rotate: true,
 
-                    // Reste droit pendant la rotation de la carte.
-                    rotate: true,
+                              child: Transform.translate(
+                                offset: Offset(decalageBoutons!, 40),
 
-                    child: _construireEpingle(Colors.red),
+                                child: BoutonsActions(
+                                  onDefinirItineraire:
+                                      widget.desactiverItineraire
+                                      ? null
+                                      : widget.onDefinirItineraire,
 
-                  ),
+                                  libelleDefinirItineraire:
+                                      widget.libelleActionPrincipale,
 
-                if (widget.afficherActions &&
-                    widget.pointActions != null &&
-                    !_modePoserEpingle)
+                                  onSupprimer: widget.onSupprimer,
 
-                  Marker(
+                                  onVoirDetails: widget.onVoirDetails,
 
-                    point: widget.pointActions!,
+                                  afficherDefinirItineraire:
+                                      !widget.seulementSupprimer,
 
-                    width: largeurBoutons!,
+                                  onInteractionStart: () {
+                                    _appuiBoutonAction = true;
+                                  },
 
-                    height: hauteurBoutons! + 40,
+                                  onInteractionEnd: () {
+                                    _appuiBoutonAction = false;
+                                  },
+                                ),
+                              ),
+                            ),
 
-                    // Reste droit pendant la rotation de la carte.
-                    rotate: true,
-
-                    child: Transform.translate(
-
-                      offset: Offset(decalageBoutons!, 40),
-
-                      child: BoutonsActions(
-
-                        onDefinirItineraire:
-                            widget.desactiverItineraire
-                                ? null
-                                : widget.onDefinirItineraire,
-
-                        libelleDefinirItineraire:
-                            widget.libelleActionPrincipale,
-
-                        onSupprimer: widget.onSupprimer,
-
-                        onVoirDetails: widget.onVoirDetails,
-
-                        afficherDefinirItineraire:
-                            !widget.seulementSupprimer,
-
-                        onInteractionStart: () {
-                          _appuiBoutonAction = true;
-                        },
-
-                        onInteractionEnd: () {
-                          _appuiBoutonAction = false;
-                        },
-
+                        ],
                       ),
-
-                    ),
-
+                    ],
                   ),
-
-
-
+                ),
               ],
             ),
-                ],
-              ),
-            ),
-
-
-          ],
-        ),
-        ),
-
-
+          ),
 
         if (_modePoserEpingle && _fmtcReady)
           Positioned.fill(
@@ -3442,8 +3688,18 @@ OptionModeCarte(
                 // Épingle de prévisualisation au centre : elle ne capte
                 // aucun toucher, la carte reste libre à déplacer dessous.
                 Center(
-                  child: IgnorePointer(
-                    child: _construireEpingle(Colors.red),
+                  // Isolée dans sa propre frontière de peinture, elle ne
+                  // laisse plus filer de copie fantôme décalée au-dessus/en
+                  // dessous d'elle-même pendant la pose d'un lieu ou d'une
+                  // épingle (doublon Web signalé sur l'épingle flottante).
+                  child: RepaintBoundary(
+                    child: IgnorePointer(
+                      child: const Icon(
+                        Icons.push_pin,
+                        size: 52,
+                        color: _couleurEpinglette,
+                      ),
+                    ),
                   ),
                 ),
                 // Bouton « Poser » juste en dessous de l'épingle.
@@ -3467,11 +3723,19 @@ OptionModeCarte(
                 // Icône de prévisualisation au centre de l'écran : elle ne
                 // capte aucun toucher — la carte reste libre à pivoter et à
                 // se déplacer dessous pour viser le lieu (maison ou travail).
+                // Elle change de TAILLE à chaque mouvement/zoom de caméra,
+                // comme les badges. Isolée dans un RepaintBoundary, elle ne
+                // laisse plus filer de copie fantôme décalée au-dessus/en
+                // dessous d'elle-même pendant cette animation de pose
+                // (doublon Web « deux épingles » signalé sur ce calque).
                 Center(
-                  child: IgnorePointer(
-                    child: _poseLieuActif == TypeLieuPose.maison
-                        ? _construireMaison(taille: _taillePoseLieu)
-                        : _construireTravail(taille: _taillePoseLieu),
+                  child: RepaintBoundary(
+                    child: IgnorePointer(
+                      child: _construireLieu(
+                        _poseLieuActif!,
+                        taille: _taillePoseLieu,
+                      ),
+                    ),
                   ),
                 ),
                 // Bouton « Poser » sous l'icône, « Annuler » encore en
@@ -3496,9 +3760,7 @@ OptionModeCarte(
             left: 8,
             bottom: 16,
             child: AnimatedOpacity(
-              opacity: _boutonsVisibles
-                  ? 1.0
-                  : _opaciteBoutonsInactifs,
+              opacity: _boutonsVisibles ? 1.0 : _opaciteBoutonsInactifs,
               duration: const Duration(milliseconds: 400),
               curve: Curves.easeOut,
               child: BoutonPoserEpingle(
@@ -3513,13 +3775,16 @@ OptionModeCarte(
             right: 8,
             bottom: 16,
             child: AnimatedOpacity(
-              opacity: _boutonsVisibles
-                  ? 1.0
-                  : _opaciteBoutonsInactifs,
+              opacity: _boutonsVisibles ? 1.0 : _opaciteBoutonsInactifs,
               duration: const Duration(milliseconds: 400),
               curve: Curves.easeOut,
-              child: BoutonModeCarte(
-                onPressed: _ouvrirMenuCartes,
+              // Le bouton des cartes change d'opacité en fondu (AnimatedOpacity)
+              // à chaque affichage/masquage des contrôles : isolé dans son
+              // RepaintBoundary, il n'imprime plus de copie fantôme floue
+              // au-dessus/en dessous de lui-même pendant ces fondus (doublon
+              // Web signalé sur ce bouton).
+              child: RepaintBoundary(
+                child: BoutonModeCarte(onPressed: _ouvrirMenuCartes),
               ),
             ),
           ),
@@ -3529,10 +3794,7 @@ OptionModeCarte(
             top: 8,
             left: 8,
             child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 6,
-                vertical: 3,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.85),
                 borderRadius: BorderRadius.circular(4),
@@ -3551,10 +3813,7 @@ OptionModeCarte(
             top: 8,
             left: 8,
             child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 6,
-                vertical: 3,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.85),
                 borderRadius: BorderRadius.circular(4),
@@ -3571,10 +3830,7 @@ OptionModeCarte(
             top: 8,
             left: 8,
             child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 6,
-                vertical: 3,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.85),
                 borderRadius: BorderRadius.circular(4),
@@ -3591,10 +3847,7 @@ OptionModeCarte(
             top: 8,
             left: 8,
             child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 6,
-                vertical: 3,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.85),
                 borderRadius: BorderRadius.circular(4),
@@ -3611,10 +3864,7 @@ OptionModeCarte(
             top: 8,
             right: 8,
             child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 10,
-                vertical: 6,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
                 color: Colors.black.withValues(alpha: 0.7),
                 borderRadius: BorderRadius.circular(6),
@@ -3640,16 +3890,8 @@ OptionModeCarte(
             ),
           ),
 
-
         if (chargementCarte && _fmtcReady)
-
-
-          const Center(
-
-            child: CircularProgressIndicator(),
-
-          ),
-
+          const Center(child: CircularProgressIndicator()),
 
         if (_downloadProgress > 0 && _downloadProgress < 100)
           Positioned(
@@ -3657,10 +3899,7 @@ OptionModeCarte(
             left: 8,
             right: 8,
             child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 12,
-                vertical: 8,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               decoration: BoxDecoration(
                 color: Colors.black87,
                 borderRadius: BorderRadius.circular(8),
@@ -3678,26 +3917,16 @@ OptionModeCarte(
                   const SizedBox(height: 4),
                   Text(
                     _lastStatus,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 11,
-                    ),
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
                     textAlign: TextAlign.center,
                   ),
                 ],
               ),
             ),
           ),
-
-
       ],
-
-
     );
-
-
   }
-
 }
 
 /// Badge maison/travail ANCRÉ à taille SUIVANT LE ZOOM : il lit la caméra dans
@@ -3734,10 +3963,7 @@ class _BadgeAncrageZoom extends StatelessWidget {
   Widget build(BuildContext context) {
     final taille = _taillePourZoom(MapCamera.of(context).zoom);
     if (taille <= 0) return const SizedBox.shrink();
-    return Align(
-      alignment: Alignment.center,
-      child: construire(taille),
-    );
+    return Align(alignment: Alignment.center, child: construire(taille));
   }
 
   /// Taille d'affichage pour un zoom donné : double à chaque niveau de zoom
@@ -3747,5 +3973,119 @@ class _BadgeAncrageZoom extends StatelessWidget {
     final taille = tailleBase * pow(2, zoom - zoomReference);
     if (taille < tailleMinVisible) return 0;
     return min(taille, tailleMax);
+  }
+}
+
+/// Pin vert d'un ami(e) partageant sa position : une goutte `location_on`
+/// verte, l'avatar animal de l'ami(e) logé dans la tête du pin, son prénom
+/// sur une petite étiquette juste en dessous, puis l'âge de sa dernière
+/// position connue (« il y a 15 minutes », « il y a 2 jours »…). Ni le pin ni
+/// les étiquettes ne captent les gestes : la carte reste libre.
+class _MarqueurAmi extends StatelessWidget {
+  const _MarqueurAmi({required this.ami});
+
+  final AmiPosition ami;
+
+  /// Vert du pin : la couleur principale de KinFlow, pour bien distinguer
+  /// l'ami(e) qui partage sa position des autres repères de la carte.
+  static const Color _vert = KinColors.primary;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Le pin vert « goutte d'eau », avec l'avatar dans sa tête.
+          SizedBox(
+            width: 52,
+            height: 52,
+            child: Stack(
+              alignment: Alignment.topCenter,
+              children: [
+                const Icon(
+                  Icons.location_on,
+                  size: 52,
+                  color: _vert,
+                  shadows: [
+                    Shadow(
+                      color: Colors.black38,
+                      blurRadius: 4,
+                      offset: Offset(0, 1),
+                    ),
+                  ],
+                ),
+                Positioned(
+                  top: 7,
+                  child: Container(
+                    padding: const EdgeInsets.all(1),
+                    decoration: const BoxDecoration(
+                      color: Colors.white,
+                      shape: BoxShape.circle,
+                    ),
+                    child: AvatarAnimalWidget(taille: 26, avatarId: ami.avatar),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+            decoration: BoxDecoration(
+              color: _vert,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              ami.nom,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+              ),
+            ),
+          ),
+          // Âge de la dernière position enregistrée : visible même quand le
+          // téléphone de l'ami(e) est éteint (position « figée » côté serveur).
+          if (ami.majA != null) ...[
+            const SizedBox(height: 2),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(8),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Colors.black26,
+                    blurRadius: 3,
+                    offset: Offset(0, 1),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.schedule, size: 10, color: _vert),
+                  const SizedBox(width: 3),
+                  Flexible(
+                    child: Text(
+                      tempsRelatif(ami.majA!),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
+                        color: _vert,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 }

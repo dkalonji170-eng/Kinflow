@@ -5,7 +5,6 @@ import 'dart:math' show max;
 import 'package:flutter/material.dart';
 
 import '../theme/kinflow_theme.dart';
-import 'map_painters.dart' show PeintreEpingle;
 
 /// Boutons d'actions contextuels affichés au-dessus du point bleu de
 /// position : « Définir itinéraire », « Détails » et « Supprimer ».
@@ -102,10 +101,7 @@ class BoutonAction extends StatelessWidget {
     return tp.width + (2 * paddingHorizontal) + iconeTaille + ecartIcone + 4;
   }
 
-  static double hauteurPour(
-    TextStyle styleBase,
-    TextScaler textScaler,
-  ) {
+  static double hauteurPour(TextStyle styleBase, TextScaler textScaler) {
     final tp = TextPainter(
       text: TextSpan(text: 'Ag', style: styleBase),
       textDirection: TextDirection.ltr,
@@ -139,10 +135,7 @@ class BoutonAction extends StatelessWidget {
       color: actif ? Colors.white : Colors.grey.shade200,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(22),
-        side: BorderSide(
-          color: actif ? Colors.black : Colors.grey,
-          width: 1.5,
-        ),
+        side: BorderSide(color: actif ? Colors.black : Colors.grey, width: 1.5),
       ),
       child: InkWell(
         borderRadius: BorderRadius.circular(22),
@@ -266,9 +259,10 @@ class BoutonPoserEpingle extends StatelessWidget {
           width: 44,
           height: 44,
           child: Center(
-            child: CustomPaint(
-              size: const Size(26, 26),
-              painter: PeintreEpingle(Colors.red),
+            child: const Icon(
+              Icons.push_pin,
+              size: 28,
+              color: Color(0xFFE53935),
             ),
           ),
         ),
@@ -285,11 +279,7 @@ class BoutonPoser extends StatelessWidget {
   /// sous la prévisualisation. La pose d'épingle garde le gabarit d'origine.
   final bool compact;
 
-  const BoutonPoser({
-    super.key,
-    required this.onPressed,
-    this.compact = false,
-  });
+  const BoutonPoser({super.key, required this.onPressed, this.compact = false});
 
   @override
   Widget build(BuildContext context) {
@@ -333,10 +323,7 @@ class BoutonPoser extends StatelessWidget {
 
 class BoutonModeCarte extends StatelessWidget {
   final VoidCallback onPressed;
-  const BoutonModeCarte({
-    super.key,
-    required this.onPressed,
-  });
+  const BoutonModeCarte({super.key, required this.onPressed});
 
   @override
   Widget build(BuildContext context) {
@@ -355,11 +342,7 @@ class BoutonModeCarte extends StatelessWidget {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(
-                Icons.layers,
-                size: 18,
-                color: Colors.black87,
-              ),
+              Icon(Icons.layers, size: 18, color: Colors.black87),
               SizedBox(width: 6),
               Text(
                 "Cartes",
@@ -397,10 +380,7 @@ class OptionModeCarte extends StatelessWidget {
     final couleurTexte = sombre ? KinColors.texteSombre : Colors.black87;
     return ListTile(
       leading: Icon(icone, color: couleurTexte),
-      title: Text(
-        libelle,
-        style: TextStyle(fontSize: 15, color: couleurTexte),
-      ),
+      title: Text(libelle, style: TextStyle(fontSize: 15, color: couleurTexte)),
       trailing: selectionne
           ? const Icon(Icons.check_circle, color: KinColors.primary)
           : null,

@@ -75,21 +75,104 @@ void main() {
       expect(r.$2, 1);
     });
 
-    test('50 m : annonce imminente', () {
+    test('50 m : troisième annonce', () {
       final r = VoixGuidage.instructionPour(40, TypeVirage.gauche, 1);
-      expect(r!.$1, 'Tournez à gauche.');
+      expect(r!.$1, 'Dans 50 mètres, tournez à gauche.');
       expect(r.$2, 2);
+    });
+
+    test('imminent : veuillez tourner', () {
+      final r = VoixGuidage.instructionPour(15, TypeVirage.gauche, 2);
+      expect(r!.$1, 'Veuillez tourner à gauche.');
+      expect(r.$2, 3);
     });
 
     test('pas de répétition quand le niveau est déjà atteint', () {
       expect(VoixGuidage.instructionPour(90, TypeVirage.gauche, 1), isNull);
       expect(VoixGuidage.instructionPour(250, TypeVirage.gauche, 0), isNull);
-      expect(VoixGuidage.instructionPour(20, TypeVirage.gauche, 2), isNull);
+      expect(VoixGuidage.instructionPour(25, TypeVirage.gauche, 2), isNull);
+      expect(VoixGuidage.instructionPour(15, TypeVirage.gauche, 3), isNull);
     });
 
     test('demi-tour', () {
       final r = VoixGuidage.instructionPour(100, TypeVirage.demiTour, 0);
       expect(r!.$1, 'Dans 100 mètres, faites demi-tour.');
+    });
+
+    test('demi-tour imminent : veuillez', () {
+      final r = VoixGuidage.instructionPour(15, TypeVirage.demiTour, 2);
+      expect(r!.$1, 'Veuillez faire demi-tour.');
+      expect(r.$2, 3);
+    });
+  });
+
+  group('instructionPour — phrases personnalisées', () {
+    test('une phrase personnalisée remplace le texte par défaut', () {
+      final r = VoixGuidage.instructionPour(
+        300,
+        TypeVirage.gauche,
+        -1,
+        phrases: {
+          'gauche_0': 'Dans 300 mètres, garez-vous à gauche.',
+        },
+      );
+      expect(r!.$1, 'Dans 300 mètres, garez-vous à gauche.');
+    });
+
+    test('phrase personnalisée sans changement de niveau', () {
+      final r = VoixGuidage.instructionPour(
+        40,
+        TypeVirage.droite,
+        1,
+        phrases: {
+          'droite_2': 'Tournez à droite maintenant.',
+        },
+      );
+      expect(r!.$1, 'Tournez à droite maintenant.');
+      expect(r.$2, 2);
+    });
+
+    test('phrase personnalisée vide : texte par défaut', () {
+      final r = VoixGuidage.instructionPour(
+        100,
+        TypeVirage.demiTour,
+        0,
+        phrases: {'demitour_1': '   '},
+      );
+      expect(r!.$1, 'Dans 100 mètres, faites demi-tour.');
+    });
+
+    test('sans la clé du niveau : texte par défaut', () {
+      final r = VoixGuidage.instructionPour(
+        100,
+        TypeVirage.droite,
+        0,
+        phrases: {'gauche_1': 'N\'importe quelle autre clé.'},
+      );
+      expect(r!.$1, 'Dans 100 mètres, tournez à droite.');
+    });
+  });
+
+  group('phrase de départ', () {
+    test('sans personnalisation : le texte par défaut', () {
+      expect(
+        VoixGuidage.phraseDepartPour(null),
+        'Itinéraire tracé avec succès.',
+      );
+    });
+
+    test('phrase personnalisée non vide : remplace le texte par défaut', () {
+      expect(
+        VoixGuidage.phraseDepartPour({'depart': 'Départ imminent.'}),
+        'Départ imminent.',
+      );
+    });
+
+    test('phrase personnalisée vide : texte par défaut', () {
+      expect(
+        VoixGuidage.phraseDepartPour({'depart': '   '}),
+        'Itinéraire tracé avec succès.',
+      );
     });
   });
 }

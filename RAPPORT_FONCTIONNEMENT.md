@@ -223,6 +223,21 @@ Dossier `supabase/migrations/` — fichiers envoyés à Supabase par l'éditeur 
 5. `20260808000000_stats_historiques.sql` → colonnes dérivées, stats_creneau, archivage, consultations.
 6. `20260921000000_informations_ville.sql` → fil de la ville : tables `informations` + `reactions`, `fil_informations()`, `reagir_information()`.
 7. `20260921010000_import_infos_rss.sql` → import automatique : colonne `source_url` (anti-doublon), table `parametres_secrets`, `publier_infos_rss()`.
+8. `20261013000000_profils_fk_update_cascade.sql` → **correctif connexion** : clés
+   étrangères `partages_info` / `messages_amis` en `ON UPDATE CASCADE` (+ report des
+   amis, position, réactions, émojis et signalements dans `adopter_profil`), pour que
+   « récupérer mon compte » ne renvoie plus l'erreur `23503`
+   (`partages_info_expediteur_fkey`).
+
+> **Important (connexion / récupération de compte).** `adopter_profil` change
+> l'`id` du profil. Toute table qui référence `profiles(id)` doit donc avoir
+> `ON UPDATE CASCADE` : sinon Postgres renvoie l'erreur
+> `update or delete on table "profiles" violates foreign key constraint ... (23503)`.
+> Les tables qui stockent une identité **sans** clé étrangère
+> (`amities.demandeur/destinataire`, `positions_amis.user_id`, `reactions.user_id`,
+> `reactions_emoji.user_id`, `signalements.user_id`) sont reportées à la main dans
+> `adopter_profil`. Penser à mettre à jour cette fonction pour toute future table
+> liée à une identité.
 
 Pour appliquer une modification dans le code SQL du projet :
 Tableau de bord Supabase → `SQL Editor` → coller le contenu → « Run ».
@@ -253,6 +268,17 @@ Tableau de bord Supabase → `SQL Editor` → coller le contenu → « Run ».
 - **Recyclage** : le fil n'affiche que les **48 dernières heures** — les infos plus
   anciennes disparaissent toutes seules, remplacées par les nouvelles. Le robot
   supprime physiquement celles de plus de 3 jours (avec leurs réactions).
+- **Points rouges (notifications)** : l'accueil affiche sur le bouton « Social » le
+  **nombre** d'infos arrivées depuis la dernière visite (RPC `compter_infos_recentes`,
+  date mémorisée localement sous la clé `fil_social_dernier_vu`). Dans l'écran Social,
+  un petit point rouge **sans chiffre** marque les onglets : « Information » s'il y a
+  des infos nouvelles, « Amis(es) » s'il y a des messages non lus. La liste d'amis(es)
+  garde, elle, le **nombre** de messages non lus.
+- **Envoyer une info à un ami(e)** : un appui long sur une info propose de l'envoyer.
+  Elle est publiée **dans la discussion** avec cet ami(e) (RPC `envoyer_message_ami`,
+  discussion ouverte automatiquement après l'envoi). La section « Informations reçues »
+  au-dessus de la liste d'amis a été retirée : les infos partagées vivent désormais
+  dans le fil de discussion (durée de vie 7 jours, comme les messages).
 
 ### 5.7 Le robot RSS « Import Kinshasa » (publication automatique)
 - **Principe** : un robot lit toutes les **30 minutes** les flux RSS des médias congolais,
@@ -260,9 +286,12 @@ Tableau de bord Supabase → `SQL Editor` → coller le contenu → « Run ».
   mention de la source** dans l'app. Volume visé : **20 à 30 infos par jour** pour que le
   fil se défiler aisément.
 - **Sources branchées** (dans `outils/importer_infos_rss.py`, liste `FLUX`) :
-  Radio Okapi (`/rss.xml`), Actualite.cd (`/feed`), LePotentiel.cd (`/feed`).
-  Sans flux RSS accessible : Beto.cd (anti-robot), **Mediacongo.net** et **7sur7.cd**
-  (pas de flux public) restent à publier manuellement via le Table Editor.
+  Radio Okapi (`/rss.xml`), Actualite.cd (`/feed`), LePotentiel.cd (`/feed`),
+  RFI Afrique (`/rss`), RTNC (`/feed`), puis **Beto.cd** (`/feed`) ajouté le
+  14/10/2026 (flux revérifié, à jour et exploitable). **Infocongo.net** a été
+  testé mais écarté : son flux est figé (dernier article de janvier 2025).
+  Sans flux RSS accessible : **Mediacongo.net** et **7sur7.cd** (pas de flux public)
+  restent à publier manuellement via le Table Editor.
 - **Filtre** (modifiable dans le script) : l'article est gardé s'il parle de **Kinshasa**
   (ou d'un quartier : Ngaliema, Ngaba, Ndjili, Matonge, Gombe…) ou de l'**actualité
   nationale** — mais écarté s'il concerne la **guerre à l'Est**, une autre ville/province
@@ -304,10 +333,18 @@ Les cartes sont assemblées tuile par tuile (carrés de 256×256 px), téléchar
   (pas de téléchargement massif ; la carte hors ligne est donc **pré-téléchargée en petites zones**).
 - **Mise en cache locale** : le paquet **`flutter_map_tile_caching` (FMTC, v10.0.0)** stocke les tuiles
   déjà vues **sur l'appareil** (sur navigateur : stockage du navigateur ; sur mobile : disque de l'app).
-  La zone **Kinshasa** est pré-découpée et pré-téléchargée : fichier `assets/kinshasa.fmtc`.
+  La zone **Kinshasa** est pré-découpée et pré-téléchargée : l'archive complète
+  (`kinshasa.fmtc`, générée par `lib/main_build_tiles.dart`) est servie à la racine du site web et
+  téléchargée une fois par l'app (`TileArchiveService`) ; une archive peut aussi être déclarée dans
+  `assets/` pour être embarquée dans l'appli (importée au premier lancement par `TileSeedService`).
 - **Consommation data** : chaque tuile ≈ quelques dizaines de **Ko**. Sur web, les tuiles du
   service FMTC coûtent de la mémoire du navigateur et de la bande passante téléchargée.
   (Un diagnostic « consommation de données en Mo par service » existe côté développeur, invisible pour l'utilisateur.)
+- **Changement de style de carte** : chaque style (clair, sombre, satellite, Carto, topo) possède
+  désormais son **propre fournisseur de tuiles**. Sans cela, un défaut de la bibliothèque de cache
+  (`flutter_map_tile_caching`, ticket n°183) conservait à l'écran les tuiles de l'ancien style :
+  la bascule semblait alors « bloquée » et ne s'appliquait qu'en déplaçant la carte. Les styles
+  déjà visités sont mémorisés, si bien qu'un retour à un style précédent est immédiat.
 
 ---
 

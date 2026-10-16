@@ -1,8 +1,6 @@
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
-import 'package:url_launcher/url_launcher.dart';
-import '../services/download_helper.dart' show telechargerViaAncre;
 import '../theme/kinflow_theme.dart';
+import '../widgets/logo_kinflow.dart';
 import 'edit_profile_screen.dart';
 import 'login_screen.dart';
 
@@ -45,13 +43,19 @@ class _AuthScreenState extends State<AuthScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Theme.of(context).colorScheme.surface,
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            children: [
+        child: LayoutBuilder(
+          builder: (context, constraints) => SingleChildScrollView(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: IntrinsicHeight(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    children: [
               const Spacer(flex: 2),
-              Image.asset('assets/image.png', width: 300),
+              const CarteLogoPrincipal(largeurImage: 280),
               const Spacer(flex: 3),
               FadeTransition(
                 opacity: _opacite,
@@ -108,86 +112,19 @@ class _AuthScreenState extends State<AuthScreen>
                           ),
                         ),
                       ),
-                      const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        child: OutlinedButton(
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: KinColors.accent,
-                            side: BorderSide(
-                              color: KinColors.accent.withValues(alpha: 0.6),
-                              width: 1.5,
-                            ),
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                          ),
-                          onPressed: _installerApk,
-                          child: const Text(
-                            'Installer l\'application (APK)',
-                            style: TextStyle(fontSize: 16),
-                          ),
-                        ),
-                      ),
                     ],
                   ),
                 ),
               ),
               const Spacer(),
-            ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
           ),
         ),
       ),
     );
-  }
-
-  /// Télécharge puis installe l'application Android (APK).
-  ///
-  /// Le fichier `app-release.apk` doit être servi à côté de l'application
-  /// (par ex. dans le dossier servi par le localhost:8080). Le chemin est
-  /// relatif pour fonctionner sur `localhost`, sur l'IP du PC (téléphone sur
-  /// le même réseau) ou sur un futur domaine.
-  ///
-  /// Sur Android, l'ouverture du lien lance le téléchargement de l'APK par le
-  /// navigateur : le fichier apparaît ensuite dans le gestionnaire de
-  /// fichiers puis se laisse installer (autoriser « sources inconnues »).
-  Future<void> _installerApk() async {
-    const relatif = 'app-release.apk';
-    final uri = Uri.parse(relatif);
-    final url = uri.toString();
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Téléchargement de l\'APK en cours…'),
-        duration: Duration(seconds: 3),
-      ),
-    );
-
-    // Sur le web, un simple lien d'ancrage force le téléchargement
-    // (download=) ; sur mobile/natif, url_launcher ouvre l'URL.
-    if (kIsWeb) {
-      telechargerViaAncre(url, 'app-release.apk');
-      return;
-    }
-
-    if (await _lancerUrl(url)) {
-      return;
-    }
-
-    // Repli : affiche l'adresse à copier si l'ouverture échoue.
-    if (mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Ouvrez : $url')));
-    }
-  }
-
-  Future<bool> _lancerUrl(String url) async {
-    try {
-      return await launchUrl(
-        Uri.parse(url),
-        mode: LaunchMode.externalApplication,
-      );
-    } catch (_) {
-      return false;
-    }
   }
 }

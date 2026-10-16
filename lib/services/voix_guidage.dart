@@ -4,6 +4,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:latlong2/latlong.dart';
 
 import '../utils/geo.dart' show capTrace, deltaRotation, distanceMetres;
+import 'phrases_guidage.dart' show PhrasesGuidage;
 
 /// Type de virage détecté sur le tracé.
 enum TypeVirage { gauche, droite, demiTour }
@@ -27,6 +28,7 @@ class Manoeuvre {
 
 /// Guidage vocal d'un itinéraire : analyse la géométrie du tracé pour
 /// transformer les changements de cap en instructions parlées simples —
+/// « Suivez l'itinéraire affiché à l'écran » dès que le tracé est affiché,
 /// « Dans 300 mètres, tournez à gauche », « Vous êtes arrivé à destination ».
 ///
 /// Totalement optionnel et silencieux tant qu'aucun itinéraire n'est affiché.
@@ -36,7 +38,8 @@ class VoixGuidage {
   // Distances d'annonce (mètres restants avant le virage) et d'arrivée.
   static const double _seuilAnnonceLoinMetres = 300;
   static const double _seuilAnnonceMoyenMetres = 100;
-  static const double _seuilAnnonceProcheMetres = 50;
+  static const double _seuilAnnonce50Metres = 50;
+  static const double _seuilAnnonceImminentMetres = 20;
   static const double _seuilArriveeMetres = 30;
 
   // Un virage est retenu quand le cap change d'au moins 30°.
@@ -56,12 +59,18 @@ class VoixGuidage {
   List<LatLng> _points = const [];
   List<Manoeuvre> _manoeuvres = const [];
 
+  /// Phrases personnalisées chargées depuis les Réglages (repli : défauts).
+  /// Rechargées à chaque [preparer] : une modification des Réglages prend
+  /// effet au prochain itinéraire affiché.
+  Map<String, String> _phrases = PhrasesGuidage.parDefaut();
+
   /// Index (dans [_manoeuvres]) de la prochaine instruction à passer.
   int _indexProchain = 0;
 
   /// Niveau d'annonce déjà prononcé pour le virage courant
-  /// (-1 = rien, 0 = 300 m, 1 = 100 m, 2 = imminent). La progression est
-  /// monotone : on ne répète jamais deux fois la même distance.
+  /// (-1 = rien, 0 = 300 m, 1 = 100 m, 2 = 50 m, 3 = imminent). La
+  /// progression est monotone : on ne répète jamais deux fois la même
+  /// distance.
   int _niveauAnnonce = -1;
 
   /// Vrai quand « Vous êtes arrivé à destination » a déjà été dit.
@@ -79,9 +88,18 @@ class VoixGuidage {
   }
 
   /// Prépare le guidage pour un nouveau tracé (à appeler à chaque fois qu'un
-  /// itinéraire est affiché ou remplacé) : recalcule les virages et remet les
-  /// niveaux d'annonce à zéro.
-  Future<void> preparer(List<LatLng> points) async {
+  /// itinéraire est affiché ou remplacé) : recalcule les virages, remet les
+  /// niveaux d'annonce à zéro et, sauf [annoncerDepart] à false, prononce le
+  /// message de départ (« Itinéraire tracé »).
+  ///
+  /// [annoncerDepart] sert aux CHANGEMENTS d'option (2ème, 3ème tracé
+  /// pré-calculé) : la voix se prépare pour les nouveaux virages mais ne
+  /// répète pas l'annonce de départ, déjà dite au tracé initial.
+  Future<void> preparer(
+    List<LatLng> points, {
+    bool annoncerDepart = true,
+  }) async {
+    _phrases = await PhrasesGuidage.charger();
     _points = List.of(points);
     _manoeuvres = calculerManoeuvres(_points);
     _indexProchain = 0;
@@ -90,6 +108,11 @@ class VoixGuidage {
     _guidageActif = true;
     if (!_disponible) {
       await _initialiser();
+    }
+    // Dès que l'itinéraire est tracé, la voix annonce le départ — sauf quand
+    // on passe simplement d'une option d'itinéraire à une autre.
+    if (annoncerDepart && _points.length >= 2) {
+      await _parler(phraseDepartPour(_phrases));
     }
   }
 
@@ -122,7 +145,7 @@ class VoixGuidage {
     if (!_arriveeAnnoncee && distanceArrivee <= _seuilArriveeMetres) {
       _arriveeAnnoncee = true;
       _niveauAnnonce = -1;
-      _parler('Vous êtes arrivé à destination.');
+      _parler(_phraseArrivee(_phrases));
       return;
     }
 
@@ -137,8 +160,12 @@ class VoixGuidage {
     final manoeuvre = _manoeuvres[_indexProchain];
     final distance = _distanceEnAvant(index, position, manoeuvre.index);
 
-    final instruction =
-        instructionPour(distance, manoeuvre.type, _niveauAnnonce);
+    final instruction = instructionPour(
+      distance,
+      manoeuvre.type,
+      _niveauAnnonce,
+      phrases: _phrases,
+    );
     if (instruction == null) return;
     _niveauAnnonce = instruction.$2;
     _parler(instruction.$1);
@@ -147,20 +174,26 @@ class VoixGuidage {
   /// Décision pure : renvoie la phrase à prononcer (et son niveau) pour un
   /// virage situé à [distance] mètres, ou null si rien ne doit être dit
   /// encore (ni répété). Séparée pour être testable sans synthétiseur.
+  /// [phrases] (facultatif) : phrases personnalisées — à défaut, les textes
+  /// par défaut sont utilisés.
   @visibleForTesting
   static (String, int)? instructionPour(
     double distance,
     TypeVirage type,
-    int niveauAnnonce,
-  ) {
-    if (distance <= _seuilAnnonceProcheMetres && niveauAnnonce < 2) {
-      return (_phrase(type, 2), 2);
+    int niveauAnnonce, {
+    Map<String, String>? phrases,
+  }) {
+    if (distance <= _seuilAnnonceImminentMetres && niveauAnnonce < 3) {
+      return (_phrase(type, 3, phrases: phrases), 3);
+    }
+    if (distance <= _seuilAnnonce50Metres && niveauAnnonce < 2) {
+      return (_phrase(type, 2, phrases: phrases), 2);
     }
     if (distance <= _seuilAnnonceMoyenMetres && niveauAnnonce < 1) {
-      return (_phrase(type, 1), 1);
+      return (_phrase(type, 1, phrases: phrases), 1);
     }
     if (distance <= _seuilAnnonceLoinMetres && niveauAnnonce < 0) {
-      return (_phrase(type, 0), 0);
+      return (_phrase(type, 0, phrases: phrases), 0);
     }
     return null;
   }
@@ -189,21 +222,46 @@ class VoixGuidage {
     }
   }
 
-  static String _phrase(TypeVirage type, int niveau) {
-    switch (type) {
-      case TypeVirage.gauche:
-        if (niveau == 0) return 'Dans 300 mètres, tournez à gauche.';
-        if (niveau == 1) return 'Dans 100 mètres, tournez à gauche.';
-        return 'Tournez à gauche.';
-      case TypeVirage.droite:
-        if (niveau == 0) return 'Dans 300 mètres, tournez à droite.';
-        if (niveau == 1) return 'Dans 100 mètres, tournez à droite.';
-        return 'Tournez à droite.';
-      case TypeVirage.demiTour:
-        if (niveau == 0) return 'Dans 300 mètres, faites demi-tour.';
-        if (niveau == 1) return 'Dans 100 mètres, faites demi-tour.';
-        return 'Faites demi-tour.';
+  /// Phrase de virage à prononcer : celle de [phrases] (personnalisée) si
+  /// elle est non vide, sinon le texte par défaut.
+  static String _phrase(
+    TypeVirage type,
+    int niveau, {
+    Map<String, String>? phrases,
+  }) {
+    if (phrases != null) {
+      final personnalisee = phrases[PhrasesGuidage.clePour(type, niveau)];
+      if (personnalisee != null && personnalisee.trim().isNotEmpty) {
+        return personnalisee;
+      }
     }
+    return PhrasesGuidage.defautPour(type, niveau);
+  }
+
+  /// Phrase de départ à prononcer dès que l'itinéraire est tracé :
+  /// [phrases] personnalisée non vide sinon le texte par défaut. Séparée
+  /// pour être testable sans synthétiseur.
+  @visibleForTesting
+  static String phraseDepartPour(Map<String, String>? phrases) {
+    if (phrases != null) {
+      final personnalisee = phrases['depart'];
+      if (personnalisee != null && personnalisee.trim().isNotEmpty) {
+        return personnalisee;
+      }
+    }
+    return PhrasesGuidage.defautDepart();
+  }
+
+  /// Phrase d'arrivée à prononcer : [phrases] personnalisée non vide sinon
+  /// le texte par défaut.
+  static String _phraseArrivee(Map<String, String>? phrases) {
+    if (phrases != null) {
+      final personnalisee = phrases['arrivee'];
+      if (personnalisee != null && personnalisee.trim().isNotEmpty) {
+        return personnalisee;
+      }
+    }
+    return PhrasesGuidage.defautArrivee();
   }
 
   /// Distance, le long de la route, entre la position courante (projetée sur

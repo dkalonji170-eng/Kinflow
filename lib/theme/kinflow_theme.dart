@@ -13,6 +13,11 @@ abstract final class KinColors {
   static const accent = Color(0xFFF2A900);
   static const accentTranche = Color(0xFFE98B00);
 
+  // Navigation : « bleu départ → vert arrivée ». Le bleu reprend celui des
+  // coordonnées (longitude) et du point de départ de l'itinéraire.
+  static const bleu = Color(0xFF1565C0);
+  static const vertArrivee = Color(0xFF008F3F);
+
   // États de trafic (repris du modèle : à conserver identiques)
   static const fluide = Color(0xFFAAE600);
   static const fluideFonce = Color(0xFF8FC400);

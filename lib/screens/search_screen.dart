@@ -234,7 +234,10 @@ class _SearchScreenState extends State<SearchScreen> {
     final lieu = await showModalBottomSheet<SearchResult>(
       context: context,
       isScrollControlled: true,
-      builder: (_) => const _ChoixMaisonSheet(),
+      builder: (_) => const _ChoixLieuSheet(
+        titre: 'Enregistrer comme maison',
+        icone: Icons.home,
+      ),
     );
     if (lieu == null) return;
     if (!mounted) return;
@@ -258,7 +261,10 @@ class _SearchScreenState extends State<SearchScreen> {
     final lieu = await showModalBottomSheet<SearchResult>(
       context: context,
       isScrollControlled: true,
-      builder: (_) => const _ChoixMaisonSheet(),
+      builder: (_) => const _ChoixLieuSheet(
+        titre: 'Enregistrer comme lieu de travail',
+        icone: Icons.work,
+      ),
     );
     if (lieu == null) return;
     if (!mounted) return;
@@ -326,6 +332,14 @@ class _SearchScreenState extends State<SearchScreen> {
       }, onError: (_) {
         if (!mounted) return;
         setState(() => _rechercheEnCours = false);
+      }, onDone: () {
+        // Recherche terminée sans aucun résultat : on coupe le spinner pour
+        // afficher la ligne « Aucun lieu trouvé. ».
+        if (!mounted) return;
+        if (_controller.text.trim() != texte) return;
+        if (_rechercheEnCours) {
+          setState(() => _rechercheEnCours = false);
+        }
       });
     });
   }
@@ -415,7 +429,7 @@ class _SearchScreenState extends State<SearchScreen> {
         title: TextField(
           controller: _controller,
           focusNode: _focus,
-          autofocus: true,
+          autofocus: false,
           textInputAction: TextInputAction.search,
           decoration: InputDecoration(
             hintText: 'Rechercher un lieu (Kinshasa ou ailleurs)',
@@ -467,10 +481,14 @@ class _SearchScreenState extends State<SearchScreen> {
                   _ouvrirChoixMaison(retournerSelection: false);
                 } else if (valeur == 'supprimer') {
                   setState(() => _maison = null);
-                  _persisterMaison();
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Maison supprimée.')),
-                  );
+                  _persisterMaison().then((_) {
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Maison supprimée.')),
+                    );
+                    widget.onDemanderPoserMaison?.call();
+                    Navigator.pop(context);
+                  });
                 }
               },
               itemBuilder: (_) => const [
@@ -512,12 +530,16 @@ class _SearchScreenState extends State<SearchScreen> {
                   _ouvrirChoixTravail(retournerSelection: false);
                 } else if (valeur == 'supprimer') {
                   setState(() => _travail = null);
-                  _persisterTravail();
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Lieu de travail supprimé.'),
-                    ),
-                  );
+                  _persisterTravail().then((_) {
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Lieu de travail supprimé.'),
+                      ),
+                    );
+                    widget.onDemanderPoserTravail?.call();
+                    Navigator.pop(context);
+                  });
                 }
               },
               itemBuilder: (_) => const [
@@ -660,17 +682,26 @@ class _SearchScreenState extends State<SearchScreen> {
   }
 }
 
-/// Fenêtre de recherche utilisée pour enregistrer le lieu de domicile :
-/// même moteur que l'écran principal (suggestions + géocodeur), mais le
-/// résultat est renvoyé au parent qui le persiste en clé `lieu_maison`.
-class _ChoixMaisonSheet extends StatefulWidget {
-  const _ChoixMaisonSheet();
+/// Fenêtre de recherche utilisée pour enregistrer un lieu personnel par nom
+/// (domicile ou lieu de travail) : même moteur que l'écran principal
+/// (suggestions + géocodeur), mais le résultat est renvoyé au parent qui le
+/// persiste sous la clé `lieu_maison` ou `lieu_travail`. [titre] et [icone]
+/// s'adaptent au lieu choisi pour ne pas annoncer « maison » lors de
+/// l'enregistrement du lieu de travail.
+class _ChoixLieuSheet extends StatefulWidget {
+  const _ChoixLieuSheet({required this.titre, required this.icone});
+
+  /// Libellé d'en-tête, ex. « Enregistrer comme maison ».
+  final String titre;
+
+  /// Icône d'en-tête, alignée sur le badge du lieu sur la carte.
+  final IconData icone;
 
   @override
-  State<_ChoixMaisonSheet> createState() => _ChoixMaisonSheetState();
+  State<_ChoixLieuSheet> createState() => _ChoixLieuSheetState();
 }
 
-class _ChoixMaisonSheetState extends State<_ChoixMaisonSheet> {
+class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
   final SearchService _service = SearchService();
   final TextEditingController _controller = TextEditingController();
   final FocusNode _focus = FocusNode();
@@ -685,9 +716,6 @@ class _ChoixMaisonSheetState extends State<_ChoixMaisonSheet> {
   void initState() {
     super.initState();
     _controller.addListener(_surSaisie);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _focus.requestFocus();
-    });
   }
 
   @override
@@ -730,6 +758,12 @@ class _ChoixMaisonSheetState extends State<_ChoixMaisonSheet> {
       }, onError: (_) {
         if (!mounted) return;
         setState(() => _rechercheEnCours = false);
+      }, onDone: () {
+        if (!mounted) return;
+        if (_controller.text.trim() != texte) return;
+        if (_rechercheEnCours) {
+          setState(() => _rechercheEnCours = false);
+        }
       });
     });
   }
@@ -747,10 +781,10 @@ class _ChoixMaisonSheetState extends State<_ChoixMaisonSheet> {
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
               child: Row(
                 children: [
-                  Icon(Icons.home, color: couleur.primary),
+                  Icon(widget.icone, color: couleur.primary),
                   const SizedBox(width: 8),
                   Text(
-                    'Enregistrer comme maison',
+                    widget.titre,
                     style: Theme.of(context).textTheme.titleMedium,
                   ),
                 ],
@@ -761,7 +795,7 @@ class _ChoixMaisonSheetState extends State<_ChoixMaisonSheet> {
               child: TextField(
                 controller: _controller,
                 focusNode: _focus,
-                autofocus: true,
+                autofocus: false,
                 textInputAction: TextInputAction.search,
                 decoration: InputDecoration(
                   isDense: true,

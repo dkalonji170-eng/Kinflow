@@ -23,6 +23,12 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
   String _recherche = '';
   bool _auFond = true;
 
+  /// Filtre rapide « Social » : regroupe tout ce qui touche à l'onglet Social —
+  /// actions d'écran (SOCIAL), chargement du fil (FIL) et gestion des amis
+  /// (AMIS) — pour voir d'un coup tout ce qui s'y passe.
+  static const Set<String> _modulesSocial = {'SOCIAL', 'FIL', 'AMIS'};
+  bool _filtreSocial = false;
+
   @override
   void initState() {
     super.initState();
@@ -71,6 +77,9 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
   List<EntreeJournal> get _entreesFiltrees {
     final requete = _recherche.toLowerCase().trim();
     final resultats = Journal.instance.entrees.where((entree) {
+      if (_filtreSocial && !_modulesSocial.contains(entree.module)) {
+        return false;
+      }
       if (_moduleFiltre != null && entree.module != _moduleFiltre) {
         return false;
       }
@@ -303,6 +312,14 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
           Wrap(
             spacing: 6,
             children: [
+              FilterChip(
+                avatar: const Icon(Icons.people_alt_outlined, size: 16),
+                label: const Text('Social', style: TextStyle(fontSize: 12)),
+                selected: _filtreSocial,
+                onSelected: (valeur) =>
+                    setState(() => _filtreSocial = valeur),
+                visualDensity: VisualDensity.compact,
+              ),
               _puceNiveau(null, 'Tous', couleurTexte),
               _puceNiveau(NiveauJournal.info, 'Info', couleurTexte),
               _puceNiveau(NiveauJournal.succes, 'OK', couleurTexte),

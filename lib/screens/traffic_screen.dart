@@ -12,12 +12,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart' show tileDownloadService;
 import '../config/carte.dart' show bornesAfrique;
+import '../models/ami_position.dart';
 import '../models/route_result.dart';
 import '../models/search_result.dart';
 import '../services/compass_service.dart';
 import '../services/diagnostics_service.dart';
 import '../services/itineraire_service.dart';
 import '../services/location_service.dart';
+import '../widgets/avatar_animal.dart';
+import '../widgets/logo_kinflow.dart';
 import '../services/route_service.dart';
 import '../services/search_service.dart';
 import '../services/supabase_service.dart';
@@ -33,6 +36,7 @@ import '../utils/geo.dart'
         deltaRotation,
         distanceALignes,
         distanceMetres,
+        distanceMetresHaversine,
         normaliserDegre,
         projeterSurAlignes,
         rotationTrace;
@@ -46,7 +50,15 @@ import 'search_screen.dart';
 import 'settings_screen.dart';
 
 class TrafficScreen extends StatefulWidget {
-  const TrafficScreen({super.key});
+  const TrafficScreen({
+    super.key,
+    this.amiALocaliser,
+  });
+
+  /// Ami(e) à localiser dès l'ouverture (bouton « Localiser » de l'onglet
+  /// Amis(es)) : seul cet ami est dessiné sur la carte, et la vue se centre
+  /// sur lui. Null en usage normal : aucun ami n'est alors affiché.
+  final AmiPosition? amiALocaliser;
 
   @override
   State<TrafficScreen> createState() => _TrafficScreenState();
@@ -58,7 +70,7 @@ class TrafficScreen extends StatefulWidget {
 /// déviation, signalements, recherche) est regroupée par domaine pour rester
 /// lisible alors que l'interface reste un [Stack] de couches superposées.
 class _TrafficScreenState extends State<TrafficScreen>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   // ---------------------------------------------------------------------------
   // Services
   // ---------------------------------------------------------------------------
@@ -70,6 +82,10 @@ class _TrafficScreenState extends State<TrafficScreen>
   final CompassService compassService = CompassService();
   final RouteService routeService = RouteService();
   final ItineraireService itineraireService = ItineraireService();
+
+  /// Avatar (animal) choisi par l'utilisateur : affiché en haut à gauche de
+  /// l'AppBar comme icône du profil.
+  String _avatar = '';
 
   // ---------------------------------------------------------------------------
   // État de la carte
@@ -131,6 +147,22 @@ class _TrafficScreenState extends State<TrafficScreen>
   /// pas réellement avancé, on ne bouge pas le point bleu d'une fix à l'autre.
   (LatLng, DateTime)? _positionAcceptee;
 
+  /// Horodatage du dernier fix BRUT reçu du flux (même rejeté par le filtre
+  /// anti-bruit). Sert de battement de cœur : si le flux se tait trop
+  /// longtemps, on le relance (cf. [_surveillerFluxGps]).
+  DateTime? _dernierFixGps;
+
+  /// Relance différée du flux après une erreur (permission révoquée, GPS
+  /// coupé un instant…). Sur Android, une erreur transitoire tuait sinon le
+  /// flux définitivement : le point bleu restait figé jusqu'à la réouverture
+  /// de l'écran.
+  Timer? _relanceGpsTimer;
+
+  /// Surveillance du flux : Android peut mettre le flux en veille sans
+  /// émettre d'erreur (arrière-plan, économie de batterie). On relance alors
+  /// la souscription au lieu de laisser le point bleu figé.
+  Timer? _surveillanceGpsTimer;
+
   /// Vitesse effective minimale (m/s) en dessous de laquelle une fix n'est
   /// pas considérée comme un réel déplacement. On mesure la distance depuis
   /// la dernière position acceptée sur le temps écoulé (≃ vitesse de marche
@@ -142,6 +174,46 @@ class _TrafficScreenState extends State<TrafficScreen>
   /// plus court que ce seuil alors que la vitesse effective est quasi nulle
   /// est traité comme du bruit de mesure et ignoré.
   static const double _seuilBruitPositionMetres = 5.0;
+
+  // ---------------------------------------------------------------------------
+  // Amis(es) : positions partagées en direct
+  // ---------------------------------------------------------------------------
+
+  /// Amis(es) chargés depuis le serveur (positions partagées).
+  List<AmiPosition> _amis = const [];
+
+  /// Identifiant de l'ami(e) ciblé par « Localiser » : SEUL cet ami est
+  /// dessiné sur la carte. Null = aucun ami affiché.
+  String? _amiLocaliseId;
+
+  /// Vrai dès que la caméra a été centrée une première fois sur l'ami ciblé.
+  bool _amiLocaliseCentre = false;
+
+  /// Identifiant de l'ami(e) qui sert de destination d'itinéraire. Tant qu'il
+  /// est renseigné et que l'itinéraire est actif, le point vert se recale sur
+  /// la position de l'ami(e) dès qu'il/elle se déplace.
+  String? _itineraireVersAmiId;
+
+  /// Rafraîchit la liste des amis(es) et leurs positions.
+  Timer? _minuteurAmis;
+
+  /// Dernière publication de ma position (throttle réseau).
+  DateTime? _dernierePublicationPosition;
+  LatLng? _dernierePositionPubliee;
+
+  /// Cadence de rafraîchissement des positions des amis. Assez court pour que
+  /// leurs déplacements se voient en direct sur la carte.
+  static const Duration _rafraichissementAmis = Duration(seconds: 10);
+
+  /// Déplacement minimal (m) d'un(e) ami(e) pour recalculer l'itinéraire qui
+  /// le/la suit : évite de recalculer pour du simple bruit GPS.
+  static const double _seuilDeplacementAmiItineraire = 20;
+
+  /// Délai minimal entre deux publications de ma position.
+  static const Duration _delaiMinPublication = Duration(seconds: 15);
+
+  /// Distance minimale (m) avant de republier ma position.
+  static const double _distanceMinPublicationMetres = 20;
 
   /// Distance minimale (mètres) d'un itinéraire exploitable. En dessous de ce
   /// seuil le trajet est jugé trop court (départ et arrivée quasi confondus) :
@@ -319,6 +391,15 @@ class _TrafficScreenState extends State<TrafficScreen>
   bool _propositionSignalementOuverte = false;
   bool afficherQuestionnaire = false;
 
+  /// Position préparée pour le prochain signalement : fix GPS one-shot obtenu
+  /// sans afficher le point bleu ni démarrer le suivi continu. Évite de
+  /// dépendre d'un fix au moment même de l'envoi.
+  Position? _positionSignalement;
+
+  /// Fix GPS de signalement en cours : mutualisé pour que le préchargement et
+  /// l'envoi rapprochés n'ouvrent qu'une seule requête.
+  Future<Position?>? _fixSignalementEnCours;
+
   // ---------------------------------------------------------------------------
   // Quartier / rue du point bleu (géocodage inverse de la position courante)
   // ---------------------------------------------------------------------------
@@ -394,10 +475,17 @@ class _TrafficScreenState extends State<TrafficScreen>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _amiLocaliseId = widget.amiALocaliser?.id;
     Journal.i('ECRAN', 'Écran de trafic ouvert');
     demarrerBoussole();
     verifierDernierSignalement();
     _chargerLieuxPersonnels();
+    _chargerAvatar();
+    _chargerAmisCache();
+    _chargerAmis();
+    SupabaseService().assurerPartagePosition();
+    _minuteurAmis = Timer.periodic(_rafraichissementAmis, (_) => _chargerAmis());
     chargerEtatActuel();
     _ecouterTelechargementTuiles();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -424,11 +512,213 @@ class _TrafficScreenState extends State<TrafficScreen>
     }
   }
 
+  /// Charge l'avatar (animal) de l'utilisateur depuis son profil pour
+  /// l'afficher en haut à gauche de l'AppBar.
+  Future<void> _chargerAvatar() async {
+    try {
+      final profile = await SupabaseService().loadProfile();
+      if (!mounted) return;
+      final avatar = profile?['avatar'] as String? ?? '';
+      if (avatar != _avatar) setState(() => _avatar = avatar);
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur avatar AppBar : $e');
+    }
+  }
+
+  /// Ouvre le profil ; à son retour, recharge l'avatar (l'animal a pu
+  /// changer dans « Modifier le profil »).
+  Future<void> _ouvrirProfil() async {
+    Journal.i('ECRAN', 'Ouverture du profil');
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const ProfileScreen()),
+    );
+    _chargerAvatar();
+  }
+
+  /// Charge mes amis(es) (avec leur position partagée). Silencieux : aucune
+  /// erreur affichée si le serveur est muet.
+  Future<void> _chargerAmis() async {
+    try {
+      final service = SupabaseService();
+      final lignes = await service.mesAmis();
+      // Les messages non lus reçus ont atteint ce téléphone : on les marque
+      // « reçus » pour que l'expéditeur voie la double coche.
+      unawaited(service.marquerMessagesRecus());
+      if (!mounted) return;
+      // Hors ligne (liste vide) : on conserve les amis déjà affichés.
+      if (lignes.isEmpty && _amis.isNotEmpty) return;
+      final amis = <AmiPosition>[
+        for (final ligne in lignes) ?AmiPosition.depuisJson(ligne),
+      ];
+      setState(() => _amis = amis);
+      _centrerSurAmiSiBesoin();
+      _suivreAmiSurItineraire();
+      // Cache local : les amis restent visibles sans connexion.
+      await service.majCacheAmis(lignes);
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur _chargerAmis: $e');
+    }
+  }
+
+  /// Affiche tout de suite les amis depuis le cache local, même hors
+  /// connexion (positions de la dernière actualisation réussie).
+  Future<void> _chargerAmisCache() async {
+    final cache = await SupabaseService().chargerAmisCache();
+    if (!mounted || cache == null) return;
+    final lignes = (cache['amis'] as List?) ?? const [];
+    final amis = <AmiPosition>[
+      for (final e in lignes)
+        if (e is Map) ?AmiPosition.depuisJson(Map<String, dynamic>.from(e)),
+    ];
+    if (amis.isEmpty) return;
+    setState(() => _amis = amis);
+    _centrerSurAmiSiBesoin();
+    _suivreAmiSurItineraire();
+  }
+
+  /// L'ami(e) ciblé par « Localiser », avec la position la plus fraîche
+  /// connue (repli sur celle transmise à l'ouverture en attendant le serveur).
+  AmiPosition? get _amiLocaliseActuel {
+    final id = _amiLocaliseId;
+    if (id == null) return null;
+    for (final ami in _amis) {
+      if (ami.id == id) return ami;
+    }
+    return widget.amiALocaliser;
+  }
+
+  /// Amis(es) réellement dessinés sur la carte : uniquement celui qu'on a
+  /// demandé à localiser. Aucun ami n'apparaît sans cette demande explicite.
+  List<AmiPosition> get _amisSurCarte {
+    final ami = _amiLocaliseActuel;
+    if (ami == null) return const <AmiPosition>[];
+    // Itinéraire actif jusqu'à cet(te) ami(e) : son emplacement devient le
+    // point vert de destination. On masque alors le pin de l'ami(e), qui ferait
+    // doublon au même endroit.
+    final arrivee = _arriveeItineraire;
+    if (_itineraire != null &&
+        arrivee != null &&
+        distanceMetresHaversine(arrivee, ami.position) < 15) {
+      return const <AmiPosition>[];
+    }
+    // On suit cet(te) ami(e) : tant que l'itinéraire dure, le pin de l'ami(e) reste
+    // masqué (le point vert le représente), y compris le bref instant où le
+    // trajet est recalculé après son déplacement.
+    if (_itineraire != null &&
+        _itineraireVersAmiId != null &&
+        ami.id == _itineraireVersAmiId) {
+      return const <AmiPosition>[];
+    }
+    return [ami];
+  }
+
+  /// Centre la carte sur l'ami(e) ciblé, une seule fois, dès que la carte est
+  /// prête et que sa position est connue.
+  void _centrerSurAmiSiBesoin() {
+    if (_amiLocaliseCentre || !cartePrete) return;
+    final ami = _amiLocaliseActuel;
+    if (ami == null) return;
+    _amiLocaliseCentre = true;
+    deplacerCarteDoucement(ami.position, 15.5);
+  }
+
+  /// Quand un itinéraire est tracé vers un(e) ami(e) et que celui-ci/celle-ci
+  /// se déplace, le point vert se recale sur sa nouvelle position et le trajet
+  /// est recalculé depuis le MÊME départ : l'itinéraire continue donc de suivre
+  /// le chemin de l'ami(e), sans repartir de zéro.
+  void _suivreAmiSurItineraire() {
+    final amiId = _itineraireVersAmiId;
+    if (amiId == null || _itineraire == null || _chargementItineraire) return;
+    AmiPosition? ami;
+    for (final a in _amis) {
+      if (a.id == amiId) {
+        ami = a;
+        break;
+      }
+    }
+    if (ami == null) return;
+    final arrivee = _arriveeItineraire;
+    final depart = _departItineraire;
+    if (arrivee == null || depart == null) return;
+    // Sous le seuil, on considère qu'il/elle n'a pas bougé (bruit GPS).
+    if (distanceMetresHaversine(arrivee, ami.position) <
+        _seuilDeplacementAmiItineraire) {
+      return;
+    }
+    Journal.i('ITINERAIRE', 'L\'ami(e) a bougé : recalcul du trajet', {
+      'deplacementMeters': distanceMetresHaversine(arrivee, ami.position),
+    });
+    _etapesAvantRecherche = List.of(_etapes);
+    unawaited(calculerItineraire(depart, ami.position));
+  }
+
+  /// Actions contextuelles ouvertes sur le pin vert de l'ami(e) localisé :
+  /// l'ami(e) reçoit alors les MÊMES boutons que le point vert (définir un
+  /// itinéraire / supprimer). Ce drapeau sert à rattacher ces boutons à
+  /// l'ami(e) plutôt qu'à un lieu, et à ne pas dessiner l'épingle rouge
+  /// par-dessus son pin.
+  bool get _actionsSurAmi {
+    final point = pointActions;
+    if (point == null) return false;
+    final ami = _amiLocaliseActuel;
+    if (ami == null) return false;
+    if (actionsSurEpingle ||
+        actionsSurPosition ||
+        actionsSurDestination ||
+        actionsSurEtape) {
+      return false;
+    }
+    // Un lieu recherché ou une épingle posée sur la même position garde la
+    // main : on n'interprète comme « ami » que le tap sur le pin de l'ami(e).
+    if (point == epingle || point == lieuRecherche) return false;
+    return distanceMetresHaversine(point, ami.position) < 5;
+  }
+
+  /// Publie ma position pour mes amis(es). Le partage est toujours actif.
+  /// Throttlé : au plus une publication toutes les 15 s, ou dès 20 m
+  /// parcourus — pour ne pas marteler le serveur à chaque fix GPS.
+  void _publierMaPosition(LatLng point, double? cap) {
+    final maintenant = DateTime.now();
+    final derniere = _dernierePublicationPosition;
+    final dernierePoint = _dernierePositionPubliee;
+    final delaiEcoule =
+        derniere == null ||
+        maintenant.difference(derniere) >= _delaiMinPublication;
+    final bougeAssez =
+        dernierePoint == null ||
+        distanceMetresHaversine(dernierePoint, point) >=
+            _distanceMinPublicationMetres;
+    if (!delaiEcoule && !bougeAssez) return;
+
+    _dernierePublicationPosition = maintenant;
+    _dernierePositionPubliee = point;
+    SupabaseService().publierMaPosition(
+      latitude: point.latitude,
+      longitude: point.longitude,
+      cap: cap,
+    );
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (afficherPositionUtilisateur && positionStream == null) {
+        Journal.i('POSITION', 'Application reprise au premier plan : réabonnement au flux GPS');
+        suivrePosition();
+      }
+    }
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _repriseNavTimer?.cancel();
     _minuteurAutoZoom?.cancel();
     _minuteurFonduBanniere?.cancel();
+    _minuteurAmis?.cancel();
+    _relanceGpsTimer?.cancel();
+    _surveillanceGpsTimer?.cancel();
     _voixGuidage.arreter();
     _suiviTicker?.dispose();
     positionStream?.cancel();
@@ -519,11 +809,47 @@ class _TrafficScreenState extends State<TrafficScreen>
     ouvrirEtatRoutes();
   }
 
+  /// Lance en arrière-plan la position qui servira au signalement.
+  void _prechargerPositionSignalement() {
+    if (positionActuelle != null) return; // position vivante déjà disponible
+    if (_fixSignalementEnCours != null) return; // un fix est déjà en route
+    unawaited(_demanderPositionSignalement());
+  }
+
+  /// Fix GPS dédié au signalement : le résultat est mémorisé dans
+  /// [_positionSignalement]. Les appels simultanés partagent la même requête.
+  Future<Position?> _demanderPositionSignalement() {
+    return _fixSignalementEnCours ??= locationService
+        .obtenirPosition()
+        .then((p) {
+          if (p != null) _positionSignalement = p;
+          return p;
+        })
+        .whenComplete(() => _fixSignalementEnCours = null);
+  }
+
+  /// Meilleure position disponible pour un signalement : la position vivante
+  /// (point bleu) si elle existe, sinon la position préparée, sinon un fix
+  /// demandé à la volée.
+  Future<Position?> _positionPourSignalement() {
+    final vivante = positionActuelle;
+    if (vivante != null) return Future.value(vivante);
+    final preparee = _positionSignalement;
+    if (preparee != null) return Future.value(preparee);
+    return _demanderPositionSignalement();
+  }
+
   /// Ouvre la feuille d'état de route (modal moderne). Une seule feuille à la
   /// fois à l'écran.
   Future<void> ouvrirEtatRoutes({String? dernierEtat}) async {
     if (_propositionSignalementOuverte) return;
     _propositionSignalementOuverte = true;
+
+    // La feuille demande un choix immédiat : on prépare déjà, en arrière-plan,
+    // la position qui accompagnera le signalement, pour que l'utilisateur ait
+    // le temps de choisir pendant que le GPS se fixe (aucun point bleu
+    // affiché, aucun suivi continu démarré).
+    _prechargerPositionSignalement();
 
     await showModalBottomSheet<void>(
       context: context,
@@ -546,24 +872,16 @@ class _TrafficScreenState extends State<TrafficScreen>
     });
 
     // La feuille se ferme aussitôt le choix fait : le reste (envoi serveur,
-    // fix GPS éventuel) se déroule en arrière-plan sans bloquer la carte.
+    // position) se déroule en arrière-plan sans bloquer la carte.
     if (mounted) Navigator.of(context).pop();
 
     await trafficService.enregistrerEtat(etat);
 
-    // Position connue ? On envoie directement. Sinon, on tente un dernier
-    // fix GPS avant de renoncer.
-    var position = positionActuelle;
-    if (position == null) {
-      Journal.a(
-        'SIGNALEMENT',
-        'Aucune position capturée : tentative de fix GPS avant envoi.',
-      );
-      position = await locationService.obtenirPosition();
-      if (position != null && mounted) {
-        setState(() => positionActuelle = position);
-      }
-    }
+    // La position a été préparée dès l'ouverture de la feuille (point bleu
+    // vivant, sinon fix one-shot). Si elle manque encore, on en demande une
+    // à l'instant : l'alerte « aucune position » ne doit plus apparaître
+    // pendant le délai normal de fixation du GPS.
+    final position = await _positionPourSignalement();
 
     if (position != null) {
       await SupabaseService().signalerEtat(
@@ -659,6 +977,23 @@ class _TrafficScreenState extends State<TrafficScreen>
   /// Démarre le flux GPS continu, met à jour la position et surveille la
   /// déviation par rapport à l'itinéraire éventuel.
   void suivrePosition() {
+    if (positionStream != null) return;
+    _surveillanceGpsTimer?.cancel();
+    _surveillanceGpsTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (!mounted || !afficherPositionUtilisateur) return;
+      final dernier = _dernierFixGps;
+      if (dernier == null ||
+          DateTime.now().difference(dernier) > const Duration(seconds: 60)) {
+        Journal.a('POSITION', 'Aucun fix GPS depuis 60 s : redémarrage du flux');
+        positionStream?.cancel();
+        positionStream = null;
+        if (!mounted || !afficherPositionUtilisateur) return;
+        suivrePosition();
+      }
+    });
+
+    _dernierFixGps = DateTime.now();
+
     // Journalisation throttlée : le flux peut envoyer plusieurs fixes par
     // seconde ; on ne consigne que les changements significatifs.
     DateTime? dernierFixJournalise;
@@ -701,8 +1036,19 @@ class _TrafficScreenState extends State<TrafficScreen>
           ),
         ).listen(
           (Position position) {
+            _dernierFixGps = DateTime.now();
             journaliserFix(position);
             if (!mounted) return;
+
+            // Précision du point bleu : une fix trop grossière (> 25 m) ne
+            // remplace pas la position déjà affichée — sauf au tout premier
+            // fix, où on n'a encore rien à montrer (sinon la carte resterait
+            // vide). Le GPS en ville alterne des fixes précises et grossières :
+            // on garde les bonnes et on ignore les mauvaises.
+            if (position.accuracy > _precisionGpsMaxMetres &&
+                _positionAcceptee != null) {
+              return;
+            }
 
             // Filtre anti-bruit : fix rejetée quand le téléphone est à l'arrêt
             // (ou quasi immobile). Le GPS dérive de quelques mètres sans bouger :
@@ -762,16 +1108,31 @@ class _TrafficScreenState extends State<TrafficScreen>
 
             _verifierDeviation(position);
             _mettreAJourZonePosition(position);
+            _publierMaPosition(
+              LatLng(position.latitude, position.longitude),
+              position.heading >= 0 ? position.heading : null,
+            );
           },
           onError: (Object e, StackTrace st) {
             // Permission révoquée en cours de route, GPS coupé… : le flux
-            // rejette une erreur. Sans ce garde-fou, elle remontait en erreur
-            // non gérée (ZonedGuarded) et l'app était consignée en plantage.
+            // rejette une erreur. Sur Android, le flux ne se relançait jamais
+            // et le point bleu restait figé — on tente désormais une relance
+            // automatique après quelques secondes.
             Journal.e('POSITION', 'Flux GPS interrompu', {'erreur': '$e'});
             debugPrint('[KinFlow] Flux GPS interrompu: $e');
             positionStream?.cancel();
             positionStream = null;
             if (mounted) setState(() => chargementPosition = false);
+            if (afficherPositionUtilisateur && mounted) {
+              _relanceGpsTimer?.cancel();
+              _relanceGpsTimer = Timer(const Duration(seconds: 3), () {
+                _relanceGpsTimer = null;
+                if (!mounted || !afficherPositionUtilisateur) return;
+                if (positionStream != null) return;
+                Journal.i('POSITION', 'Nouvelle tentative de souscription au flux GPS');
+                suivrePosition();
+              });
+            }
           },
           cancelOnError: true,
         );
@@ -1286,14 +1647,41 @@ class _TrafficScreenState extends State<TrafficScreen>
       MaterialPageRoute(
         fullscreenDialog: true,
         builder: (context) => SearchScreen(
-          onDemanderPoserMaison: () =>
-              _demanderPoserLieu(TypeLieuPose.maison),
+          onDemanderPoserMaison: () => _demanderPoserLieu(TypeLieuPose.maison),
           onDemanderPoserTravail: () =>
               _demanderPoserLieu(TypeLieuPose.travail),
         ),
       ),
     );
-    if (resultat == null || !mounted) return;
+    if (resultat == null) {
+      // Rechargement des lieux personnels (maison/travail) au cas où ils auraient
+      // été supprimés depuis l'écran de recherche.
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final brutMaison = prefs.getString('lieu_maison');
+        final brutTravail = prefs.getString('lieu_travail');
+        LatLng? maison;
+        LatLng? travail;
+        if (brutMaison != null) {
+          maison = _extraireLieu(brutMaison);
+        } else {
+          maison = null;
+        }
+        if (brutTravail != null) {
+          travail = _extraireLieu(brutTravail);
+        } else {
+          travail = null;
+        }
+        if (mounted) {
+          setState(() {
+            _maisonPoint = maison;
+            _travailPoint = travail;
+          });
+        }
+      } catch (_) {}
+      return;
+    }
+    if (!mounted) return;
 
     // L'écran de recherche a pu enregistrer (ou modifier) « Ma maison » /
     // « Mon travail » pendant la consultation : on recharge leurs ancrages
@@ -1386,6 +1774,27 @@ class _TrafficScreenState extends State<TrafficScreen>
   static bool _estLieuPersonnel(String nom) =>
       nom == 'Ma maison' || nom == 'Mon travail';
 
+  /// Vrai si [point] correspond (à quelques mètres près) au domicile ou au
+  /// lieu de travail enregistré : la règle « distance trop courte » doit aussi
+  /// s'appliquer à ces tracés, y compris à vol d'oiseau (voir
+  /// [demarrerItineraire]).
+  bool _estPointPersonnel(LatLng point) {
+    // Le point choisi peut différer légèrement du badge ancré (arrondi,
+    // projection écran) : 25 m suffisent à les faire coïncider.
+    const toleranceMetres = 25.0;
+    final maison = _maisonPoint;
+    if (maison != null &&
+        distanceMetresHaversine(maison, point) < toleranceMetres) {
+      return true;
+    }
+    final travail = _travailPoint;
+    if (travail != null &&
+        distanceMetresHaversine(travail, point) < toleranceMetres) {
+      return true;
+    }
+    return false;
+  }
+
   /// Demande (depuis la recherche de lieu) de passer en mode « poser un lieu
   /// personnel » : la carte entre en pose avec l'icône au centre. Si le lieu
   /// existe déjà, la carte est d'abord ramenée dessus pour corriger
@@ -1473,6 +1882,9 @@ class _TrafficScreenState extends State<TrafficScreen>
   // ---------------------------------------------------------------------------
 
   Future<void> demarrerItineraire(LatLng cible) async {
+    // Tout nouvel itinéraire part par défaut sans suivi d'ami(e) ; l'appelant
+    // repose [_itineraireVersAmiId] après coup s'il s'agit d'un(e) ami(e).
+    _itineraireVersAmiId = null;
     final position = positionActuelle;
     if (position == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1485,6 +1897,27 @@ class _TrafficScreenState extends State<TrafficScreen>
       return;
     }
     final depart = LatLng(position.latitude, position.longitude);
+
+    // Lieux personnels (« Ma maison » / « Mon travail ») : si on est déjà
+    // quasiment sur place, l'itinéraire ne doit pas se calculer. On mesure la
+    // distance À VOL D'OISEAU, car un trajet routier peut dépasser le seuil à
+    // cause des sens uniques alors que départ et arrivée sont quasi confondus.
+    // Le calcul n'est alors même pas lancé.
+    if (_estPointPersonnel(cible) &&
+        distanceMetresHaversine(depart, cible) <
+            _distanceMinItineraireMetres) {
+      Journal.a('ITINERAIRE', 'Distance trop courte (lieu personnel)', {
+        'distanceMeters': distanceMetresHaversine(depart, cible),
+        'minimumMeters': _distanceMinItineraireMetres,
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Distance trop courte pour l'itinéraire."),
+        ),
+      );
+      return;
+    }
+
     _etapesAvantRecherche = List.of(_etapes);
     _etapes.clear();
     await calculerItineraire(depart, cible);
@@ -1509,9 +1942,7 @@ class _TrafficScreenState extends State<TrafficScreen>
     }
     if (_etapes.any((e) => e == point) || destination == point) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Ce point est déjà dans l'itinéraire."),
-        ),
+        const SnackBar(content: Text("Ce point est déjà dans l'itinéraire.")),
       );
       return;
     }
@@ -1950,7 +2381,10 @@ class _TrafficScreenState extends State<TrafficScreen>
     setState(() {
       _indexItineraire = (_indexItineraire + 1) % options.length;
       _itineraire = suivant;
-      _voixGuidage.preparer(suivant.points);
+      // La voix se prépare aux nouveaux virages SANS répéter l'annonce de
+      // départ : « Itinéraire tracé avec succès » n'est dit qu'une fois, au
+      // premier tracé. Changer entre les options ne le redéclenche pas.
+      _voixGuidage.preparer(suivant.points, annoncerDepart: false);
       _guidageVoixActif = true;
       _itineraireSegmentIds = suivant.segmentsIds.isEmpty
           ? null
@@ -2019,8 +2453,7 @@ class _TrafficScreenState extends State<TrafficScreen>
             _itineraire != null &&
             cible == _arriveeItineraire &&
             !actionsSurEpingle;
-        actionsSurEtape =
-            _etapes.contains(cible) && !actionsSurEpingle;
+        actionsSurEtape = _etapes.contains(cible) && !actionsSurEpingle;
         actionsSurPosition = false;
         afficherActionsPosition = true;
       });
@@ -2068,6 +2501,11 @@ class _TrafficScreenState extends State<TrafficScreen>
       ..._etapes,
       lieuRecherche,
       epingle,
+      // Le pin de l'ami(e) localisé : taper dessus ouvre les mêmes
+      // boutons que le point vert (définir un itinéraire / supprimer). Quand
+      // un itinéraire y est déjà actif, la destination (première de la liste)
+      // prend le dessus : le tap se comporte alors comme sur le point vert.
+      _amiLocaliseActuel?.position,
     ];
     for (final candidat in cibles) {
       if (candidat == null) continue;
@@ -2088,13 +2526,19 @@ class _TrafficScreenState extends State<TrafficScreen>
 
   void _onDefinirItineraire() {
     final point = pointActions;
-    if (point != null && !_chargementItineraire) {
-      if (_itineraire != null) {
-        ajouterEtape(point);
-      } else {
-        demarrerItineraire(point);
-      }
+    if (point == null || _chargementItineraire) return;
+    // Le pin de l'ami(e) porte les MÊMES boutons que le point vert :
+    // « Ajouter à l'itinéraire » si un trajet est déjà affiché, sinon
+    // « Définir itinéraire », qui trace jusqu'à lui/elle.
+    if (_itineraire != null) {
+      ajouterEtape(point);
+      return;
     }
+    final ami = _actionsSurAmi ? _amiLocaliseActuel : null;
+    demarrerItineraire(point);
+    // demarrerItineraire remet l'identifiant à zéro : on le repose APRÈS, pour
+    // que le point vert continue de suivre cet(te) ami(e) s'il/elle bouge.
+    if (ami != null) _itineraireVersAmiId = ami.id;
   }
 
   /// Affiche une petite fenêtre avec les coordonnées géographiques exactes
@@ -2230,6 +2674,7 @@ class _TrafficScreenState extends State<TrafficScreen>
         _departItineraireQuitte = false;
         _debutVisuelItineraire = -1;
         _etapes.clear();
+        _itineraireVersAmiId = null;
         _travaillerCarteSuspendu = false;
         afficherLignesTrafic = _lignesTraficAvantItineraire;
       } else if (actionsSurDestination) {
@@ -2244,6 +2689,7 @@ class _TrafficScreenState extends State<TrafficScreen>
         _debutVisuelItineraire = -1;
         _etapes.clear();
         actionsSurDestination = false;
+        _itineraireVersAmiId = null;
         _travaillerCarteSuspendu = false;
         afficherLignesTrafic = _lignesTraficAvantItineraire;
       } else if (actionsSurEtape) {
@@ -2257,6 +2703,13 @@ class _TrafficScreenState extends State<TrafficScreen>
       } else if (actionsSurEpingle) {
         epingle = null;
         actionsSurEpingle = false;
+      } else if (_actionsSurAmi) {
+        // « Supprimer » sur le pin de l'ami(e) : on retire son pin de
+        // la carte (comme « Supprimer » retire le point vert). Aucun trajet
+        // n'est en cours dans ce cas.
+        _amiLocaliseId = null;
+        _amiLocaliseCentre = false;
+        _itineraireVersAmiId = null;
       } else {
         lieuRecherche = null;
         dernierLieuRecherche = null;
@@ -2268,7 +2721,8 @@ class _TrafficScreenState extends State<TrafficScreen>
     if (recalculerSansEtape) {
       final destination = _arriveeItineraire!;
       final position = positionActuelle;
-      final depart = _departItineraire ??
+      final depart =
+          _departItineraire ??
           (position != null
               ? LatLng(position.latitude, position.longitude)
               : null);
@@ -2488,25 +2942,16 @@ class _TrafficScreenState extends State<TrafficScreen>
             icon: const Icon(Icons.settings),
             tooltip: 'Réglages',
           ),
-          title: Image.asset(
-            Theme.of(context).brightness == Brightness.dark
-                ? "assets/kinflow_dark.jpg"
-                : "assets/kinflow.jpg",
-            height: 70,
-          ),
+          title: const LogoKinflow(hauteur: 54),
           centerTitle: true,
           actions: [
             IconButton(
-              onPressed: () {
-                Journal.i('ECRAN', 'Ouverture du profil');
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => const ProfileScreen(),
-                  ),
-                );
-              },
-              icon: const Icon(Icons.person),
+              onPressed: _ouvrirProfil,
+              iconSize: 34,
+              icon: AvatarAnimalWidget(
+                taille: 34,
+                avatarId: _avatar.isEmpty ? null : _avatar,
+              ),
               tooltip: 'Profil',
             ),
           ],
@@ -2565,6 +3010,7 @@ class _TrafficScreenState extends State<TrafficScreen>
                     _apresVueItineraireEnAttente = null;
                     _ajusterVueSurItineraire(points, apres: apres);
                   }
+                  _centrerSurAmiSiBesoin();
                 },
                 epingle: epingle,
                 onPoserEpingle: (point) =>
@@ -2572,14 +3018,15 @@ class _TrafficScreenState extends State<TrafficScreen>
                 poseLieu: _poserMaisonActif
                     ? TypeLieuPose.maison
                     : _poserTravailActif
-                        ? TypeLieuPose.travail
-                        : null,
+                    ? TypeLieuPose.travail
+                    : null,
                 pointMaison: _maisonPoint,
                 pointTravail: _travailPoint,
                 onPoserLieu: _onPoserLieu,
                 onAnnulerPoseLieu: _annulerPoseLieu,
                 pointActions: pointActions,
                 actionsSurEpingle: actionsSurEpingle,
+                actionsSurAmi: _actionsSurAmi,
                 versionZonesTrafic: _versionZonesTrafic,
                 onZonesTrafic: _appliquerZonesTrafic,
                 itinerairePoints: _itineraire?.points,
@@ -2588,16 +3035,19 @@ class _TrafficScreenState extends State<TrafficScreen>
                 itineraireDebutRoute: _itineraire?.debutRoute ?? 0,
                 itineraireDebutVisuel: _debutVisuelItineraire,
                 itineraireFinRoute: _itineraire?.finRoute ?? -1,
+                itineraireDepart: _itineraire != null
+                    ? _departItineraire
+                    : null,
                 pointDestination: _itineraire != null
                     ? _arriveeItineraire
                     : null,
                 pointEtape: List.of(_etapes),
+                amis: _amisSurCarte,
                 modeNavigation: modeNavigation,
                 capUtilisateur: afficherPositionUtilisateur
                     ? capUtilisateur
                     : null,
                 onNavigationInterrompue: interrompreSuiviNavigation,
-                modeSombre: Theme.of(context).brightness == Brightness.dark,
                 onUserInteract: () => _suiviTicker?.stop(),
                 afficherActions: afficherActionsPosition,
                 seulementSupprimer:
@@ -2859,178 +3309,198 @@ class _TrafficScreenState extends State<TrafficScreen>
                         ),
                       ),
                       const SizedBox(width: 12),
-                      Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                'Itinéraire tracé',
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w700,
-                                  color: couleurTitre,
-                                ),
-                              ),
-                              if (avecEtape) ...[
-                                const SizedBox(width: 8),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 7,
-                                    vertical: 2,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: KinColors.accent.withValues(
-                                      alpha: 0.16,
+                      // Flexible : la bannière reste dans l'écran (le détail
+                      // distance/durée se coupe en « … » si besoin) au lieu de
+                      // déborder à droite sur petit écran.
+                      Flexible(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    'Itinéraire tracé',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w700,
+                                      color: couleurTitre,
                                     ),
-                                    borderRadius: BorderRadius.circular(10),
                                   ),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(
-                                        MdiIcons.flagCheckered,
-                                        size: 12,
-                                        color: KinColors.accentTranche,
+                                ),
+                                if (avecEtape) ...[
+                                  const SizedBox(width: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 7,
+                                      vertical: 2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: KinColors.accent.withValues(
+                                        alpha: 0.16,
                                       ),
-                                      const SizedBox(width: 3),
-                                      Text(
-                                        '${_etapes.length} étape'
-                                        '${_etapes.length > 1 ? 's' : ''}',
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.w600,
-                                          color: sombre
-                                              ? const Color(0xFFFFC94D)
-                                              : KinColors.accentTranche,
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          MdiIcons.flagCheckered,
+                                          size: 12,
+                                          color: KinColors.accentTranche,
                                         ),
-                                      ),
-                                    ],
+                                        const SizedBox(width: 3),
+                                        Text(
+                                          '${_etapes.length} étape'
+                                          '${_etapes.length > 1 ? 's' : ''}',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                            color: sombre
+                                                ? const Color(0xFFFFC94D)
+                                                : KinColors.accentTranche,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                            const SizedBox(height: 3),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(
+                                  Icons.schedule,
+                                  size: 13,
+                                  color: KinColors.accent,
+                                ),
+                                const SizedBox(width: 4),
+                                Flexible(
+                                  child: Text(
+                                    'Arrivée à ${formaterHeure(arrivee)}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700,
+                                      color: couleurArrivee,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  '·',
+                                  style: TextStyle(color: couleurSecondaire),
+                                ),
+                                const SizedBox(width: 6),
+                                Flexible(
+                                  child: Text(
+                                    '${formaterDistance(_banniereDistanceRestante)} · '
+                                    '${formaterDuree(_banniereDureeRestante)}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: couleurSecondaire,
+                                    ),
                                   ),
                                 ),
                               ],
-                            ],
-                          ),
-                          const SizedBox(height: 3),
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(
-                                Icons.schedule,
-                                size: 13,
-                                color: KinColors.accent,
-                              ),
-                              const SizedBox(width: 4),
-                              Text(
-                                'Arrivée à ${formaterHeure(arrivee)}',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w700,
-                                  color: couleurArrivee,
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              Text(
-                                '·',
-                                style: TextStyle(color: couleurSecondaire),
-                              ),
-                              const SizedBox(width: 6),
-                              Text(
-                                '${formaterDistance(_banniereDistanceRestante)} · '
-                                '${formaterDuree(_banniereDureeRestante)}',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: couleurSecondaire,
-                                ),
-                              ),
-                            ],
-                          ),
-                          if (_itineraire != null &&
-                              (_optionsItineraire.length >= 2 ||
-                                  _departItineraireQuitte)) ...[
-                            const SizedBox(height: 7),
-                            Material(
-                              color: sombre
-                                  ? Colors.white.withValues(alpha: 0.06)
-                                  : KinColors.primary.withValues(alpha: 0.08),
-                              borderRadius: BorderRadius.circular(12),
-                              child: InkWell(
+                            ),
+                            if (_itineraire != null &&
+                                (_optionsItineraire.length >= 2 ||
+                                    _departItineraireQuitte)) ...[
+                              const SizedBox(height: 7),
+                              Material(
+                                color: sombre
+                                    ? Colors.white.withValues(alpha: 0.06)
+                                    : KinColors.primary.withValues(alpha: 0.08),
                                 borderRadius: BorderRadius.circular(12),
-                                onTap:
-                                    _chargementItineraire ||
-                                        (_departItineraireQuitte &&
-                                            positionActuelle == null)
-                                    ? null
-                                    : _onBoutonChangerOuRecalculer,
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 10,
-                                    vertical: 5,
-                                  ),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(
-                                        _departItineraireQuitte
-                                            ? Icons.refresh
-                                            : Icons.swap_horiz,
-                                        size: 14,
-                                        color: KinColors.primary,
-                                      ),
-                                      const SizedBox(width: 5),
-                                      Text(
-                                        _departItineraireQuitte
-                                            ? 'Recalculer'
-                                            : 'Changer d\'itinéraire',
-                                        style: TextStyle(
-                                          fontSize: 11.5,
-                                          fontWeight: FontWeight.w700,
-                                          color: sombre
-                                              ? const Color(0xFF4CD98E)
-                                              : KinColors.primaryFonce,
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(12),
+                                  onTap:
+                                      _chargementItineraire ||
+                                          (_departItineraireQuitte &&
+                                              positionActuelle == null)
+                                      ? null
+                                      : _onBoutonChangerOuRecalculer,
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 5,
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          _departItineraireQuitte
+                                              ? Icons.refresh
+                                              : Icons.swap_horiz,
+                                          size: 14,
+                                          color: KinColors.primary,
                                         ),
-                                      ),
-                                      if (!_departItineraireQuitte) ...[
-                                        const SizedBox(width: 6),
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 5,
-                                            vertical: 1,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: sombre
-                                                ? Colors.black.withValues(
-                                                    alpha: 0.25,
-                                                  )
-                                                : Colors.white.withValues(
-                                                    alpha: 0.6,
-                                                  ),
-                                            borderRadius: BorderRadius.circular(
-                                              7,
-                                            ),
-                                          ),
+                                        const SizedBox(width: 5),
+                                        Flexible(
                                           child: Text(
-                                            '${_indexItineraire + 1}/'
-                                            '${_optionsItineraire.length}',
+                                            _departItineraireQuitte
+                                                ? 'Recalculer'
+                                                : 'Changer d\'itinéraire',
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
                                             style: TextStyle(
-                                              fontSize: 9.5,
+                                              fontSize: 11.5,
                                               fontWeight: FontWeight.w700,
                                               color: sombre
-                                                  ? Colors.white70
+                                                  ? const Color(0xFF4CD98E)
                                                   : KinColors.primaryFonce,
                                             ),
                                           ),
                                         ),
+                                        if (!_departItineraireQuitte) ...[
+                                          const SizedBox(width: 6),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 5,
+                                              vertical: 1,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: sombre
+                                                  ? Colors.black.withValues(
+                                                      alpha: 0.25,
+                                                    )
+                                                  : Colors.white.withValues(
+                                                      alpha: 0.6,
+                                                    ),
+                                              borderRadius:
+                                                  BorderRadius.circular(7),
+                                            ),
+                                            child: Text(
+                                              '${_indexItineraire + 1}/'
+                                              '${_optionsItineraire.length}',
+                                              style: TextStyle(
+                                                fontSize: 9.5,
+                                                fontWeight: FontWeight.w700,
+                                                color: sombre
+                                                    ? Colors.white70
+                                                    : KinColors.primaryFonce,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
                                       ],
-                                    ],
+                                    ),
                                   ),
                                 ),
                               ),
-                            ),
+                            ],
                           ],
-                        ],
+                        ),
                       ),
                       const SizedBox(width: 4),
                       IconButton(

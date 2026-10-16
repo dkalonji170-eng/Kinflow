@@ -5,6 +5,7 @@ import 'auth_screen.dart';
 import '../services/diagnostics_service.dart';
 import '../services/supabase_service.dart';
 import '../theme/theme_provider.dart';
+import '../widgets/logo_kinflow.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -49,25 +50,37 @@ class _SplashScreenState extends State<SplashScreen> {
       });
     }
 
+    // Repli local : si Supabase n'a pas pu restaurer la session mais qu'un
+    // compte est déjà lié à cet appareil, on ouvre directement l'accueil.
+    if ((nom ?? '').isEmpty) {
+      try {
+        final compteLocal = await SupabaseService().lireCompteLieLocal();
+        final nomLocal = compteLocal['nom'] ?? '';
+        if (nomLocal.isNotEmpty) {
+          nom = nomLocal;
+          Journal.i('DEMARRAGE', 'Compte retrouvé depuis cache local', {
+            'nom': nom,
+          });
+        }
+      } catch (_) {}
+    }
+
+    if ((nom ?? '').isEmpty) {
+      try {
+        if (await SupabaseService().estCompteLie()) {
+          final compteLocal = await SupabaseService().lireCompteLieLocal();
+          nom = compteLocal['nom'] ?? '';
+        }
+      } catch (_) {}
+    }
+
     // Première ouverture (aucun compte) : thème blanc.
     // Compte connecté : son thème enregistré.
     themeProvider.appliquerTheme(modeSombre ?? false);
 
     if (!mounted) return;
 
-    if (nom == null) {
-      Journal.i(
-        'ECRAN',
-        'Redirection vers l\'accueil (aucun profil lié à cet appareil)',
-      );
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (context) => const HomeScreen()),
-      );
-      return;
-    }
-
-    if (nom.isEmpty) {
+    if (nom == null || nom.isEmpty) {
       Journal.i('ECRAN', 'Redirection vers l\'écran d\'inscription');
       Navigator.pushReplacement(
         context,
@@ -85,15 +98,13 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Theme.of(context).colorScheme.surface,
       body: Center(
         child: Transform.translate(
           offset: const Offset(0, -40),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Image.asset("assets/image.png", width: 220),
-              const SizedBox(height: 20),
-            ],
+            children: [const LogoKinflow(hauteur: 90)],
           ),
         ),
       ),

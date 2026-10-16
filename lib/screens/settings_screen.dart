@@ -1,13 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'notifications_screen.dart';
-import 'offline_maps_screen.dart';
 import '../theme/theme_provider.dart';
 import 'about_screen.dart';
 import 'help_screen.dart';
 import 'splash_screen.dart';
 import '../services/diagnostics_service.dart';
+import '../services/position_partage_service.dart';
 import '../services/supabase_service.dart';
+import 'voix_guidage_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -36,15 +37,15 @@ class SettingsScreen extends StatelessWidget {
           ),
           const Divider(),
           ListTile(
-            leading: const Icon(Icons.offline_pin),
-            title: const Text("Cartes hors ligne"),
+            leading: const Icon(Icons.record_voice_over),
+            title: const Text("Guidage vocal"),
             trailing: const Icon(Icons.arrow_forward_ios),
             onTap: () {
-              Journal.i('ECRAN', 'Ouverture des cartes hors ligne');
+              Journal.i('ECRAN', 'Ouverture du guidage vocal');
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (context) => const OfflineMapsScreen(),
+                  builder: (context) => const VoixGuidageScreen(),
                 ),
               );
             },
@@ -136,6 +137,9 @@ class SettingsScreen extends StatelessWidget {
                         onPressed: () async {
                           final navigator = Navigator.of(context);
                           Journal.i('COMPTE', 'Déconnexion confirmée');
+                          // Plus de partage de position après la déconnexion :
+                          // on ne publie jamais sous une session anonyme.
+                          PositionPartageService.instance.stop();
                           await SupabaseService().signOut();
                           navigator.pop();
                           navigator.pushAndRemoveUntil(

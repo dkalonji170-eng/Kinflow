@@ -1,10 +1,20 @@
 /// Une information publiée par KinFlow dans le fil de la ville.
 /// Les utilisateurs n'écrivent rien : ils réagissent en VERT (info
 /// confirmée) ou en ROUGE (info fausse), une réaction par personne,
-/// et peuvent déposer un émoji (les plus populaires d'abord).
+/// et peuvent déposer un SEUL émoji (au choix ; les plus populaires
+/// d'abord). Poser un autre émoji remplace le précédent.
 class InformationVille {
   final String id;
   final String contenu;
+
+  /// Lien vers l'article d'origine (médias RSS). Null pour les infos
+  /// publiées manuellement sans URL : l'app n'affiche alors aucun lien.
+  final String? sourceUrl;
+
+  /// Image de l'article d'origine (récupérée par le robot RSS), affichée
+  /// au-dessus du texte. Null quand l'info n'a pas d'image.
+  final String? imageUrl;
+
   final double? latitude;
   final double? longitude;
   final int nbVerts;
@@ -17,7 +27,8 @@ class InformationVille {
   /// popularité décroissante.
   final List<(String, int)> emojis;
 
-  /// Les émojis que le visiteur a lui-même déposés sur cette info.
+  /// L'émoji unique que le visiteur a lui-même déposé sur cette info
+  /// (un seul maximum : l'ensemble contient 0 ou 1 élément).
   final Set<String> mesEmojis;
 
   /// true si KinFlow a épinglé cette info : elle reste en haut du fil.
@@ -28,6 +39,8 @@ class InformationVille {
   const InformationVille({
     required this.id,
     required this.contenu,
+    this.sourceUrl,
+    this.imageUrl,
     this.latitude,
     this.longitude,
     required this.nbVerts,
@@ -43,6 +56,8 @@ class InformationVille {
     return InformationVille(
       id: json['id'] as String,
       contenu: (json['contenu'] as String?) ?? '',
+      sourceUrl: json['source_url'] as String?,
+      imageUrl: json['image_url'] as String?,
       latitude: (json['latitude'] as num?)?.toDouble(),
       longitude: (json['longitude'] as num?)?.toDouble(),
       nbVerts: (json['nb_verts'] as num?)?.toInt() ?? 0,
@@ -77,10 +92,88 @@ class InformationVille {
     return {...valeur.whereType<String>()};
   }
 
+  /// Sérialise l'information pour le cache local (mêmes clés que celles lues
+  /// par [InformationVille.depuisJson]).
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'contenu': contenu,
+        'source_url': sourceUrl,
+        'image_url': imageUrl,
+        'latitude': latitude,
+        'longitude': longitude,
+        'nb_verts': nbVerts,
+        'nb_rouges': nbRouges,
+        'ma_reaction': maReaction,
+        'emojis': [
+          for (final (e, c) in emojis) {'e': e, 'c': c},
+        ],
+        'mes_emojis': mesEmojis.toList(),
+        'epinglee': epinglee,
+        'cree_a': creeA.toUtc().toIso8601String(),
+      };
+
   bool get etreConfirme => maReaction == 'VERT';
   bool get etreSignale => maReaction == 'ROUGE';
 
   /// Total des réactions (pouces + émojis) : utilisé pour trier par popularité.
   int get nbReactionsTotal =>
       nbVerts + nbRouges + emojis.fold(0, (somme, e) => somme + e.$2);
+
+  /// Applique un tap émoji avec la règle **un seul émoji par personne** :
+  /// - retaper l'émoji déjà posé le retire (bascule) ;
+  /// - poser un autre émoji remplace l'éventuel précédent.
+  ///
+  /// Retourne le nouveau (compteurs [emojis], émojis du visiteur [mesEmojis]).
+  static (List<(String, int)>, Set<String>) appliquerEmoji(
+    List<(String, int)> emojis,
+    Set<String> mesEmojis,
+    String emoji,
+  ) {
+    final resultat = [...emojis];
+    final mes = {...mesEmojis};
+    if (mes.contains(emoji)) {
+      mes.remove(emoji);
+      _decrementerEmoji(resultat, emoji);
+    } else {
+      for (final ancien in mes) {
+        _decrementerEmoji(resultat, ancien);
+      }
+      mes
+        ..clear()
+        ..add(emoji);
+      _incrementerEmoji(resultat, emoji);
+    }
+    resultat.sort((a, b) => b.$2.compareTo(a.$2));
+    return (resultat, mes);
+  }
+
+  /// Retire une occurrence d'[emoji] du compteur : supprime la ligne quand
+  /// elle tombe à 0 (plus personne n'a posé cet émoji).
+  static void _decrementerEmoji(
+    List<(String, int)> emojis,
+    String emoji,
+  ) {
+    final idx = emojis.indexWhere((x) => x.$1 == emoji);
+    if (idx == -1) return;
+    final (e, c) = emojis[idx];
+    if (c <= 1) {
+      emojis.removeAt(idx);
+    } else {
+      emojis[idx] = (e, c - 1);
+    }
+  }
+
+  /// Ajoute une occurrence d'[emoji] au compteur (crée la ligne si absente).
+  static void _incrementerEmoji(
+    List<(String, int)> emojis,
+    String emoji,
+  ) {
+    final idx = emojis.indexWhere((x) => x.$1 == emoji);
+    if (idx != -1) {
+      final (e, c) = emojis[idx];
+      emojis[idx] = (e, c + 1);
+    } else {
+      emojis.add((emoji, 1));
+    }
+  }
 }

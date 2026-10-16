@@ -13,7 +13,7 @@
   <meta name="apple-mobile-web-app-title" content="kinflow">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
-  <link rel="icon" type="image/png" href="favicon.png"/>
+  <link rel="icon" type="image/png" sizes="64x64" href="favicon.png"/>
 
   <title>kinflow</title>
   <link rel="manifest" href="manifest.json">
@@ -29,6 +29,29 @@
     }
   </style>
 
+  <script>
+    // Nettoie les anciens service workers et caches laissés par des builds
+    // web précédents servis sur le même port : sans ce nettoyage, le
+    // navigateur continuerait d'afficher l'ancienne compilation.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function (regs) {
+        regs.forEach(function (r) {
+          r.unregister();
+        });
+      });
+      window.addEventListener('load', function () {
+        if (window.caches && caches.keys) {
+          caches.keys().then(function (keys) {
+            return Promise.all(
+              keys.map(function (k) {
+                return caches.delete(k);
+              })
+            );
+          });
+        }
+      });
+    }
+  </script>
   <script>
     if (window.visualViewport) {
       let prevH = window.visualViewport.height;

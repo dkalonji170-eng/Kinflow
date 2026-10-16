@@ -119,6 +119,16 @@ class RoadService {
   static const double _kinLonMin = 15.00;
   static const double _kinLonMax = 16.45;
 
+  /// Vrai si le point ([lat], [lon]) tombe dans la ville-province de Kinshasa.
+  /// C'est la SEULE zone que le réseau routier local (Overpass borné + graphe
+  /// embarqué) sait couvrir : au-delà, un itinéraire local n'a aucun sens et
+  /// doit être refusé au profit d'OSRM.
+  static bool dansZoneKinshasa(double lat, double lon) =>
+      lat >= _kinLatMin &&
+      lat <= _kinLatMax &&
+      lon >= _kinLonMin &&
+      lon <= _kinLonMax;
+
   static const _classesMajeures =
       'motorway|motorway_link|trunk|trunk_link|primary|primary_link'
       '|secondary|secondary_link|tertiary|tertiary_link';

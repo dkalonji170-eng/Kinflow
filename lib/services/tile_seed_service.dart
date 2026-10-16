@@ -1,6 +1,6 @@
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/services.dart' show ByteData, rootBundle;
 import 'package:flutter_map_tile_caching/flutter_map_tile_caching.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -21,7 +21,18 @@ class TileSeedService {
       final fichierArchive = File('${supportDir.path}/kinshasa.fmtc');
 
       if (!await fichierArchive.exists()) {
-        final data = await rootBundle.load(_assetArchive);
+        final ByteData? data;
+        try {
+          data = await rootBundle.load(_assetArchive);
+        } catch (_) {
+          // Aucune archive embarquée dans le bundle : la carte se charge
+          // normalement en réseau, ce n'est pas un plantage.
+          debugPrint(
+            '[KinFlow] Pas d\'archive embarquée (kinshasa.fmtc) — '
+            'mode réseau uniquement.',
+          );
+          return false;
+        }
         if (data.lengthInBytes == 0) {
           debugPrint('[KinFlow] Archive embarquée absente, import ignoré.');
           return false;
@@ -32,12 +43,11 @@ class TileSeedService {
         );
       }
 
-      final resultat = FMTCRoot.external(
-        pathToArchive: fichierArchive.path,
-      ).import(
-        storeNames: ['kinshasa'],
-        strategy: ImportConflictStrategy.merge,
-      );
+      final resultat = FMTCRoot.external(pathToArchive: fichierArchive.path)
+          .import(
+            storeNames: ['kinshasa'],
+            strategy: ImportConflictStrategy.merge,
+          );
       await resultat.complete;
 
       if (await fichierArchive.exists()) {

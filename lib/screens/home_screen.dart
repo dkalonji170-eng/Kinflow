@@ -3,6 +3,9 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../services/supabase_service.dart';
+import '../services/position_partage_service.dart';
+import '../widgets/avatar_animal.dart';
+import '../widgets/logo_kinflow.dart';
 import 'fil_ville_screen.dart';
 import 'profile_screen.dart';
 import 'settings_screen.dart';
@@ -18,19 +21,47 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   static const Duration _rafraichissementBadge = Duration(seconds: 60);
 
-  /// Nombre d'infos du Fil Social arrivées depuis la dernière visite :
-  /// affiché en rouge sur le bouton « Social » (0 = pas de badge).
+  /// Nombre total de notifications (nouvelles infos + messages non lus +
+  /// demandes d'amis) : affiché en rouge sur le bouton « Social » (0 = pas de
+  /// badge).
   int _nouvelles = 0;
   Timer? _minuteur;
+
+  /// Avatar (animal) choisi par l'utilisateur : affiché en haut à gauche de
+  /// l'AppBar comme icône du profil. Vide tant que le profil n'est pas chargé.
+  String _avatar = '';
 
   @override
   void initState() {
     super.initState();
     _actualiserBadge();
+    _chargerAvatar();
+    PositionPartageService.instance.start();
     _minuteur = Timer.periodic(
       _rafraichissementBadge,
       (_) => _actualiserBadge(),
     );
+  }
+
+  Future<void> _chargerAvatar() async {
+    try {
+      final profile = await SupabaseService().loadProfile();
+      if (!mounted) return;
+      final avatar = profile?['avatar'] as String? ?? '';
+      if (avatar != _avatar) setState(() => _avatar = avatar);
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur avatar AppBar : $e');
+    }
+  }
+
+  /// Ouvre le profil ; à son retour (l'animal a pu changer dans « Modifier
+  /// le profil »), recharge l'avatar pour le garder à jour.
+  Future<void> _ouvrirProfil() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const ProfileScreen()),
+    );
+    _chargerAvatar();
   }
 
   @override
@@ -39,17 +70,31 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
+  /// Le badge du bouton « Social » additionne tout ce qui est une
+  /// notification : nouvelles informations du fil + messages non lus +
+  /// demandes d'amis reçues. Chaque élément compte pour +1.
   Future<void> _actualiserBadge() async {
     final service = SupabaseService();
     final dernierVu = await service.lireDernierVuFil();
-    if (dernierVu == null) {
-      if (!mounted) return;
-      setState(() => _nouvelles = 0);
-      return;
-    }
-    final compteur = await service.compterNouvellesInfos(dernierVu);
+
+    final resultats = await Future.wait<Object?>([
+      dernierVu == null
+          ? Future<int>.value(0)
+          : service.compterNouvellesInfos(dernierVu),
+      service.nbMessagesNonLusAmis(),
+      service.mesDemandesAmis(),
+    ]);
+
+    final nouvellesInfos = resultats[0] as int? ?? 0;
+    final nonLus = resultats[1] as Map<String, int>? ?? const {};
+    final demandes = resultats[2] as List<Map<String, dynamic>>? ?? const [];
+
+    final total = nouvellesInfos +
+        nonLus.values.fold<int>(0, (s, v) => s + v) +
+        demandes.length;
+
     if (!mounted) return;
-    setState(() => _nouvelles = compteur);
+    setState(() => _nouvelles = total);
   }
 
   Future<void> _ouvrirSocial() async {
@@ -64,6 +109,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Theme.of(context).colorScheme.surface,
       appBar: AppBar(
         leading: IconButton(
           onPressed: () {
@@ -75,25 +121,16 @@ class _HomeScreenState extends State<HomeScreen> {
           icon: const Icon(Icons.settings),
           tooltip: 'Réglages',
         ),
-        title: Padding(
-          padding: const EdgeInsets.only(top: 8),
-          child: Image.asset(
-            Theme.of(context).brightness == Brightness.dark
-                ? "assets/kinflow_dark.jpg"
-                : "assets/kinflow.jpg",
-            height: 70,
-          ),
-        ),
+        title: const LogoKinflow(hauteur: 54),
         centerTitle: true,
         actions: [
           IconButton(
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (context) => const ProfileScreen()),
-              );
-            },
-            icon: const Icon(Icons.person),
+            onPressed: _ouvrirProfil,
+            iconSize: 34,
+            icon: AvatarAnimalWidget(
+              taille: 34,
+              avatarId: _avatar.isEmpty ? null : _avatar,
+            ),
             tooltip: 'Profil',
           ),
         ],
@@ -131,7 +168,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   backgroundColor: Colors.blue,
                   foregroundColor: Colors.white,
                   textStyle: const TextStyle(
-                    fontSize: 16,
+                    fontSize: 15,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
@@ -184,7 +221,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           textAlign: TextAlign.center,
                           style: const TextStyle(
                             color: Colors.white,
-                            fontSize: 12,
+                            fontSize: 9,
                             fontWeight: FontWeight.w700,
                           ),
                         ),

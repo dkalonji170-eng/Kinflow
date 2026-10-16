@@ -1,5 +1,8 @@
+import 'dart:math';
+
 import 'package:flutter/material.dart';
 import '../services/supabase_service.dart';
+import '../widgets/avatar_animal.dart';
 import 'code_screen.dart';
 
 class EditProfileScreen extends StatefulWidget {
@@ -18,6 +21,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   final telephoneController = TextEditingController();
   final emailController = TextEditingController();
   String code = '';
+  String avatarChoisi = '';
 
   bool erreurNom = false;
   bool erreurPrenom = false;
@@ -27,7 +31,11 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   @override
   void initState() {
     super.initState();
-    if (!widget.premiereFois) {
+    if (widget.premiereFois) {
+      // À l'inscription, on propose déjà un avatar au hasard : l'utilisateur
+      // peut en choisir un autre d'un simple appui.
+      avatarChoisi = avatarsAnimaux[Random().nextInt(avatarsAnimaux.length)].id;
+    } else {
       chargerProfil();
     }
   }
@@ -56,11 +64,51 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
           telephoneController.text = profile['telephone'] as String? ?? '';
           emailController.text = profile['email'] as String? ?? '';
           code = profile['code'] as String? ?? '';
+          avatarChoisi = profile['avatar'] as String? ?? '';
         });
       }
     } catch (e) {
       debugPrint('[KinFlow] Erreur chargement profil: $e');
     }
+  }
+
+  /// Une pastille d'animal rond dans le sélecteur ; un anneau bleu marque
+  /// l'avatar actuellement choisi.
+  Widget _choixAnimal(AvatarAnimal animal) {
+    final selectionne = animal.id == avatarChoisi;
+    return Tooltip(
+      message: animal.nom,
+      child: InkWell(
+        key: ValueKey('avatar_${animal.id}'),
+        customBorder: const CircleBorder(),
+        onTap: () {
+          setState(() {
+            avatarChoisi = animal.id;
+          });
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          width: 54,
+          height: 54,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: animal.couleur,
+            border: Border.all(
+              color: selectionne
+                  ? const Color(0xFF1565C0) // KinColors.bleu
+                  : Colors.transparent,
+              width: 3,
+            ),
+          ),
+          child: Center(
+            child: Text(
+              animal.emoji,
+              style: const TextStyle(fontSize: 26),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -81,16 +129,31 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
           padding: const EdgeInsets.all(20),
           child: Column(
             children: [
-              CircleAvatar(
-                radius: 45,
-                backgroundColor: Theme.of(
-                  context,
-                ).colorScheme.surfaceContainerHighest,
-                child: Icon(
-                  Icons.person,
-                  size: 50,
+              AvatarAnimalWidget(taille: 90, avatarId: avatarChoisi),
+
+              const SizedBox(height: 12),
+
+              Text(
+                widget.premiereFois
+                    ? "Choisis ton avatar (animal)"
+                    : "Ton avatar",
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
                   color: Theme.of(context).colorScheme.onSurfaceVariant,
                 ),
+              ),
+
+              const SizedBox(height: 10),
+
+              // Les 10 animaux ronds façon Xender : un appui = choix.
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                alignment: WrapAlignment.center,
+                children: [
+                  for (final animal in avatarsAnimaux) _choixAnimal(animal),
+                ],
               ),
 
               const SizedBox(height: 30),
@@ -114,9 +177,9 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                       : code,
                   readOnly: true,
                   decoration: const InputDecoration(
-                    labelText: "Code",
+                    labelText: "Code de compte (privé)",
                     border: OutlineInputBorder(),
-                    helperText: "Ce code ne peut pas être modifié",
+                    helperText: "Sert à te reconnecter : ne le partage pas",
                   ),
                 ),
                 const SizedBox(height: 15),
@@ -259,6 +322,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                     date: dateController.text,
                     telephone: telephoneController.text,
                     email: emailController.text,
+                    avatar: avatarChoisi,
                   );
 
                   if (!context.mounted) return;
@@ -284,6 +348,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                       date: dateController.text,
                       telephone: telephoneController.text,
                       email: emailController.text,
+                      avatar: avatarChoisi,
                     );
 
                     if (!context.mounted) return;

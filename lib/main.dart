@@ -11,6 +11,7 @@ import 'services/tile_download_service.dart';
 import 'services/tile_seed_service.dart';
 import 'services/supabase_service.dart';
 import 'services/crash_reporter.dart';
+import 'services/crash_web_hook.dart' show transmettreCrash;
 import 'services/diagnostics_service.dart';
 import 'package:flutter_map_tile_caching/flutter_map_tile_caching.dart';
 
@@ -32,6 +33,10 @@ void _signalerPlantage(String origine, Object erreur, [StackTrace? stack]) {
   try {
     Journal.e('PLANTAGE', 'Erreur non gérée ($origine)', {'erreur': '$erreur'});
     reportCrash(origine, erreur, stack ?? StackTrace.current);
+    try {
+      final contenu = '[$origine] ${DateTime.now()}\nERREUR: $erreur\nSTACK:\n${stack ?? StackTrace.current}';
+      transmettreCrash(contenu);
+    } catch (_) {}
   } catch (_) {
     // Impossible de consigner : on n'insiste pas.
   } finally {

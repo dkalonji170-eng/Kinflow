@@ -227,13 +227,17 @@ class SearchService {
 
   /// Boîte englobant toute la ville-province de Kinshasa (communes ouest
   /// jusqu'aux zones rurales de Maluku et N'sele à l'est), au format
-  /// Nominatim viewbox « lon1,lat1,lon2,lat2 ». Aucune recherche ne peut
-  /// sortir de cette zone.
+  /// Nominatim viewbox « lon1,lat1,lon2,lat2 ». Mêmes limites que le service
+  /// routier : la recherche couvre toute la province, pas seulement le centre.
   static const String _zoneKinshasa = '15.00,-3.90,16.45,-5.20';
 
   /// Même boîte au format bbox Overpass « lat1,lon1,lat2,lon2 » : une
   /// contrainte bbox est résolue bien plus vite qu'un area administratif.
-  static const String _bboxOverpass = '(-4.60,15.05,-4.10,15.60)';
+  static const String _bboxOverpass = '(-5.20,15.00,-3.90,16.45)';
+
+  /// Même boîte au format bbox Photon « lon1,lat1,lon2,lat2 » (le géocodeur
+  /// Photon attend le minimum en premier).
+  static const String _bboxPhoton = '15.00,-5.20,16.45,-3.90';
 
   static const int _limiteResultats = 30;
   static const int _tailleMaxCacheRecherches = 40;
@@ -330,15 +334,17 @@ class SearchService {
     throw Exception('Overpass: échec après $_maxTentativesOverpass tentatives');
   }
 
-  /// Recherche un lieu en fusionnant TROIS services EN LIGNE : Photon
-  /// (~100-300 ms, fournit les premières suggestions pendant la frappe),
-  /// Nominatim borné à la boîte ci-dessus et Overpass sur la vraie
-  /// frontière de Kinshasa. Aucun repli mondial : un lieu hors de
-  /// Kinshasa n'est jamais proposé.
+  /// Recherche un lieu en fusionnant TROIS services EN LIGNE bornés à
+  /// Kinshasa (Photon ~100-300 ms pour l'effet « clavier intelligent »,
+  /// Nominatim et Overpass), PLUS une recherche Photon mondiale qui garantit
+  /// qu'un lieu hors de Kinshasa (autre ville, autre pays) est TOUJOURS
+  /// proposé. Les résultats de Kinshasa restent en tête, ceux du monde
+  /// entier suivent.
   ///
   /// Les résultats arrivent EN PROGRESSIF : dès qu'une source répond, la
-  /// liste partielle est émise. Le flux se ferme quand les trois ont
-  /// répondu.
+  /// liste partielle est émise. Le flux se ferme quand toutes les sources ont
+  /// répondu (et, si vraiment rien n'a été trouvé, après un ultime repli
+  /// Nominatim mondial).
   Stream<List<SearchResult>> rechercherLieu(String recherche) {
     final terme = recherche.trim();
     late final StreamController<List<SearchResult>> controller;
@@ -360,30 +366,34 @@ class SearchService {
         return;
       }
 
-      Journal.i('RECHERCHE', 'Recherche lancée sur 3 sources en ligne', {
+      Journal.i('RECHERCHE', 'Recherche lancée (Kinshasa + monde)', {
         'terme': terme,
-        'sources': 'Photon + Nominatim + Overpass',
+        'sources': 'Photon + Nominatim + Overpass (Kinshasa) + Photon (monde)',
       });
 
-      final accumules = <SearchResult>[];
-      final vus = <String>{};
+      // Kinshasa d'abord, monde ensuite : une destination lointaine est
+      // toujours proposée sans prendre la place des lieux locaux.
+      final locaux = <SearchResult>[];
+      final mondiaux = <SearchResult>[];
 
-      void fusionner(List<SearchResult> ajouts) {
-        for (final r in ajouts) {
+      /// Fusionne les deux listes (locaux puis monde), sans doublon de
+      /// coordonnée, en limitant le total.
+      List<SearchResult> fusion() {
+        final vus = <String>{};
+        final out = <SearchResult>[];
+        for (final r in [...locaux, ...mondiaux]) {
           if (r.nom.trim().isEmpty) continue;
-          final clePoint =
+          final k =
               '${r.latitude.toStringAsFixed(4)},${r.longitude.toStringAsFixed(4)}';
-          if (!vus.add(clePoint)) continue;
-          accumules.add(r);
+          if (!vus.add(k)) continue;
+          out.add(r);
+          if (out.length >= _limiteResultats) break;
         }
+        return out;
       }
 
-      var sourcesEnAttente = 3;
-      // Le repli mondial ne se déclenche qu'UNE fois : quand les trois sources
-      // localisées n'ont rien trouvé à Kinshasa (voir [lancerRepliMondial]).
-      var repliMondialEnCours = false;
-
-      void cloreEtCacher(List<SearchResult> resultats) {
+      void cloreEtCacher() {
+        final resultats = fusion();
         _cacheRecherches[cle] = resultats;
         while (_cacheRecherches.length > _tailleMaxCacheRecherches) {
           _cacheRecherches.remove(_cacheRecherches.keys.first);
@@ -399,76 +409,66 @@ class SearchService {
         controller.close();
       }
 
-      /// Rien trouvé à Kinshasa : on relance Photon et Nominatim SANS
-      /// bornage géographique pour couvrir toute la planète. Une destination
-      /// hors de Kinshasa (ville étrangère, autre pays…) peut ainsi être
-      /// trouvée puis posée sur la carte.
-      void lancerRepliMondial() {
+      /// Émet la liste fusionnée courante sans la clore : l'écran montre les
+      /// résultats au fur et à mesure, sans flash « aucun résultat ».
+      void rafraichir() {
+        final liste = fusion();
+        if (liste.isNotEmpty) controller.add(liste);
+      }
+
+      var sourcesEnAttente = 4; // 3 sources localisées + Photon mondial
+      var repliMondialEnCours = false;
+
+      /// Dernier recours : rien trouvé à Kinshasa NI via Photon mondial, on
+      /// tente Nominatim sans bornage avant d'annoncer « aucun lieu trouvé ».
+      void lancerRepliNominatimMondial() {
         if (controller.isClosed || repliMondialEnCours) return;
         repliMondialEnCours = true;
         Journal.a('RECHERCHE',
-            'Aucun résultat à Kinshasa, repli sur le monde entier');
-
-        var repliEnAttente = 2;
-        void repliTerminee(String source, List<SearchResult> ajouts) {
-          if (controller.isClosed) return;
-          Journal.i('RECHERCHE', 'Source mondiale $source terminée', {
-            'resultats': ajouts.length,
-          });
-          fusionner(ajouts);
-          repliEnAttente--;
-          if (repliEnAttente == 0) {
-            controller.add(accumules.take(_limiteResultats).toList());
-            cloreEtCacher(accumules.take(_limiteResultats).toList());
-          }
-        }
-
-        unawaited(_protegerSource('Photon mondial',
-                () => _rechercherPhoton(terme, mondial: true)).then(
-          (r) => repliTerminee('Photon mondial', r),
-        ));
+            'Aucun résultat (Kinshasa ni Photon monde), repli sur Nominatim mondial');
         unawaited(_protegerSource('Nominatim mondial',
-                () => _rechercherNominatim(terme, mondial: true)).then(
-          (r) => repliTerminee('Nominatim mondial', r),
-        ));
+                () => _rechercherNominatim(terme, mondial: true)).then((r) {
+          if (controller.isClosed) return;
+          Journal.i('RECHERCHE', 'Source Nominatim mondial terminée', {
+            'resultats': r.length,
+          });
+          mondiaux.addAll(r);
+          rafraichir();
+          cloreEtCacher();
+        }));
       }
 
-      void sourceTerminee(String source, List<SearchResult> ajouts) {
+      void sourceTerminee(String source, bool local, List<SearchResult> ajouts) {
         if (controller.isClosed) return;
         Journal.i('RECHERCHE', 'Source $source terminée', {
           'resultats': ajouts.length,
         });
-        fusionner(ajouts);
+        (local ? locaux : mondiaux).addAll(ajouts);
         sourcesEnAttente--;
-        final liste = accumules.take(_limiteResultats).toList();
-        if (liste.isNotEmpty) {
-          // Émission progressive : l'écran montre au fur et à mesure ce que
-          // renvoient les sources localisées, sans flash « aucun résultat »
-          // entre deux sources.
-          controller.add(liste);
-        }
+        rafraichir();
         if (sourcesEnAttente == 0) {
-          if (liste.isEmpty) {
-            // Aucun lieu à Kinshasa : élargir au monde entier avant de dire
-            // « aucun lieu trouvé ».
-            lancerRepliMondial();
+          if (fusion().isEmpty) {
+            lancerRepliNominatimMondial();
             return;
           }
-          cloreEtCacher(liste);
+          cloreEtCacher();
         }
       }
 
-      unawaited(_protegerSource(
-          'Photon', () => _rechercherPhoton(terme)).then(
-        (r) => sourceTerminee('Photon', r),
+      unawaited(_protegerSource('Photon', () => _rechercherPhoton(terme)).then(
+        (r) => sourceTerminee('Photon', true, r),
       ));
-      unawaited(_protegerSource(
-          'Nominatim', () => _rechercherNominatim(terme)).then(
-        (r) => sourceTerminee('Nominatim', r),
+      unawaited(_protegerSource('Nominatim', () => _rechercherNominatim(terme))
+          .then(
+        (r) => sourceTerminee('Nominatim', true, r),
       ));
-      unawaited(_protegerSource(
-          'Overpass', () => _rechercherOverpass(terme)).then(
-        (r) => sourceTerminee('Overpass', r),
+      unawaited(_protegerSource('Overpass', () => _rechercherOverpass(terme))
+          .then(
+        (r) => sourceTerminee('Overpass', true, r),
+      ));
+      unawaited(_protegerSource('Photon mondial',
+              () => _rechercherPhoton(terme, mondial: true)).then(
+        (r) => sourceTerminee('Photon mondial', false, r),
       ));
     });
     return controller.stream;
@@ -505,7 +505,7 @@ class SearchService {
       'lang': 'fr',
     };
     if (!mondial) {
-      params['bbox'] = '15.05,-4.60,15.60,-4.10';
+      params['bbox'] = _bboxPhoton;
     }
 
     final url = Uri.parse(
@@ -748,8 +748,11 @@ class SearchService {
       .replaceAll(RegExp('[ç]'), 'c')
       .replaceAll(RegExp('[ñ]'), 'n');
 
+  /// Vrai si le point tombe dans la ville-province de Kinshasa (mêmes bornes
+  /// que le service routier). Les recherches localisées y sont restreintes ;
+  /// les résultats du monde entier, eux, ne passent pas par ce filtre.
   bool _dansZoneKinshasa(double lat, double lon) =>
-      lat >= -4.60 && lat <= -4.10 && lon >= 15.05 && lon <= 15.60;
+      lat >= -5.20 && lat <= -3.90 && lon >= 15.00 && lon <= 16.45;
 
   _TypePoi? _typePour(String terme) {
     final bas = terme.toLowerCase();
