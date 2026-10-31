@@ -20,8 +20,7 @@ class HelpScreen extends StatelessWidget {
           ),
           const SizedBox(height: 15),
           const Text(
-            "Contactez-nous pour toute question "
-            "ou pour signaler un problème.",
+            "Contactez-nous pour toute question.",
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 30),

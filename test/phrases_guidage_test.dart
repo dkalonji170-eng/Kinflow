@@ -11,15 +11,8 @@ void main() {
       SharedPreferences.setMockInitialValues({});
       final phrases = await PhrasesGuidage.charger();
       expect(phrases, PhrasesGuidage.parDefaut());
-      expect(
-        PhrasesGuidage.defautDepart(),
-        'Itinéraire tracé avec succès.',
-      );
-      expect(
-        PhrasesGuidage.defautArrivee(),
-        'Vous êtes arrivé à destination. Merci de nous avoir accordé votre '
-        'attention. À bientôt pour d\'autres aventures.',
-      );
+      expect(PhrasesGuidage.defautDepart(), 'Itinéraire tracé avec succès.');
+      expect(PhrasesGuidage.defautArrivee(), 'Vous êtes arrivé à destination.');
     });
 
     test('la phrase de départ est personnalisable', () async {
@@ -28,10 +21,7 @@ void main() {
         'depart': 'C\'est parti, suivez la route indiquée.',
       });
       final phrases = await PhrasesGuidage.charger();
-      expect(
-        phrases['depart'],
-        'C\'est parti, suivez la route indiquée.',
-      );
+      expect(phrases['depart'], 'C\'est parti, suivez la route indiquée.');
     });
 
     test('sauvegarde puis rechargement d\'une phrase personnalisée', () async {
@@ -40,12 +30,12 @@ void main() {
         'gauche_0': 'Dans 300 mètres, garez-vous à gauche.',
       });
       final phrases = await PhrasesGuidage.charger();
-      expect(
-        phrases['gauche_0'],
-        'Dans 300 mètres, garez-vous à gauche.',
-      );
+      expect(phrases['gauche_0'], 'Dans 300 mètres, garez-vous à gauche.');
       // Les autres phrases restent par défaut.
-      expect(phrases['droite_0'], PhrasesGuidage.defautPour(TypeVirage.droite, 0));
+      expect(
+        phrases['droite_0'],
+        PhrasesGuidage.defautPour(TypeVirage.droite, 0),
+      );
     });
 
     test('les phrases par défaut ne sont pas écrasées en mémoire', () async {
@@ -55,14 +45,15 @@ void main() {
       expect(phrases['arrivee'], 'Bienvenue au bout.');
       expect(
         PhrasesGuidage.parDefaut()['arrivee'],
-        'Vous êtes arrivé à destination. Merci de nous avoir accordé votre '
-        'attention. À bientôt pour d\'autres aventures.',
+        'Vous êtes arrivé à destination.',
       );
     });
 
     test('rétablir les défauts efface les personnalisations', () async {
       SharedPreferences.setMockInitialValues({});
-      await PhrasesGuidage.sauvegarder({'gauche_2': 'Prenez à gauche maintenant.'});
+      await PhrasesGuidage.sauvegarder({
+        'gauche_2': 'Prenez à gauche maintenant.',
+      });
       await PhrasesGuidage.reinitialiser();
       final phrases = await PhrasesGuidage.charger();
       expect(phrases, PhrasesGuidage.parDefaut());
@@ -82,8 +73,32 @@ void main() {
     test('clé de stockage stables pour les 14 phrases éditables', () {
       expect(PhrasesGuidage.editables, hasLength(14));
       for (final p in PhrasesGuidage.editables) {
-        expect(PhrasesGuidage.cleStockage(p.cle), startsWith('phrases_guidage_'));
+        expect(
+          PhrasesGuidage.cleStockage(p.cle),
+          startsWith('phrases_guidage_'),
+        );
       }
+    });
+
+    test(
+      'ancienne phrase d\'arrivée non modifiée : remplacée par la courte',
+      () async {
+        SharedPreferences.setMockInitialValues({
+          'phrases_guidage_arrivee':
+              'Vous êtes arrivé à destination. Merci de nous avoir accordé '
+              'votre attention. À bientôt pour d\'autres aventures.',
+        });
+        final phrases = await PhrasesGuidage.charger();
+        expect(phrases['arrivee'], 'Vous êtes arrivé à destination.');
+      },
+    );
+
+    test('une phrase d\'arrivée personnalisée reste respectée', () async {
+      SharedPreferences.setMockInitialValues({
+        'phrases_guidage_arrivee': 'Bienvenue à la maison.',
+      });
+      final phrases = await PhrasesGuidage.charger();
+      expect(phrases['arrivee'], 'Bienvenue à la maison.');
     });
   });
 }

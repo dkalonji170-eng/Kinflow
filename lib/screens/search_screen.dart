@@ -4,9 +4,19 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../config/carte.dart' show estDansKinshasa;
 import '../models/search_result.dart';
 import '../services/diagnostics_service.dart';
 import '../services/search_service.dart';
+
+/// Ne garde que les lieux réellement situés dans la zone couverte (Kinshasa).
+///
+/// Les géocodeurs renvoient volontiers des résultats du monde entier : l'app
+/// ne référence que la ville, tout le reste est écarté avant l'affichage.
+List<SearchResult> _dansLaVille(List<SearchResult> resultats) => [
+  for (final r in resultats)
+    if (estDansKinshasa(r.latitude, r.longitude)) r,
+];
 
 class SearchScreen extends StatefulWidget {
   /// Appelé quand l'utilisateur demande à poser son domicile directement sur
@@ -19,10 +29,18 @@ class SearchScreen extends StatefulWidget {
   /// passe en mode pose d'une icône mallette.
   final VoidCallback? onDemanderPoserTravail;
 
+  /// Position GPS courante de l'utilisateur (point bleu), servie de référence
+  /// pour classer les résultats du plus proche au plus loin. `null` si le GPS
+  /// n'est pas actif : la recherche se rabat alors sur le centre de Kinshasa.
+  final double? procheLatitude;
+  final double? procheLongitude;
+
   const SearchScreen({
     super.key,
     this.onDemanderPoserMaison,
     this.onDemanderPoserTravail,
+    this.procheLatitude,
+    this.procheLongitude,
   });
 
   @override
@@ -43,6 +61,10 @@ class _SearchScreenState extends State<SearchScreen> {
   List<String> _suggestionsCategories = [];
   List<SearchResult> _resultats = [];
   bool _rechercheEnCours = false;
+
+  /// Vrai quand la saisie a renvoyé des lieux, mais tous en dehors de
+  /// Kinshasa : ils sont écartés et un petit message l'explique en bas.
+  bool _horsZone = false;
 
   /// Lieu de domicile enregistré (clé `lieu_maison`), affiché au-dessus des
   /// recherches récentes. `null` tant que l'utilisateur n'a pas choisi.
@@ -96,7 +118,9 @@ class _SearchScreenState extends State<SearchScreen> {
         );
       }
       setState(() {
-        _recentes = recentes.take(_nombreRecentes).toList();
+        // Les anciennes recherches enregistrées avant le bornage Kinshasa
+        // peuvent pointer ailleurs : on ne garde que la ville.
+        _recentes = _dansLaVille(recentes).take(_nombreRecentes).toList();
       });
     } catch (_) {
       // historique illisible : ignoré
@@ -234,9 +258,11 @@ class _SearchScreenState extends State<SearchScreen> {
     final lieu = await showModalBottomSheet<SearchResult>(
       context: context,
       isScrollControlled: true,
-      builder: (_) => const _ChoixLieuSheet(
+      builder: (_) => _ChoixLieuSheet(
         titre: 'Enregistrer comme maison',
         icone: Icons.home,
+        procheLatitude: widget.procheLatitude,
+        procheLongitude: widget.procheLongitude,
       ),
     );
     if (lieu == null) return;
@@ -261,9 +287,11 @@ class _SearchScreenState extends State<SearchScreen> {
     final lieu = await showModalBottomSheet<SearchResult>(
       context: context,
       isScrollControlled: true,
-      builder: (_) => const _ChoixLieuSheet(
+      builder: (_) => _ChoixLieuSheet(
         titre: 'Enregistrer comme lieu de travail',
         icone: Icons.work,
+        procheLatitude: widget.procheLatitude,
+        procheLongitude: widget.procheLongitude,
       ),
     );
     if (lieu == null) return;
@@ -295,36 +323,53 @@ class _SearchScreenState extends State<SearchScreen> {
       setState(() {
         _resultats = [];
         _rechercheEnCours = false;
+        _horsZone = false;
       });
       return;
     }
 
     // Si le texte collé correspond à des coordonnées géographiques
     // (ex. « -4.321679, 15.311559 »), on propose directement ce point
-    // sans passer par les géocodeurs.
+    // sans passer par les géocodeurs — à condition qu'il soit à Kinshasa.
     final coordonnees = _parserCoordonnees(texte);
     if (coordonnees != null) {
       _rechercheSub?.cancel();
       _rechercheSub = null;
+      final dansLaVille = estDansKinshasa(
+        coordonnees.latitude,
+        coordonnees.longitude,
+      );
       setState(() {
-        _resultats = [coordonnees];
+        _resultats = dansLaVille ? [coordonnees] : [];
+        _horsZone = !dansLaVille;
         _rechercheEnCours = false;
       });
       return;
     }
 
-    setState(() => _rechercheEnCours = true);
+    setState(() {
+      _rechercheEnCours = true;
+      _horsZone = false;
+    });
     // 250 ms : assez court pour que les suggestions « suivent le doigt »,
     // assez long pour ne pas mitrailler les géocodeurs à chaque lettre.
     _debounce = Timer(const Duration(milliseconds: 250), () {
       Journal.i('RECHERCHE', 'Saisie envoyée aux géocodeurs', {'terme': texte});
       _rechercheSub?.cancel();
-      _rechercheSub = _service.rechercherLieu(texte).listen((resultats) {
+      _rechercheSub = _service.rechercherLieu(
+        texte,
+        procheLat: widget.procheLatitude,
+        procheLon: widget.procheLongitude,
+      ).listen((resultats) {
         if (!mounted) return;
         // Résultat périmé : l'utilisateur a modifié la saisie depuis.
         if (_controller.text.trim() != texte) return;
+        final dansLaVille = _dansLaVille(resultats);
         setState(() {
-          _resultats = resultats;
+          _resultats = dansLaVille;
+          // Des lieux ont été trouvés, mais tous hors de Kinshasa : l'app ne
+          // référence que la ville, on le dit explicitement en bas d'écran.
+          _horsZone = resultats.isNotEmpty && dansLaVille.isEmpty;
           // Première liste reçue : on arrête le grand spinner, les lots
           // suivants (Overpass) se fusionnent à l'affichage.
           _rechercheEnCours = false;
@@ -432,7 +477,7 @@ class _SearchScreenState extends State<SearchScreen> {
           autofocus: false,
           textInputAction: TextInputAction.search,
           decoration: InputDecoration(
-            hintText: 'Rechercher un lieu (Kinshasa ou ailleurs)',
+            hintText: 'Rechercher un lieu à Kinshasa',
             border: InputBorder.none,
             prefixIcon: const Icon(Icons.search),
             suffixIcon: saisie.isEmpty
@@ -448,7 +493,14 @@ class _SearchScreenState extends State<SearchScreen> {
           ),
         ),
       ),
-      body: saisie.isEmpty ? _vueRecentes() : _vueSuggestions(couleur),
+      body: Column(
+        children: [
+          Expanded(
+            child: saisie.isEmpty ? _vueRecentes() : _vueSuggestions(couleur),
+          ),
+          if (_horsZone) const _BandeauHorsZone(),
+        ],
+      ),
     );
   }
 
@@ -597,8 +649,8 @@ class _SearchScreenState extends State<SearchScreen> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Cherchez un lieu : Kinshasa est recherchée en priorité,'
-                  '\net toute la planète est couverte si rien n\'y est trouvé.'
+                  'Cherchez un lieu à Kinshasa.'
+                  '\nSeuls les lieux de la ville sont proposés.'
                   '\nVos 5 dernières recherches apparaîtront ici.',
                   textAlign: TextAlign.center,
                   style: TextStyle(
@@ -663,13 +715,15 @@ class _SearchScreenState extends State<SearchScreen> {
           ),
         );
       }
-      if (_resultats.isEmpty && _suggestionsCategories.isEmpty) {
+      if (_resultats.isEmpty &&
+          _suggestionsCategories.isEmpty &&
+          !_horsZone) {
         enfants.add(
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 24),
             child: Center(
               child: Text(
-                'Aucun lieu trouvé.',
+                'Aucun lieu trouvé à Kinshasa.',
                 style: TextStyle(color: couleur.onSurface.withValues(alpha: 0.6)),
               ),
             ),
@@ -689,13 +743,23 @@ class _SearchScreenState extends State<SearchScreen> {
 /// s'adaptent au lieu choisi pour ne pas annoncer « maison » lors de
 /// l'enregistrement du lieu de travail.
 class _ChoixLieuSheet extends StatefulWidget {
-  const _ChoixLieuSheet({required this.titre, required this.icone});
+  const _ChoixLieuSheet({
+    required this.titre,
+    required this.icone,
+    this.procheLatitude,
+    this.procheLongitude,
+  });
 
   /// Libellé d'en-tête, ex. « Enregistrer comme maison ».
   final String titre;
 
   /// Icône d'en-tête, alignée sur le badge du lieu sur la carte.
   final IconData icone;
+
+  /// Référence de proximité (position GPS de l'utilisateur), identique à
+  /// celle de l'écran principal.
+  final double? procheLatitude;
+  final double? procheLongitude;
 
   @override
   State<_ChoixLieuSheet> createState() => _ChoixLieuSheetState();
@@ -711,6 +775,10 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
   List<String> _suggestionsCategories = [];
   List<SearchResult> _resultats = [];
   bool _rechercheEnCours = false;
+
+  /// Vrai quand des lieux ont été trouvés hors de Kinshasa : ils sont
+  /// écartés, un petit message l'explique en bas de la fenêtre.
+  bool _horsZone = false;
 
   @override
   void initState() {
@@ -741,18 +809,28 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
       setState(() {
         _resultats = [];
         _rechercheEnCours = false;
+        _horsZone = false;
       });
       return;
     }
 
-    setState(() => _rechercheEnCours = true);
+    setState(() {
+      _rechercheEnCours = true;
+      _horsZone = false;
+    });
     _debounce = Timer(const Duration(milliseconds: 250), () {
       _rechercheSub?.cancel();
-      _rechercheSub = _service.rechercherLieu(texte).listen((resultats) {
+      _rechercheSub = _service.rechercherLieu(
+        texte,
+        procheLat: widget.procheLatitude,
+        procheLon: widget.procheLongitude,
+      ).listen((resultats) {
         if (!mounted) return;
         if (_controller.text.trim() != texte) return;
+        final dansLaVille = _dansLaVille(resultats);
         setState(() {
-          _resultats = resultats;
+          _resultats = dansLaVille;
+          _horsZone = resultats.isNotEmpty && dansLaVille.isEmpty;
           _rechercheEnCours = false;
         });
       }, onError: (_) {
@@ -800,7 +878,7 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
                 decoration: InputDecoration(
                   isDense: true,
                   prefixIcon: const Icon(Icons.search),
-                  hintText: 'Rechercher un lieu (Kinshasa ou ailleurs)',
+                  hintText: 'Rechercher un lieu à Kinshasa',
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -811,6 +889,7 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
             Expanded(
               child: ListView(children: _enfants(couleur)),
             ),
+            if (_horsZone) const _BandeauHorsZone(),
           ],
         ),
       ),
@@ -872,13 +951,15 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
           ),
         );
       }
-      if (_resultats.isEmpty && _suggestionsCategories.isEmpty) {
+      if (_resultats.isEmpty &&
+          _suggestionsCategories.isEmpty &&
+          !_horsZone) {
         enfants.add(
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 24),
             child: Center(
               child: Text(
-                'Aucun lieu trouvé.',
+                'Aucun lieu trouvé à Kinshasa.',
                 style: TextStyle(color: couleur.onSurface.withValues(alpha: 0.6)),
               ),
             ),
@@ -888,5 +969,44 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
     }
 
     return enfants;
+  }
+}
+
+/// Petit bandeau discret, en bas de l'écran : la recherche a bien trouvé des
+/// lieux, mais aucun dans la zone couverte. L'app ne référence que Kinshasa.
+class _BandeauHorsZone extends StatelessWidget {
+  const _BandeauHorsZone();
+
+  @override
+  Widget build(BuildContext context) {
+    final couleur = Theme.of(context).colorScheme;
+    return Material(
+      color: couleur.surfaceContainerHighest,
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(
+            children: [
+              Icon(
+                Icons.location_off,
+                size: 16,
+                color: couleur.onSurfaceVariant,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Hors de Kinshasa : la recherche est limitée à la ville.',
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: couleur.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

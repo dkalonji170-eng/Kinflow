@@ -96,6 +96,12 @@
         <package android:name="com.snapchat.android"/>
         <package android:name="com.instagram.android"/>
 
+        <!-- Appareil photo : requis par image_picker sur Android 11+ pour
+             prendre une photo depuis la discussion privée. -->
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE"/>
+        </intent>
+
     </queries>
 
 

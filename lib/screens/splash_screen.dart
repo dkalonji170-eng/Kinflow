@@ -26,50 +26,62 @@ class _SplashScreenState extends State<SplashScreen> {
 
     await Future.delayed(const Duration(seconds: 2));
 
-    try {
-      await SupabaseService().ready.timeout(const Duration(seconds: 25));
-    } catch (e) {
-      debugPrint('[KinFlow] Supabase non prêt: $e');
-      Journal.a('DEMARRAGE', 'Serveur non prêt à l\'ouverture', {
-        'erreur': '$e',
-      });
-    }
-
     String? nom;
     bool? modeSombre;
+
+    // 1) Compte déjà lié à cet appareil : on ouvre directement l'accueil,
+    //    instantanément et même hors ligne, sans attendre Supabase. C'est ce
+    //    qui évite de renvoyer un utilisateur connu vers inscription/connexion.
     try {
-      final profile = await SupabaseService().loadProfile().timeout(
-        const Duration(seconds: 10),
-      );
-      nom = profile?['nom'] as String? ?? '';
-      modeSombre = profile?['mode_sombre'] as bool?;
+      final compteLocal = await SupabaseService().lireCompteLieLocal();
+      final nomLocal = (compteLocal['nom'] ?? '').trim();
+      if (nomLocal.isNotEmpty) {
+        nom = nomLocal;
+        final cache = await SupabaseService().chargerProfilCache();
+        modeSombre = cache?['mode_sombre'] as bool?;
+        Journal.i('DEMARRAGE', 'Compte retrouvé depuis le cache local', {
+          'nom': nomLocal,
+        });
+      }
     } catch (e) {
-      debugPrint('[KinFlow] Erreur chargement profil: $e');
-      Journal.a('DEMARRAGE', 'Profil illisible à l\'ouverture', {
-        'erreur': '$e',
-      });
+      debugPrint('[KinFlow] Erreur cache local: $e');
     }
 
-    // Repli local : si Supabase n'a pas pu restaurer la session mais qu'un
-    // compte est déjà lié à cet appareil, on ouvre directement l'accueil.
+    // 2) Aucun compte local : on interroge Supabase (première session
+    //    restaurée par le SDK, ou compte non encore mis en cache).
     if ((nom ?? '').isEmpty) {
       try {
-        final compteLocal = await SupabaseService().lireCompteLieLocal();
-        final nomLocal = compteLocal['nom'] ?? '';
-        if (nomLocal.isNotEmpty) {
-          nom = nomLocal;
-          Journal.i('DEMARRAGE', 'Compte retrouvé depuis cache local', {
-            'nom': nom,
-          });
+        await SupabaseService().ready.timeout(const Duration(seconds: 25));
+      } catch (e) {
+        debugPrint('[KinFlow] Supabase non prêt: $e');
+        Journal.a('DEMARRAGE', 'Serveur non prêt à l\'ouverture', {
+          'erreur': '$e',
+        });
+      }
+
+      try {
+        final profile = await SupabaseService().loadProfile().timeout(
+          const Duration(seconds: 10),
+        );
+        final nomServeur = (profile?['nom'] as String? ?? '').trim();
+        if (nomServeur.isNotEmpty) {
+          nom = nomServeur;
+          modeSombre = profile?['mode_sombre'] as bool?;
         }
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('[KinFlow] Erreur chargement profil: $e');
+        Journal.a('DEMARRAGE', 'Profil illisible à l\'ouverture', {
+          'erreur': '$e',
+        });
+      }
     }
 
+    // 3) Dernier repli : le drapeau « compte lié » posé localement.
     if ((nom ?? '').isEmpty) {
       try {
         if (await SupabaseService().estCompteLie()) {
           final compteLocal = await SupabaseService().lireCompteLieLocal();
-          nom = compteLocal['nom'] ?? '';
+          nom = (compteLocal['nom'] ?? '').trim();
         }
       } catch (_) {}
     }

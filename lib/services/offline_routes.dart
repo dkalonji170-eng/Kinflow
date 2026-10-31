@@ -64,12 +64,16 @@ class OfflineRoutes {
         debugPrint('[KinFlow] Asset $asset absent ou vide — repli réseau.');
         return null;
       }
-      final octets =
-          data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+      final octets = data.buffer.asUint8List(
+        data.offsetInBytes,
+        data.lengthInBytes,
+      );
       final graphe = await compute(GrapheCodec.decoderHorsLigne, octets);
       _graphe = graphe;
-      debugPrint('[KinFlow] Graphe hors-ligne prêt : '
-          '${graphe.nombreSegments} segments.');
+      debugPrint(
+        '[KinFlow] Graphe hors-ligne prêt : '
+        '${graphe.nombreSegments} segments.',
+      );
       return graphe;
     } catch (e) {
       debugPrint('[KinFlow] Chargement du graphe hors-ligne échoué : $e');
@@ -103,10 +107,42 @@ class OfflineRoutes {
     );
     if (graphe == null || !graphe.couvre(limites)) return null;
 
-    final segments = await compute(
-      _decoderSegments,
-      (graphe, limites),
-    );
+    final segments = await compute(_decoderSegments, (graphe, limites));
+    _cacheSegments[cle] = segments;
+    if (_cacheSegments.length > _maxEntreesCache) {
+      _cacheSegments.remove(_cacheSegments.keys.first);
+    }
+    return segments;
+  }
+
+  /// Segments embarqués INTERSECTANT [zone], même si le graphe ne couvre pas
+  /// toute la zone.
+  ///
+  /// Réservé à l'AFFICHAGE de la carte : quand Overpass est saturé, un réseau
+  /// partiel reste infiniment préférable à une carte sans aucune couleur. Le
+  /// calcul d'itinéraire, lui, continue d'utiliser [segmentsPour], qui exige
+  /// une couverture complète pour ne jamais router dans un trou.
+  static Future<List<RoadSegment>> segmentsPourAffichage(
+    LatLngBounds zone,
+  ) async {
+    if (indisponible) return const [];
+
+    final cle = _cleZone(zone);
+    final enCache = _cacheSegments[cle];
+    if (enCache != null) return enCache;
+
+    final graphe = await charger();
+    if (graphe == null) return const [];
+
+    final segments = await compute(_decoderSegments, (
+      graphe,
+      LimitesGraphe(
+        nord: zone.north,
+        sud: zone.south,
+        est: zone.east,
+        ouest: zone.west,
+      ),
+    ));
     _cacheSegments[cle] = segments;
     if (_cacheSegments.length > _maxEntreesCache) {
       _cacheSegments.remove(_cacheSegments.keys.first);

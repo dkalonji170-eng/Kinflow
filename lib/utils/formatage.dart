@@ -13,7 +13,7 @@ String formaterDuree(double secondes) {
   if (minutes < 60) return '$minutes min';
   final heures = minutes ~/ 60;
   final restantes = minutes % 60;
-  return restantes == 0 ? '$heures h' : '$heures h $restantes';
+  return restantes == 0 ? '$heures h' : '$heures h $restantes min';
 }
 
 String formaterHeure(DateTime d) {

@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
+import '../config/carte.dart'
+    show viewboxKinshasa, kinshasaSud, kinshasaOuest, kinshasaNord, kinshasaEst;
 import '../models/search_result.dart';
 import '../models/place_info.dart';
 import 'data_usage_service.dart';
@@ -36,10 +38,11 @@ class _CircuitBreakerRecherche {
       final cooldown = _cooldownBase * _cooldownMultiplier;
       _ouvertJusquau = DateTime.now().add(cooldown);
       _cooldownMultiplier = (_cooldownMultiplier * 2).clamp(1, 8);
-      Journal.a('RECHERCHE',
-          'Disjoncteur Overpass ouvert, pause de ${cooldown.inSeconds} s', {
-        'echecs_consecutifs': _echecsConsecutifs,
-      });
+      Journal.a(
+        'RECHERCHE',
+        'Disjoncteur Overpass ouvert, pause de ${cooldown.inSeconds} s',
+        {'echecs_consecutifs': _echecsConsecutifs},
+      );
     }
   }
 }
@@ -62,35 +65,53 @@ class _TypePoi {
 
 const List<_TypePoi> _typesPoi = [
   _TypePoi(
-    patterns: ['station-service', 'station service', 'essence', 'carburant', 'pétrole', 'petrole'],
-    libelle: 'Station-service',
-    lignes: [
-      'nwr["amenity"="fuel"](area.kin);',
+    patterns: [
+      'station-service',
+      'station service',
+      'essence',
+      'carburant',
+      'pétrole',
+      'petrole',
     ],
+    libelle: 'Station-service',
+    lignes: ['nwr["amenity"="fuel"](area.kin);'],
   ),
   _TypePoi(
     patterns: ['hôpital', 'hopital', 'hospital', 'hpital', 'clinique', 'clin'],
     libelle: 'Hôpital',
-    lignes: [
-      'nwr["amenity"~"hospital|clinic"](area.kin);',
-    ],
+    lignes: ['nwr["amenity"~"hospital|clinic"](area.kin);'],
   ),
   _TypePoi(
     patterns: ['université', 'universite', 'univ'],
     libelle: 'Université',
-    lignes: [
-      'nwr["amenity"~"university|college"](area.kin);',
-    ],
+    lignes: ['nwr["amenity"~"university|college"](area.kin);'],
   ),
   _TypePoi(
-    patterns: ['école', 'ecole', 'scolaire', 'lycée', 'lycee', 'collège', 'college', 'primaire', 'secondaire'],
+    patterns: [
+      'école',
+      'ecole',
+      'scolaire',
+      'lycée',
+      'lycee',
+      'collège',
+      'college',
+      'primaire',
+      'secondaire',
+    ],
     libelle: 'École',
-    lignes: [
-      'nwr["amenity"~"school|kindergarten"](area.kin);',
-    ],
+    lignes: ['nwr["amenity"~"school|kindergarten"](area.kin);'],
   ),
   _TypePoi(
-    patterns: ['marché', 'marche', 'marchés', 'marches', 'supermarché', 'supermache', 'magasin', 'boutique'],
+    patterns: [
+      'marché',
+      'marche',
+      'marchés',
+      'marches',
+      'supermarché',
+      'supermache',
+      'magasin',
+      'boutique',
+    ],
     libelle: 'Marché',
     lignes: [
       'nwr["amenity"="marketplace"](area.kin);',
@@ -100,51 +121,47 @@ const List<_TypePoi> _typesPoi = [
   _TypePoi(
     patterns: ['pharmacie', 'pharma', 'médicament', 'medicament'],
     libelle: 'Pharmacie',
-    lignes: [
-      'nwr["amenity"="pharmacy"](area.kin);',
-    ],
+    lignes: ['nwr["amenity"="pharmacy"](area.kin);'],
   ),
   _TypePoi(
     patterns: ['banque', 'banques', 'cash', 'argent', 'gab'],
     libelle: 'Banque',
-    lignes: [
-      'nwr["amenity"~"bank|atm"](area.kin);',
-    ],
+    lignes: ['nwr["amenity"~"bank|atm"](area.kin);'],
   ),
   _TypePoi(
     patterns: ['police', 'commissariat', 'gendarm', 'secours'],
     libelle: 'Police',
-    lignes: [
-      'nwr["amenity"~"police|fire_station"](area.kin);',
-    ],
+    lignes: ['nwr["amenity"~"police|fire_station"](area.kin);'],
   ),
   _TypePoi(
     patterns: ['restaurant', 'bouffe', 'manger', 'bar'],
     libelle: 'Restaurant',
-    lignes: [
-      'nwr["amenity"~"restaurant|fast_food|bar|pub|cafe"](area.kin);',
-    ],
+    lignes: ['nwr["amenity"~"restaurant|fast_food|bar|pub|cafe"](area.kin);'],
   ),
   _TypePoi(
     patterns: ['hôtel', 'hotel', 'hôtels', 'hotels', 'auberge', 'guest house'],
     libelle: 'Hôtel',
-    lignes: [
-      'nwr["tourism"~"hotel|guest_house|hostel"](area.kin);',
-    ],
+    lignes: ['nwr["tourism"~"hotel|guest_house|hostel"](area.kin);'],
   ),
   _TypePoi(
-    patterns: ['église', 'eglise', 'cathédrale', 'cathedrale', 'mosquée', 'mosquee', 'temple', 'culte', 'chapelle'],
-    libelle: 'Lieu de culte',
-    lignes: [
-      'nwr["amenity"="place_of_worship"](area.kin);',
+    patterns: [
+      'église',
+      'eglise',
+      'cathédrale',
+      'cathedrale',
+      'mosquée',
+      'mosquee',
+      'temple',
+      'culte',
+      'chapelle',
     ],
+    libelle: 'Lieu de culte',
+    lignes: ['nwr["amenity"="place_of_worship"](area.kin);'],
   ),
   _TypePoi(
     patterns: ['stade', 'stadium', 'terrain de sport', 'sport'],
     libelle: 'Stade',
-    lignes: [
-      'nwr["leisure"~"stadium|sports_centre|pitch"](area.kin);',
-    ],
+    lignes: ['nwr["leisure"~"stadium|sports_centre|pitch"](area.kin);'],
   ),
   _TypePoi(
     patterns: ['taxi', 'taxis', 'gare', 'arrêt', 'arret', 'bus', 'transport'],
@@ -157,12 +174,19 @@ const List<_TypePoi> _typesPoi = [
   _TypePoi(
     patterns: ['parc', 'jardin', 'espace vert', 'aire de jeux'],
     libelle: 'Parc',
-    lignes: [
-      'nwr["leisure"~"park|garden|playground"](area.kin);',
-    ],
+    lignes: ['nwr["leisure"~"park|garden|playground"](area.kin);'],
   ),
   _TypePoi(
-    patterns: ['bibliothèque', 'bibliotheque', 'musée', 'musee', 'cinéma', 'cinema', 'théâtre', 'theatre'],
+    patterns: [
+      'bibliothèque',
+      'bibliotheque',
+      'musée',
+      'musee',
+      'cinéma',
+      'cinema',
+      'théâtre',
+      'theatre',
+    ],
     libelle: 'Culture',
     lignes: [
       'nwr["amenity"~"library|theatre|cinema"](area.kin);',
@@ -172,9 +196,7 @@ const List<_TypePoi> _typesPoi = [
   _TypePoi(
     patterns: ['parking', 'stationnement'],
     libelle: 'Parking',
-    lignes: [
-      'nwr["amenity"="parking"](area.kin);',
-    ],
+    lignes: ['nwr["amenity"="parking"](area.kin);'],
   ),
 ];
 
@@ -227,17 +249,19 @@ class SearchService {
 
   /// Boîte englobant toute la ville-province de Kinshasa (communes ouest
   /// jusqu'aux zones rurales de Maluku et N'sele à l'est), au format
-  /// Nominatim viewbox « lon1,lat1,lon2,lat2 ». Mêmes limites que le service
-  /// routier : la recherche couvre toute la province, pas seulement le centre.
-  static const String _zoneKinshasa = '15.00,-3.90,16.45,-5.20';
+  /// Nominatim viewbox « lon1,lat1,lon2,lat2 ». Une seule source de vérité :
+  /// les bornes de `config/carte.dart` (celles qui bornent l'affichage).
+  static const String _zoneKinshasa = viewboxKinshasa;
 
   /// Même boîte au format bbox Overpass « lat1,lon1,lat2,lon2 » : une
   /// contrainte bbox est résolue bien plus vite qu'un area administratif.
-  static const String _bboxOverpass = '(-5.20,15.00,-3.90,16.45)';
+  static const String _bboxOverpass =
+      '($kinshasaSud,$kinshasaOuest,$kinshasaNord,$kinshasaEst)';
 
   /// Même boîte au format bbox Photon « lon1,lat1,lon2,lat2 » (le géocodeur
   /// Photon attend le minimum en premier).
-  static const String _bboxPhoton = '15.00,-5.20,16.45,-3.90';
+  static const String _bboxPhoton =
+      '$kinshasaOuest,$kinshasaSud,$kinshasaEst,$kinshasaNord';
 
   static const int _limiteResultats = 30;
   static const int _tailleMaxCacheRecherches = 40;
@@ -268,18 +292,19 @@ class SearchService {
     for (var tentative = 0; tentative < _maxTentativesOverpass; tentative++) {
       final endpoint = _endpointsOverpass[
           (_indexMiroirOverpass + tentative) % _endpointsOverpass.length];
-      // File d'attente globale Overpass : la recherche ne passe jamais devant
-      // les routes/POIs de la carte quand le serveur souffre.
-      await OverpassGate.attendreCreneau();
       if (_CircuitBreakerRecherche.ouvert) return null;
       try {
-        final reponse = await HttpMeter.post(
-          CategorieData.recherche,
-          endpoint,
-          headers: {'User-Agent': _userAgent},
-          body: {'data': body},
-          encode: true,
-          timeout: timeout,
+        // File d'attente globale Overpass : une seule requête en vol dans
+        // toute l'app, la recherche ne passe jamais devant les routes/POIs.
+        final reponse = await OverpassGate.executer(
+          () => HttpMeter.post(
+            CategorieData.recherche,
+            endpoint,
+            headers: {'User-Agent': _userAgent},
+            body: {'data': body},
+            encode: true,
+            timeout: timeout,
+          ),
         );
 
         if (reponse.statusCode == 200) {
@@ -304,12 +329,15 @@ class SearchService {
         final delai = retryAfter != null && retryAfter > 0
             ? Duration(seconds: retryAfter)
             : _ajouterJitterRecherche(_baseBackoffOverpass * (1 << tentative));
-        Journal.a('RECHERCHE',
-            'Surcharge Overpass, nouvelle tentative dans ${delai.inSeconds} s', {
-          'code_http': reponse.statusCode,
-          'tentative': tentative + 1,
-          'miroir': endpoint,
-        });
+        Journal.a(
+          'RECHERCHE',
+          'Surcharge Overpass, nouvelle tentative dans ${delai.inSeconds} s',
+          {
+            'code_http': reponse.statusCode,
+            'tentative': tentative + 1,
+            'miroir': endpoint,
+          },
+        );
         await Future<void>.delayed(delai);
       } on TimeoutException {
         _CircuitBreakerRecherche.enregistrerEchec();
@@ -318,7 +346,9 @@ class SearchService {
               (_indexMiroirOverpass + 1) % _endpointsOverpass.length;
           rethrow;
         }
-        final delai = _ajouterJitterRecherche(_baseBackoffOverpass * (1 << tentative));
+        final delai = _ajouterJitterRecherche(
+          _baseBackoffOverpass * (1 << tentative),
+        );
         await Future<void>.delayed(delai);
       } on http.ClientException {
         _CircuitBreakerRecherche.enregistrerEchec();
@@ -327,7 +357,9 @@ class SearchService {
               (_indexMiroirOverpass + 1) % _endpointsOverpass.length;
           rethrow;
         }
-        final delai = _ajouterJitterRecherche(_baseBackoffOverpass * (1 << tentative));
+        final delai = _ajouterJitterRecherche(
+          _baseBackoffOverpass * (1 << tentative),
+        );
         await Future<void>.delayed(delai);
       }
     }
@@ -345,132 +377,166 @@ class SearchService {
   /// liste partielle est émise. Le flux se ferme quand toutes les sources ont
   /// répondu (et, si vraiment rien n'a été trouvé, après un ultime repli
   /// Nominatim mondial).
-  Stream<List<SearchResult>> rechercherLieu(String recherche) {
+  Stream<List<SearchResult>> rechercherLieu(
+    String recherche, {
+    double? procheLat,
+    double? procheLon,
+  }) {
     final terme = recherche.trim();
+    // Référence de proximité : la position GPS de l'utilisateur quand elle
+    // est connue, sinon le centre de Kinshasa. Sert à classer du plus proche
+    // au plus loin, en gardant toujours Kinshasa devant le reste du monde.
+    final (double, double) ref = (procheLat != null && procheLon != null)
+        ? (procheLat, procheLon)
+        : _centreKinshasa;
     late final StreamController<List<SearchResult>> controller;
-    controller = StreamController<List<SearchResult>>(onListen: () {
-      if (terme.isEmpty) {
-        controller.close();
-        return;
-      }
+    controller = StreamController<List<SearchResult>>(
+      onListen: () {
+        if (terme.isEmpty) {
+          controller.close();
+          return;
+        }
 
-      final cle = _normaliser(terme);
-      final enCache = _cacheRecherches[cle];
-      if (enCache != null) {
-        Journal.i('RECHERCHE', 'Résultats servis depuis le cache', {
+        final cle = _normaliser(terme);
+        final enCache = _cacheRecherches[cle];
+        if (enCache != null) {
+          Journal.i('RECHERCHE', 'Résultats servis depuis le cache', {
+            'terme': terme,
+            'resultats': enCache.length,
+          });
+          controller.add(_trierParProximite(enCache, ref));
+          controller.close();
+          return;
+        }
+
+        Journal.i('RECHERCHE', 'Recherche lancée (Kinshasa + monde)', {
           'terme': terme,
-          'resultats': enCache.length,
+          'sources':
+              'Photon + Nominatim + Overpass (Kinshasa) + Photon (monde)',
         });
-        controller.add(enCache);
-        controller.close();
-        return;
-      }
 
-      Journal.i('RECHERCHE', 'Recherche lancée (Kinshasa + monde)', {
-        'terme': terme,
-        'sources': 'Photon + Nominatim + Overpass (Kinshasa) + Photon (monde)',
-      });
+        // Kinshasa d'abord, monde ensuite : une destination lointaine est
+        // toujours proposée sans prendre la place des lieux locaux.
+        final locaux = <SearchResult>[];
+        final mondiaux = <SearchResult>[];
 
-      // Kinshasa d'abord, monde ensuite : une destination lointaine est
-      // toujours proposée sans prendre la place des lieux locaux.
-      final locaux = <SearchResult>[];
-      final mondiaux = <SearchResult>[];
-
-      /// Fusionne les deux listes (locaux puis monde), sans doublon de
-      /// coordonnée, en limitant le total.
-      List<SearchResult> fusion() {
-        final vus = <String>{};
-        final out = <SearchResult>[];
-        for (final r in [...locaux, ...mondiaux]) {
-          if (r.nom.trim().isEmpty) continue;
-          final k =
-              '${r.latitude.toStringAsFixed(4)},${r.longitude.toStringAsFixed(4)}';
-          if (!vus.add(k)) continue;
-          out.add(r);
-          if (out.length >= _limiteResultats) break;
-        }
-        return out;
-      }
-
-      void cloreEtCacher() {
-        final resultats = fusion();
-        _cacheRecherches[cle] = resultats;
-        while (_cacheRecherches.length > _tailleMaxCacheRecherches) {
-          _cacheRecherches.remove(_cacheRecherches.keys.first);
-        }
-        if (resultats.isEmpty) {
-          Journal.a('RECHERCHE',
-              'Aucun lieu trouvé, y compris en recherche mondiale');
-        } else {
-          Journal.s('RECHERCHE', 'Recherche terminée', {
-            'resultats_fusionnes': resultats.length,
-          });
-        }
-        controller.close();
-      }
-
-      /// Émet la liste fusionnée courante sans la clore : l'écran montre les
-      /// résultats au fur et à mesure, sans flash « aucun résultat ».
-      void rafraichir() {
-        final liste = fusion();
-        if (liste.isNotEmpty) controller.add(liste);
-      }
-
-      var sourcesEnAttente = 4; // 3 sources localisées + Photon mondial
-      var repliMondialEnCours = false;
-
-      /// Dernier recours : rien trouvé à Kinshasa NI via Photon mondial, on
-      /// tente Nominatim sans bornage avant d'annoncer « aucun lieu trouvé ».
-      void lancerRepliNominatimMondial() {
-        if (controller.isClosed || repliMondialEnCours) return;
-        repliMondialEnCours = true;
-        Journal.a('RECHERCHE',
-            'Aucun résultat (Kinshasa ni Photon monde), repli sur Nominatim mondial');
-        unawaited(_protegerSource('Nominatim mondial',
-                () => _rechercherNominatim(terme, mondial: true)).then((r) {
-          if (controller.isClosed) return;
-          Journal.i('RECHERCHE', 'Source Nominatim mondial terminée', {
-            'resultats': r.length,
-          });
-          mondiaux.addAll(r);
-          rafraichir();
-          cloreEtCacher();
-        }));
-      }
-
-      void sourceTerminee(String source, bool local, List<SearchResult> ajouts) {
-        if (controller.isClosed) return;
-        Journal.i('RECHERCHE', 'Source $source terminée', {
-          'resultats': ajouts.length,
-        });
-        (local ? locaux : mondiaux).addAll(ajouts);
-        sourcesEnAttente--;
-        rafraichir();
-        if (sourcesEnAttente == 0) {
-          if (fusion().isEmpty) {
-            lancerRepliNominatimMondial();
-            return;
+        /// Fusionne les deux listes (locaux puis monde), sans doublon de
+        /// coordonnée, puis classe du plus proche au plus loin (Kinshasa
+        /// toujours devant le reste du monde) avant de limiter le total.
+        List<SearchResult> fusion() {
+          final vus = <String>{};
+          final out = <SearchResult>[];
+          for (final r in [...locaux, ...mondiaux]) {
+            if (r.nom.trim().isEmpty) continue;
+            final k =
+                '${r.latitude.toStringAsFixed(4)},${r.longitude.toStringAsFixed(4)}';
+            if (!vus.add(k)) continue;
+            out.add(r);
           }
-          cloreEtCacher();
+          return _trierParProximite(out, ref).take(_limiteResultats).toList();
         }
-      }
 
-      unawaited(_protegerSource('Photon', () => _rechercherPhoton(terme)).then(
-        (r) => sourceTerminee('Photon', true, r),
-      ));
-      unawaited(_protegerSource('Nominatim', () => _rechercherNominatim(terme))
-          .then(
-        (r) => sourceTerminee('Nominatim', true, r),
-      ));
-      unawaited(_protegerSource('Overpass', () => _rechercherOverpass(terme))
-          .then(
-        (r) => sourceTerminee('Overpass', true, r),
-      ));
-      unawaited(_protegerSource('Photon mondial',
-              () => _rechercherPhoton(terme, mondial: true)).then(
-        (r) => sourceTerminee('Photon mondial', false, r),
-      ));
-    });
+        void cloreEtCacher() {
+          final resultats = fusion();
+          _cacheRecherches[cle] = resultats;
+          while (_cacheRecherches.length > _tailleMaxCacheRecherches) {
+            _cacheRecherches.remove(_cacheRecherches.keys.first);
+          }
+          if (resultats.isEmpty) {
+            Journal.a(
+              'RECHERCHE',
+              'Aucun lieu trouvé, y compris en recherche mondiale',
+            );
+          } else {
+            Journal.s('RECHERCHE', 'Recherche terminée', {
+              'resultats_fusionnes': resultats.length,
+            });
+          }
+          controller.close();
+        }
+
+        /// Émet la liste fusionnée courante sans la clore : l'écran montre les
+        /// résultats au fur et à mesure, sans flash « aucun résultat ».
+        void rafraichir() {
+          final liste = fusion();
+          if (liste.isNotEmpty) controller.add(liste);
+        }
+
+        var sourcesEnAttente = 4; // 3 sources localisées + Photon mondial
+        var repliMondialEnCours = false;
+
+        /// Dernier recours : rien trouvé à Kinshasa NI via Photon mondial, on
+        /// tente Nominatim sans bornage avant d'annoncer « aucun lieu trouvé ».
+        void lancerRepliNominatimMondial() {
+          if (controller.isClosed || repliMondialEnCours) return;
+          repliMondialEnCours = true;
+          Journal.a(
+            'RECHERCHE',
+            'Aucun résultat (Kinshasa ni Photon monde), repli sur Nominatim mondial',
+          );
+          unawaited(
+            _protegerSource(
+              'Nominatim mondial',
+              () => _rechercherNominatim(terme, mondial: true),
+            ).then((r) {
+              if (controller.isClosed) return;
+              Journal.i('RECHERCHE', 'Source Nominatim mondial terminée', {
+                'resultats': r.length,
+              });
+              mondiaux.addAll(r);
+              rafraichir();
+              cloreEtCacher();
+            }),
+          );
+        }
+
+        void sourceTerminee(
+          String source,
+          bool local,
+          List<SearchResult> ajouts,
+        ) {
+          if (controller.isClosed) return;
+          Journal.i('RECHERCHE', 'Source $source terminée', {
+            'resultats': ajouts.length,
+          });
+          (local ? locaux : mondiaux).addAll(ajouts);
+          sourcesEnAttente--;
+          rafraichir();
+          if (sourcesEnAttente == 0) {
+            if (fusion().isEmpty) {
+              lancerRepliNominatimMondial();
+              return;
+            }
+            cloreEtCacher();
+          }
+        }
+
+        unawaited(
+          _protegerSource(
+            'Photon',
+            () => _rechercherPhoton(terme),
+          ).then((r) => sourceTerminee('Photon', true, r)),
+        );
+        unawaited(
+          _protegerSource(
+            'Nominatim',
+            () => _rechercherNominatim(terme),
+          ).then((r) => sourceTerminee('Nominatim', true, r)),
+        );
+        unawaited(
+          _protegerSource(
+            'Overpass',
+            () => _rechercherOverpass(terme),
+          ).then((r) => sourceTerminee('Overpass', true, r)),
+        );
+        unawaited(
+          _protegerSource(
+            'Photon mondial',
+            () => _rechercherPhoton(terme, mondial: true),
+          ).then((r) => sourceTerminee('Photon mondial', false, r)),
+        );
+      },
+    );
     return controller.stream;
   }
 
@@ -540,11 +606,16 @@ class SearchService {
         final lon = (coords[0] as num?)?.toDouble();
         final lat = (coords[1] as num?)?.toDouble();
         if (lat == null || lon == null) continue;
+        final props = (f['properties'] as Map?) ?? const {};
         // Filtre dur : rien hors de Kinshasa n'est accepté (hors repli
         // mondial où tout le globe est autorisé).
         if (!mondial && !_dansZoneKinshasa(lat, lon)) continue;
+        // La bbox de Kinshasa englobe aussi Brazzaville/Kintélé, sur la rive
+        // nord du fleuve (République du Congo). On écarte ces résultats hors
+        // RDC : les lieux de Kinshasa passent toujours en premier, même quand
+        // une faute de frappe fait retomber sur des correspondances proches.
+        if (!mondial && !_estRdc(props)) continue;
 
-        final props = (f['properties'] as Map?) ?? const {};
         final nom = (props['name'] ??
                 props['street'] ??
                 props['district'] ??
@@ -634,9 +705,8 @@ class SearchService {
         final displayName = lieu['display_name']?.toString() ?? '';
         final parties = displayName.split(',').map((p) => p.trim()).toList();
         final nom = parties.isNotEmpty ? parties.first : '';
-        final sousTitre = parties.length > 1
-            ? parties.sublist(1).join(', ').trim()
-            : '';
+        final sousTitre =
+            parties.length > 1 ? parties.sublist(1).join(', ').trim() : '';
 
         resultats.add(
           SearchResult(
@@ -700,7 +770,8 @@ class SearchService {
         resultats.add(
           SearchResult(
             nom: nom.isNotEmpty ? nom : (type?.libelle ?? 'Lieu'),
-            sousTitre: type?.libelle ?? (typeReel.isNotEmpty ? typeReel : 'Lieu à Kinshasa'),
+            sousTitre: type?.libelle ??
+                (typeReel.isNotEmpty ? typeReel : 'Lieu à Kinshasa'),
             latitude: lat,
             longitude: lon,
           ),
@@ -754,11 +825,109 @@ class SearchService {
   bool _dansZoneKinshasa(double lat, double lon) =>
       lat >= -5.20 && lat <= -3.90 && lon >= 15.00 && lon <= 16.45;
 
+  /// Centre de Kinshasa (Gare centrale, Gombe) : référence de proximité
+  /// utilisée quand la position GPS de l'utilisateur n'est pas connue.
+  static const (double, double) _centreKinshasa = (-4.325, 15.322);
+
+  /// Vrai si les propriétés Photon annoncent la République démocratique du
+  /// Congo (code pays `CD`). La bbox de Kinshasa englobe aussi Brazzaville et
+  /// Kintélé, sur la rive nord du fleuve (République du Congo, `CG`) : ces
+  /// lieux sont écartés de la recherche locale, sinon ils apparaissaient
+  /// parmi les résultats de Kinshasa — surtout quand l'utilisateur se trompe
+  /// et que le géocodeur retombe sur des correspondances approximatives.
+  bool _estRdc(Map props) {
+    final code = (props['countrycode'] ?? '').toString().trim().toUpperCase();
+    // Code absent : on garde le résultat (il est déjà dans la bbox).
+    if (code.isEmpty) return true;
+    return code == 'CD';
+  }
+
+  /// Distance en kilomètres entre deux points (formule haversine).
+  double _distanceKm(double latA, double lonA, double latB, double lonB) {
+    const rayon = 6371.0;
+    final dLat = _enRadian(latB - latA);
+    final dLon = _enRadian(lonB - lonA);
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(_enRadian(latA)) *
+            math.cos(_enRadian(latB)) *
+            math.sin(dLon / 2) *
+            math.sin(dLon / 2);
+    return rayon * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+  }
+
+  double _enRadian(double degre) => degre * math.pi / 180;
+
+  /// Classe les résultats du plus proche au plus loin par rapport à [ref]
+  /// (position de l'utilisateur, sinon centre de Kinshasa). Les lieux situés
+  /// dans la zone Kinshasa passent TOUJOURS en premier : un lieu du monde
+  /// entier, même proche du texte recherché, ne passe jamais devant un lieu
+  /// de Kinshasa.
+  List<SearchResult> _trierParProximite(
+    List<SearchResult> resultats,
+    (double, double) ref,
+  ) {
+    final liste = [...resultats];
+    liste.sort((a, b) {
+      final aKin = _dansZoneKinshasa(a.latitude, a.longitude);
+      final bKin = _dansZoneKinshasa(b.latitude, b.longitude);
+      if (aKin != bKin) return aKin ? -1 : 1;
+      final cmp = _distanceKm(
+        ref.$1,
+        ref.$2,
+        a.latitude,
+        a.longitude,
+      ).compareTo(_distanceKm(ref.$1, ref.$2, b.latitude, b.longitude));
+      if (cmp != 0) return cmp;
+      return a.nom.toLowerCase().compareTo(b.nom.toLowerCase());
+    });
+    return liste;
+  }
+
+  /// Distance d'édition (Levenshtein) entre deux chaînes, pour tolérer les
+  /// fautes de frappe dans les catégories de POI.
+  int _distanceLevenshtein(String a, String b) {
+    if (a == b) return 0;
+    final la = a.length;
+    final lb = b.length;
+    if (la == 0) return lb;
+    if (lb == 0) return la;
+    var precedent = List<int>.generate(lb + 1, (i) => i);
+    var courant = List<int>.filled(lb + 1, 0);
+    for (var i = 1; i <= la; i++) {
+      courant[0] = i;
+      for (var j = 1; j <= lb; j++) {
+        final cout = a[i - 1] == b[j - 1] ? 0 : 1;
+        courant[j] = math.min(
+          math.min(courant[j - 1] + 1, precedent[j] + 1),
+          precedent[j - 1] + cout,
+        );
+      }
+      final tmp = precedent;
+      precedent = courant;
+      courant = tmp;
+    }
+    return precedent[lb];
+  }
+
   _TypePoi? _typePour(String terme) {
-    final bas = terme.toLowerCase();
+    final bas = _normaliser(terme);
     for (final type in _typesPoi) {
       for (final pattern in type.patterns) {
-        if (bas.contains(pattern)) return type;
+        if (bas.contains(_normaliser(pattern))) return type;
+      }
+    }
+    // Tolérance aux fautes de frappe : « farmarcie » retrouve la pharmacie,
+    // « broullion » le bureau, etc. On compare chaque mot de la saisie aux
+    // libellés de catégories via la distance d'édition (Levenshtein).
+    final mots = bas.split(RegExp(r'\s+')).where((m) => m.length >= 4).toList();
+    if (mots.isEmpty) return null;
+    for (final type in _typesPoi) {
+      for (final pattern in type.patterns) {
+        final p = _normaliser(pattern);
+        final seuil = p.length >= 8 ? 2 : 1;
+        for (final mot in mots) {
+          if (_distanceLevenshtein(mot, p) <= seuil) return type;
+        }
       }
     }
     return null;
@@ -946,9 +1115,12 @@ out center tags 40;
         if (response.statusCode == 200) {
           final data = json.decode(response.body);
           if (data['error'] == null) {
-            final adresseJSON = (data['address'] as Map<String, dynamic>?) ?? {};
+            final adresseJSON =
+                (data['address'] as Map<String, dynamic>?) ?? {};
             info = PlaceInfo(
-              nom: data['name'] ?? data['display_name']?.toString().split(',').first ?? '',
+              nom: data['name'] ??
+                  data['display_name']?.toString().split(',').first ??
+                  '',
               type: data['type'] ?? '',
               categorie: data['category'] ?? '',
               adresse: data['display_name'] ?? '',
@@ -1086,12 +1258,10 @@ out tags geom;
     for (var i = 0; i < geometry.length - 1; i++) {
       final a = geometry[i] as Map;
       final b = geometry[i + 1] as Map;
-      final ax =
-          ((b['lon'] as num).toDouble() - (a['lon'] as num).toDouble()) *
-              cosLat;
+      final ax = ((b['lon'] as num).toDouble() - (a['lon'] as num).toDouble()) *
+          cosLat;
       final ay = (b['lat'] as num).toDouble() - (a['lat'] as num).toDouble();
-      final bx =
-          (lon - (a['lon'] as num).toDouble()) * cosLat;
+      final bx = (lon - (a['lon'] as num).toDouble()) * cosLat;
       final by = lat - (a['lat'] as num).toDouble();
       final len2 = ax * ax + ay * ay;
       if (len2 <= 0) continue;
@@ -1105,5 +1275,4 @@ out tags geom;
     }
     return minD;
   }
-
 }

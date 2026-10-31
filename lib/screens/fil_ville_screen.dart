@@ -11,9 +11,9 @@ import '../models/information_ville.dart';
 import '../services/diagnostics_service.dart';
 import '../services/supabase_service.dart';
 import '../theme/kinflow_theme.dart';
-import '../utils/autorisation_loc.dart';
-import '../utils/temps_relatif.dart';
 import '../widgets/avatar_animal.dart';
+import '../widgets/logo_kinflow.dart';
+import '../widgets/profil_ami_dialog.dart';
 import '../widgets/social_ui.dart';
 import 'chat_ami_screen.dart';
 import 'scan_qr_ami_screen.dart';
@@ -72,21 +72,27 @@ class _FilVilleScreenState extends State<FilVilleScreen>
 
   /// Filtre actif du fil d'actualité.
   String _filtre = 'tout';
+
   /// Filtre texte de la liste d'amis(es).
   final TextEditingController _rechercheAmis = TextEditingController();
+
   /// Prénom de l'utilisateur, pour le message d'accueil de l'en-tête.
   String _prenom = '';
 
   // --- Amis(es) -------------------------------------------------------------
   List<Map<String, dynamic>> _amis = [];
   List<Map<String, dynamic>> _demandes = [];
+
   /// Messages non lus par ami(e) : ami_id -> nombre.
   Map<String, int> _nonLus = {};
+
   /// Dernier message échangé par ami(e) : ami_id -> {contenu, moi, cree_a}.
   Map<String, Map<String, dynamic>> _apercus = {};
   bool _chargementAmis = true;
+
   /// Mon code AMI public (partageable), distinct du code de compte (secret).
   String _monCodeAmi = '';
+
   /// Vrai dès que la liste a été chargée une première fois : évite de
   /// recharger à chaque aller-retour sur l'onglet.
   bool _amisChargees = false;
@@ -155,9 +161,11 @@ class _FilVilleScreenState extends State<FilVilleScreen>
         for (final info in _informations)
           if (SupabaseService.informationActive(info)) info,
       ];
-      Journal.a('SOCIAL',
-          'Fil vide ou injoignable : ${_informations.length - actives.length} '
-          'info(s) hors fenêtre retirée(s)');
+      Journal.a(
+        'SOCIAL',
+        'Fil vide ou injoignable : ${_informations.length - actives.length} '
+            'info(s) hors fenêtre retirée(s)',
+      );
       setState(() {
         _informations = actives;
         _chargement = false;
@@ -176,8 +184,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   Future<void> _chargerFilCache() async {
     final cache = await SupabaseService().chargerInfosCache();
     if (!mounted || cache.isEmpty) return;
-    Journal.i('SOCIAL', 'Fil affiché depuis le cache local',
-        {'infos': cache.length});
+    Journal.i('SOCIAL', 'Fil affiché depuis le cache local', {
+      'infos': cache.length,
+    });
     setState(() {
       _informations = cache;
       _chargement = false;
@@ -202,13 +211,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     } catch (_) {}
   }
 
-  /// Nombre d'informations nouvelles depuis la dernière visite.
-  int get _nombreNouvelles => _informations.where(_estNouvelle).length;
-
-  /// Total des messages non lus, toutes conversations confondues.
-  int get _totalNonLus =>
-      _nonLus.values.fold<int>(0, (somme, n) => somme + n);
-
   /// Le fil, épinglées d'abord puis du plus récent au plus ancien.
   List<InformationVille> get _filTrie {
     final liste = [..._informations];
@@ -225,16 +227,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     switch (_filtre) {
       case 'neuf':
         return liste.where(_estNouvelle).toList();
-      case 'epingle':
-        return liste.where((i) => i.epinglee).toList();
-      case 'confirme':
-        return liste
-            .where((i) => i.nbVerts > 0 && i.nbVerts >= i.nbRouges)
-            .toList();
-      case 'verifier':
-        return liste
-            .where((i) => i.nbRouges > 0 && i.nbRouges > i.nbVerts)
-            .toList();
       case 'populaire':
         final liste2 = [...liste];
         liste2.sort((a, b) => _scoreInfo(b).compareTo(_scoreInfo(a)));
@@ -257,15 +249,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     if (requete.isEmpty) return _amis;
     return _amis.where((a) {
       return _nomComplet(a).toLowerCase().contains(requete);
-    }).toList();
-  }
-
-  /// Les amis(es) qui partagent actuellement une position (bandeau « Qui est
-  /// où ? »).
-  List<Map<String, dynamic>> get _amisPositionnes {
-    return _amis.where((a) {
-      return _doubleOuNull(a['latitude']) != null &&
-          _doubleOuNull(a['longitude']) != null;
     }).toList();
   }
 
@@ -322,6 +305,10 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     final codeAmi = (resultats[2] as String?) ?? '';
     final nonLus = resultats[3] as Map<String, int>;
     final apercus = resultats[5] as Map<String, Map<String, dynamic>>;
+    // Surnoms locaux : les ami(e)s renommé(e)s gardent leur nom choisi.
+    final surnoms = await service.chargerSurnomsAmis();
+    if (!mounted) return;
+    final amisAffiches = service.appliquerSurnomsAmis(amis, surnoms);
     // Réseau indisponible : on garde la liste déjà affichée (cache local).
     final succes = amis.isNotEmpty || demandes.isNotEmpty || codeAmi.isNotEmpty;
     if (succes) {
@@ -335,7 +322,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     }
     setState(() {
       if (succes || _amis.isEmpty) {
-        _amis = amis;
+        _amis = amisAffiches;
         _demandes = demandes;
         _monCodeAmi = codeAmi;
         _nonLus = nonLus;
@@ -358,19 +345,23 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// Affiche tout de suite la liste d'amis depuis le cache local, avant le
   /// réseau : elle reste visible même sans connexion.
   Future<void> _chargerAmisCache() async {
-    final cache = await SupabaseService().chargerAmisCache();
+    final service = SupabaseService();
+    final cache = await service.chargerAmisCache();
     if (!mounted || cache == null) return;
     final amis = (cache['amis'] as List?) ?? const [];
     final demandes = (cache['demandes'] as List?) ?? const [];
+    final surnoms = await service.chargerSurnomsAmis();
+    if (!mounted) return;
+    final amisAffiches = service.appliquerSurnomsAmis([
+      for (final e in amis)
+        if (e is Map) Map<String, dynamic>.from(e),
+    ], surnoms);
     Journal.i('SOCIAL', 'Amis(es) affichés depuis le cache local', {
       'amis': amis.length,
       'demandes': demandes.length,
     });
     setState(() {
-      _amis = [
-        for (final e in amis)
-          if (e is Map) Map<String, dynamic>.from(e),
-      ];
+      _amis = amisAffiches;
       _demandes = [
         for (final e in demandes)
           if (e is Map) Map<String, dynamic>.from(e),
@@ -396,7 +387,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     });
   }
 
-  /// Menu ⋮ de l'AppBar : toutes les actions d'ajout / de partage d'amis(es).
+  /// Menu ⋮ de l'en-tête Social : ajouter un ami(e) ou afficher mon code ami.
   Widget _menuAmis() {
     final pret = _monCodeAmi.isNotEmpty;
     return PopupMenuButton<String>(
@@ -405,12 +396,8 @@ class _FilVilleScreenState extends State<FilVilleScreen>
       onSelected: (valeur) {
         if (valeur == 'ajouter') {
           _ouvrirAjoutAmi();
-        } else if (valeur == 'qr') {
-          _afficherQrAmi();
-        } else if (valeur == 'copier') {
-          _copierCodeAmi();
-        } else if (valeur == 'envoyer') {
-          _partagerCodeAmi();
+        } else if (valeur == 'code') {
+          _ouvrirMonCodeAmi();
         }
       },
       itemBuilder: (context) => [
@@ -423,43 +410,24 @@ class _FilVilleScreenState extends State<FilVilleScreen>
           ),
         ),
         PopupMenuItem(
-          value: 'qr',
+          value: 'code',
           enabled: pret,
           child: const ListTile(
             contentPadding: EdgeInsets.zero,
             leading: Icon(Icons.qr_code_2),
-            title: Text('Afficher mon QR ami'),
-          ),
-        ),
-        PopupMenuItem(
-          value: 'copier',
-          enabled: pret,
-          child: const ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.copy),
-            title: Text('Copier mon code ami'),
-          ),
-        ),
-        PopupMenuItem(
-          value: 'envoyer',
-          enabled: pret,
-          child: const ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.share),
-            title: Text('Envoyer mon code ami'),
+            title: Text('Mon code d\'ami'),
           ),
         ),
       ],
     );
   }
 
-  /// Vue « Amis(es) » : ma carte ami, les demandes, les positions partagées et
-  /// la liste des amis(es) avec recherche.
+  /// Vue « Amis(es) » : les demandes reçues, puis la liste des amis(es)
+  /// avec recherche.
   Widget _vueAmis() {
     if (_chargementAmis) return _squeletteAmis();
     final theme = Theme.of(context);
     final filtres = _amisFiltres;
-    final positionnes = _amisPositionnes;
     return RefreshIndicator(
       onRefresh: () => _chargerAmis(silencieux: true),
       child: ListView(
@@ -481,44 +449,44 @@ class _FilVilleScreenState extends State<FilVilleScreen>
             ],
             const SizedBox(height: 10),
           ],
-          _carteMonCode(theme),
-          if (_amis.isNotEmpty) ...[
-            const SizedBox(height: 16),
-            _barreRechercheAmis(theme),
-          ],
-          if (positionnes.isNotEmpty) ...[
-            const SizedBox(height: 20),
-            const TitreSection(
-              icone: Icons.location_on,
-              titre: 'Qui est où ?',
-              sousTitre: 'La position partagée par tes amis(es)',
-            ),
-            const SizedBox(height: 10),
-            _bandePositions(theme, positionnes),
-          ],
+          if (_amis.isNotEmpty) ...[_barreRechercheAmis(theme)],
           const SizedBox(height: 20),
           TitreSection(
             icone: Icons.people_alt,
             titre: 'Mes amis(es)',
-            sousTitre: _amis.isEmpty ? null : '${_amis.length} au total',
-            trailing: TextButton.icon(
-              onPressed: _ouvrirAjoutAmi,
-              icon: const Icon(Icons.add, size: 18),
-              label: const Text('Ajouter'),
-            ),
+            trailing: _amis.isEmpty
+                ? null
+                : TextButton.icon(
+                    onPressed: _ouvrirAjoutAmi,
+                    icon: const Icon(Icons.add, size: 18),
+                    label: const Text('Ajouter'),
+                  ),
           ),
           const SizedBox(height: 10),
           if (_amis.isEmpty)
             EspaceVideSocial(
               icone: Icons.group_add_outlined,
-              titre: 'Ta tribu commence ici',
+              titre: 'Pas encore d\'ami(e)',
               message:
-                  'Ajoute tes amis(es) pour échanger, partager ta position et '
-                  'te prévenir en cas de besoin sur la route.',
-              action: FilledButton.icon(
-                onPressed: _ouvrirAjoutAmi,
-                icon: const Icon(Icons.person_add_alt_1),
-                label: const Text('Ajouter un ami(e)'),
+                  'Ajoute une personne avec son code ami pour discuter et '
+                  'suivre sa position sur la carte. Tu peux aussi partager '
+                  'le tien.',
+              action: Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                alignment: WrapAlignment.center,
+                children: [
+                  FilledButton.icon(
+                    onPressed: _ouvrirAjoutAmi,
+                    icon: const Icon(Icons.person_add_alt_1, size: 18),
+                    label: const Text('Ajouter'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _ouvrirMonCodeAmi,
+                    icon: const Icon(Icons.qr_code_2, size: 18),
+                    label: const Text('Mon code'),
+                  ),
+                ],
               ),
             )
           else if (filtres.isEmpty)
@@ -534,114 +502,192 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     );
   }
 
-  /// Carte « Mon code ami » bien visible : on la partage d'un geste.
-  Widget _carteMonCode(ThemeData theme) {
-    final pret = _monCodeAmi.isNotEmpty;
-    return Container(
-      padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
-      decoration: BoxDecoration(
-        gradient: SocialUI.degradeEntete,
-        borderRadius: BorderRadius.circular(SocialUI.rayonCarte),
-        boxShadow: SocialUI.ombreDouce(teinte: KinColors.primaryFonce, opacite: 0.25),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.qr_code_2, color: Colors.white, size: 20),
-              const SizedBox(width: 8),
-              const Text(
-                'Mon code ami',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.w800,
-                  fontSize: 15,
-                ),
-              ),
-              const Spacer(),
-              Icon(Icons.lock_outline,
-                  size: 15, color: Colors.white.withValues(alpha: 0.8)),
-              const SizedBox(width: 4),
-              Text(
-                'Privé',
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.8),
-                  fontSize: 11,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Text(
-            pret ? _formaterCodeAmi(_monCodeAmi) : '••••-••••',
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 30,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 4,
-            ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            'Fais scanner ce code ou partage-le pour qu\'on t\'ajoute.',
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.85),
-              fontSize: 12,
-            ),
-          ),
-          const SizedBox(height: 14),
-          Row(
-            children: [
-              _boutonCode(theme, Icons.qr_code_2, 'Afficher', _afficherQrAmi,
-                  actif: pret),
-              const SizedBox(width: 8),
-              _boutonCode(theme, Icons.copy, 'Copier', _copierCodeAmi,
-                  actif: pret),
-              const SizedBox(width: 8),
-              _boutonCode(theme, Icons.ios_share, 'Partager', _partagerCodeAmi,
-                  actif: pret),
-            ],
-          ),
-        ],
+  /// Ouvre la carte « Mon code ami » (code, QR, partage) dans une fenêtre :
+  /// elle n'apparaît plus dans la liste, seulement via le menu ⋮.
+  Future<void> _ouvrirMonCodeAmi() async {
+    Journal.i('SOCIAL', 'Ouverture de mon code ami');
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 32),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 380),
+          child: _carteMonCode(Theme.of(ctx), ctx),
+        ),
       ),
     );
   }
 
-  Widget _boutonCode(
-    ThemeData theme,
-    IconData icone,
-    String libelle,
-    VoidCallback action, {
-    bool actif = true,
-  }) {
-    return Expanded(
-      child: Opacity(
-        opacity: actif ? 1 : 0.5,
-        child: Material(
-          color: Colors.white.withValues(alpha: 0.18),
-          borderRadius: BorderRadius.circular(12),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(12),
-            onTap: actif ? action : null,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 10),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
+  /// Carte « Mon code ami » : le code, le QR, la copie et le partage.
+  ///
+  /// Présentation en carte blanche (et non en aplat de dégradé) : le code et
+  /// le QR sont les deux choses à lire, ils doivent ressortir sur un fond
+  /// calme. Le QR est visible d'emblée — plus besoin d'ouvrir une seconde
+  /// fenêtre pour l'afficher.
+  Widget _carteMonCode(ThemeData theme, BuildContext dialogContext) {
+    final pret = _monCodeAmi.isNotEmpty;
+    final couleur = theme.colorScheme;
+    return Container(
+      decoration: BoxDecoration(
+        color: couleur.surface,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: couleur.outlineVariant.withValues(alpha: 0.5),
+        ),
+        boxShadow: SocialUI.ombreDouce(teinte: Colors.black, opacite: 0.22),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Material(
+        type: MaterialType.transparency,
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
                 children: [
-                  Icon(icone, color: Colors.white, size: 19),
-                  const SizedBox(height: 3),
-                  Text(
-                    libelle,
-                    style: const TextStyle(
+                  Container(
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      gradient: SocialUI.degradeEntete,
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: const Icon(
+                      Icons.qr_code_2,
                       color: Colors.white,
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w600,
+                      size: 24,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Mon code ami',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        Text(
+                          'Partage-le pour qu\'on t\'ajoute',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: couleur.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Fermer',
+                    icon: const Icon(Icons.close),
+                    onPressed: () => Navigator.of(dialogContext).pop(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              // Le code : encadré teinté, tapotable pour copier.
+              Material(
+                color: KinColors.primary.withValues(alpha: 0.07),
+                borderRadius: BorderRadius.circular(16),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(16),
+                  onTap: pret ? _copierCodeAmi : null,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: KinColors.primary.withValues(alpha: 0.20),
+                      ),
+                    ),
+                    child: Column(
+                      children: [
+                        Text(
+                          pret ? _formaterCodeAmi(_monCodeAmi) : '••••-••••',
+                          style: TextStyle(
+                            fontSize: 28,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 3,
+                            color: pret
+                                ? KinColors.primaryFonce
+                                : couleur.onSurfaceVariant,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          pret ? 'Appuie pour copier' : 'Chargement…',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: couleur.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: couleur.outlineVariant),
+                  ),
+                  child: pret
+                      ? QrImageView(
+                          data: _monCodeAmi,
+                          version: QrVersions.auto,
+                          size: 168,
+                          backgroundColor: Colors.white,
+                        )
+                      : SizedBox(
+                          width: 168,
+                          height: 168,
+                          child: Icon(
+                            Icons.qr_code_2,
+                            size: 64,
+                            color: couleur.onSurfaceVariant.withValues(
+                              alpha: 0.35,
+                            ),
+                          ),
+                        ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Fais scanner ce QR code pour qu\'on t\'ajoute.',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: couleur.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: pret ? _copierCodeAmi : null,
+                      icon: const Icon(Icons.copy_rounded, size: 18),
+                      label: const Text('Copier'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: pret ? _partagerCodeAmi : null,
+                      icon: const Icon(Icons.ios_share, size: 18),
+                      label: const Text('Partager'),
                     ),
                   ),
                 ],
               ),
-            ),
+            ],
           ),
         ),
       ),
@@ -672,103 +718,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     );
   }
 
-  /// Bandeau horizontal « Qui est où ? » : un avatar par ami(e) qui partage sa
-  /// position, avec une pastille verte si la position est récente.
-  Widget _bandePositions(
-    ThemeData theme,
-    List<Map<String, dynamic>> positionnes,
-  ) {
-    return SizedBox(
-      height: 108,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        itemCount: positionnes.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 12),
-        itemBuilder: (context, index) {
-          final ami = positionnes[index];
-          final recent = _positionRecente(ami);
-          return SizedBox(
-            width: 76,
-            child: InkWell(
-              borderRadius: BorderRadius.circular(16),
-              onTap: () => _ouvrirDiscussionAmi(ami),
-              child: Column(
-                children: [
-                  Stack(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(2.5),
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          gradient: recent
-                              ? const LinearGradient(
-                                  colors: [
-                                    KinColors.vertArrivee,
-                                    KinColors.fluideFonce,
-                                  ],
-                                )
-                              : null,
-                          color: recent
-                              ? null
-                              : theme.colorScheme.outlineVariant,
-                        ),
-                        child: AvatarAnimalWidget(
-                          taille: 56,
-                          avatarId: ami['avatar'] as String?,
-                        ),
-                      ),
-                      Positioned(
-                        right: 0,
-                        bottom: 0,
-                        child: PastillePresence(active: recent),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    _prenomDe(ami),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  Text(
-                    _agePositionCourt(ami),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 10.5,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
-    );
-  }
-
-  /// Prénom d'un profil (repli : nom complet, puis libellé générique).
-  static String _prenomDe(Map<String, dynamic> profil) {
-    final prenom = (profil['prenom'] as String? ?? '').trim();
-    if (prenom.isNotEmpty) return prenom;
-    return _nomComplet(profil);
-  }
-
-  /// Âge de la position, très court (« 2 min »).
-  String _agePositionCourt(Map<String, dynamic> ami) {
-    final brut = ami['maj_a'];
-    final majA = brut == null ? null : DateTime.tryParse(brut.toString());
-    if (majA == null) return '';
-    return tempsRelatif(majA.toLocal());
-  }
-
   /// Affiche un code sous la forme `XXXX-XXXX` (8 caractères).
   String _formaterCodeAmi(String code) {
     final propre = code.trim();
@@ -778,61 +727,13 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     return propre;
   }
 
-  /// Boîte de dialogue avec le QR code de mon code ami.
-  Future<void> _afficherQrAmi() async {
-    final code = _monCodeAmi;
-    if (code.isEmpty) return;
-    Journal.i('SOCIAL', 'Affichage du QR code ami');
-    await showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Mon QR ami'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              color: Colors.white,
-              padding: const EdgeInsets.all(12),
-              child: QrImageView(
-                data: code,
-                version: QrVersions.auto,
-                size: 220,
-                backgroundColor: Colors.white,
-              ),
-            ),
-            const SizedBox(height: 12),
-            SelectableText(
-              _formaterCodeAmi(code),
-              style: const TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 2,
-              ),
-            ),
-            const SizedBox(height: 6),
-            const Text(
-              'Fais scanner ce QR code pour qu\'on t\'ajoute.',
-              textAlign: TextAlign.center,
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Fermer'),
-          ),
-        ],
-      ),
-    );
-  }
-
   Future<void> _copierCodeAmi() async {
     await Clipboard.setData(ClipboardData(text: _monCodeAmi));
     Journal.i('SOCIAL', 'Code ami copié');
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Code ami copié.')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Code ami copié.')));
   }
 
   /// Partager mon code ami : l'utilisateur choisit la messagerie
@@ -939,8 +840,8 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     required VoidCallback onTap,
   }) {
     final theme = Theme.of(context);
-    final iconeClaire = ThemeData.estimateBrightnessForColor(couleur) ==
-        Brightness.dark;
+    final iconeClaire =
+        ThemeData.estimateBrightnessForColor(couleur) == Brightness.dark;
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(12),
@@ -997,7 +898,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     if (cle == 'snapchat' || cle == 'instagram') {
       await Clipboard.setData(ClipboardData(text: texte));
       final app = cle == 'snapchat' ? 'Snapchat' : 'Instagram';
-      await _essayerOuvrir(cle == 'snapchat' ? 'snapchat://' : 'instagram://app');
+      await _essayerOuvrir(
+        cle == 'snapchat' ? 'snapchat://' : 'instagram://app',
+      );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Texte copié : colle-le dans $app.')),
@@ -1033,9 +936,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
       'facebook' => 'Facebook',
       _ => 'l\'application',
     };
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Texte copié. Colle-le dans $app.')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Texte copié. Colle-le dans $app.')));
   }
 
   /// Ajout d'un ami(e) : propose de scanner un QR code ou de saisir un code
@@ -1088,8 +991,10 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     );
 
     if (!mounted || choix == null) return;
-    Journal.i('SOCIAL',
-        'Ajout d\'un ami(e) : ${choix == 'scanner' ? 'scan du QR' : 'saisie du code'}');
+    Journal.i(
+      'SOCIAL',
+      'Ajout d\'un ami(e) : ${choix == 'scanner' ? 'scan du QR' : 'saisie du code'}',
+    );
 
     String? code;
     if (choix == 'scanner') {
@@ -1165,7 +1070,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
       'non_connecte' => 'Compte non connecté.',
       _ => 'Envoi impossible. Vérifie ta connexion.',
     };
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
 
     if (resultat == 'envoye' || resultat == 'accepte') {
       await _chargerAmis(silencieux: true);
@@ -1183,9 +1090,18 @@ class _FilVilleScreenState extends State<FilVilleScreen>
       ),
       child: Row(
         children: [
-          AvatarAnimalWidget(
-            taille: 48,
-            avatarId: demande['avatar'] as String?,
+          GestureDetector(
+            onTap: () => ouvrirProfilAmi(
+              context,
+              userId: demande['demandeur'] as String? ?? '',
+              nom: _nomComplet(demande),
+              avatarId: demande['avatar'] as String?,
+            ),
+            child: AvatarAnimalWidget(
+              taille: 48,
+              avatarId: demande['avatar'] as String?,
+              userId: demande['demandeur'] as String?,
+            ),
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -1242,7 +1158,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     Journal.i(
       'SOCIAL',
       'Demande d\'ami ${accepter ? 'acceptée' : 'refusée'}'
-      '${ok ? '' : ' (échec)'}',
+          '${ok ? '' : ' (échec)'}',
       {'ami': _nomComplet(demande)},
     );
     if (!ok) {
@@ -1254,27 +1170,10 @@ class _FilVilleScreenState extends State<FilVilleScreen>
       return;
     }
     await _chargerAmis(silencieux: true);
-    // Nouvelle amitié : je dois, moi aussi, dire si j'autorise la localisation
-    // simple (l'autre personne a été invitée de son côté).
-    if (accepter) {
-      final amiId = demande['demandeur']?.toString() ?? '';
-      if (amiId.isNotEmpty) {
-        await _demanderAutorisationLoc(amiId, _nomComplet(demande));
-      }
-    }
-  }
-
-  /// Pose la question de localisation simple (une seule fois) puis enregistre
-  /// le choix.
-  Future<void> _demanderAutorisationLoc(String amiId, String nom) async {
-    if (await questionLocDejaPosee(amiId)) return;
-    await marquerQuestionLocPosee(amiId);
-    if (!mounted) return;
-    final choix = await demanderAutorisationLocSimple(context, nom);
-    if (choix == null) return;
-    Journal.i('SOCIAL', 'Autorisation de localisation simple enregistrée',
-        {'ami': nom, 'autorise': choix});
-    await SupabaseService().definirAutorisationLocSimple(amiId, choix);
+    // La localisation simple est autorisée par défaut entre amis (voir la
+    // migration SQL) : plus besoin de poser la question à l'acceptation.
+    // Chacun peut retirer son accord via l'interrupteur « Autoriser … à me
+    // localiser » dans la discussion.
   }
 
   Widget _carteAmi(Map<String, dynamic> ami) {
@@ -1284,8 +1183,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     final positionLine = _libellePositionAmi(ami);
     final recent = _positionRecente(ami);
     final sousTitre = apercu.isNotEmpty ? apercu : positionLine;
-    final texteSousTitre =
-        sousTitre.isEmpty ? 'Démarrer la discussion' : sousTitre;
+    final texteSousTitre = sousTitre.isEmpty
+        ? 'Démarrer la discussion'
+        : sousTitre;
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
@@ -1308,9 +1208,18 @@ class _FilVilleScreenState extends State<FilVilleScreen>
               children: [
                 Stack(
                   children: [
-                    AvatarAnimalWidget(
-                      taille: 52,
-                      avatarId: ami['avatar'] as String?,
+                    GestureDetector(
+                      onTap: () => ouvrirProfilAmi(
+                        context,
+                        userId: ami['ami_id'] as String? ?? '',
+                        nom: _nomComplet(ami),
+                        avatarId: ami['avatar'] as String?,
+                      ),
+                      child: AvatarAnimalWidget(
+                        taille: 52,
+                        avatarId: ami['avatar'] as String?,
+                        userId: ami['ami_id'] as String?,
+                      ),
                     ),
                     Positioned(
                       right: 0,
@@ -1340,8 +1249,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
                           fontSize: 13,
-                          fontWeight:
-                              nonLus > 0 ? FontWeight.w600 : FontWeight.w400,
+                          fontWeight: nonLus > 0
+                              ? FontWeight.w600
+                              : FontWeight.w400,
                           color: nonLus > 0
                               ? theme.colorScheme.onSurface
                               : theme.colorScheme.onSurfaceVariant,
@@ -1376,8 +1286,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                   Icon(
                     Icons.chat_bubble_outline,
                     size: 19,
-                    color: theme.colorScheme.onSurfaceVariant
-                        .withValues(alpha: 0.7),
+                    color: theme.colorScheme.onSurfaceVariant.withValues(
+                      alpha: 0.7,
+                    ),
                   ),
               ],
             ),
@@ -1392,7 +1303,15 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   String _apercuMessageAmi(Map<String, dynamic> ami) {
     final apercu = _apercus[ami['ami_id']];
     if (apercu == null) return '';
-    final contenu = (apercu['contenu'] as String? ?? '').trim();
+    final type = apercu['type_message']?.toString() ?? 'texte';
+    final String contenu;
+    if (type == 'image') {
+      contenu = '📷 Photo';
+    } else if (type == 'vocal') {
+      contenu = '🎤 Message vocal';
+    } else {
+      contenu = (apercu['contenu'] as String? ?? '').trim();
+    }
     if (contenu.isEmpty) return '';
     return apercu['moi'] == true ? 'Vous : $contenu' : contenu;
   }
@@ -1423,17 +1342,13 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     if (mounted) await _chargerAmis(silencieux: true);
   }
 
-  /// « Position partagée · il y a 2 min » ou « Position non partagée ».
+  /// « Position partagée » ou « Position non partagée ».
   String _libellePositionAmi(Map<String, dynamic> ami) {
     final latitude = _doubleOuNull(ami['latitude']);
     final longitude = _doubleOuNull(ami['longitude']);
     if (latitude == null || longitude == null) return 'Position non partagée';
-    final brut = ami['maj_a'];
-    final majA = brut == null ? null : DateTime.tryParse(brut.toString());
-    if (majA == null) return 'Position partagée';
-    return 'Position partagée · ${tempsRelatif(majA.toLocal())}';
+    return 'Position partagée';
   }
-
 
   /// Prénom + nom, ou un libellé de repli si le profil est vide.
   static String _nomComplet(Map<String, dynamic> profil) {
@@ -1448,6 +1363,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     if (valeur is num) return valeur.toDouble();
     return double.tryParse(valeur.toString());
   }
+
   /// Vert : pose une réaction VERT, ou l'enlève si déjà posée.
   /// Rouge idem avec ROUGE. Changer de couleur remplace la réaction.
   Future<void> _reagir(InformationVille info, String sens) async {
@@ -1503,16 +1419,13 @@ class _FilVilleScreenState extends State<FilVilleScreen>
           content: Text('Réaction non enregistrée. Vérifie ta connexion.'),
         ),
       );
-      Journal.a('SOCIAL', 'Réaction non enregistrée (réseau)',
-          {'info': info.id});
+      Journal.a('SOCIAL', 'Réaction non enregistrée (réseau)', {
+        'info': info.id,
+      });
     }
   }
 
-  static (int, int) _retirerCompteur(
-    int verts,
-    int rouges,
-    String? reaction,
-  ) {
+  static (int, int) _retirerCompteur(int verts, int rouges, String? reaction) {
     if (reaction == 'VERT') verts = verts > 0 ? verts - 1 : 0;
     if (reaction == 'ROUGE') rouges = rouges > 0 ? rouges - 1 : 0;
     return (verts, rouges);
@@ -1527,7 +1440,11 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// Onglet personnalisé : icône + libellé, et un petit point rouge (pastille
   /// blanche translucide) quand il y a du nouveau. Pensé pour être lisible sur
   /// le fond dégradé de l'en-tête.
-  Widget _onglet({required IconData icone, required String texte, required bool aUnPoint}) {
+  Widget _onglet({
+    required IconData icone,
+    required String texte,
+    required bool aUnPoint,
+  }) {
     return Tab(
       height: 50,
       child: Row(
@@ -1555,8 +1472,8 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     );
   }
 
-  /// En-tête dégradé : salutation personnalisée, actions rapides, statistiques
-  /// vivantes et les deux onglets.
+  /// En-tête dégradé : logo KinFlow, salutation, actions rapides et les deux
+  /// onglets.
   Widget _entete(BuildContext context) {
     final haut = MediaQuery.paddingOf(context).top;
     return Container(
@@ -1584,24 +1501,25 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        _prenom.isEmpty
-                            ? 'KinFlow Social'
-                            : 'Bonjour $_prenom 👋',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 22,
-                          fontWeight: FontWeight.w800,
-                          height: 1.15,
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 5,
                         ),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: const LogoKinflow(hauteur: 24),
                       ),
-                      const SizedBox(height: 3),
+                      const SizedBox(height: 4),
                       Text(
-                        'Ta ville en direct, tes amis(es) à portée de main',
+                        _prenom.isEmpty ? 'Bonjour 👋' : 'Bonjour $_prenom 👋',
                         style: TextStyle(
-                          color: Colors.white.withValues(alpha: 0.88),
+                          color: Colors.white.withValues(alpha: 0.9),
                           fontSize: 12.5,
                           fontWeight: FontWeight.w500,
+                          height: 1.15,
                         ),
                       ),
                     ],
@@ -1616,30 +1534,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
               ],
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(18, 6, 18, 12),
-            child: Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                PastilleStat(
-                  icone: Icons.bolt,
-                  valeur: '$_nombreNouvelles',
-                  libelle: _nombreNouvelles > 1 ? 'nouvelles' : 'nouvelle',
-                ),
-                PastilleStat(
-                  icone: Icons.people_alt,
-                  valeur: '${_amis.length}',
-                  libelle: _amis.length > 1 ? 'amis(es)' : 'ami(e)',
-                ),
-                PastilleStat(
-                  icone: Icons.chat_bubble,
-                  valeur: '$_totalNonLus',
-                  libelle: _totalNonLus > 1 ? 'messages' : 'message',
-                ),
-              ],
-            ),
-          ),
+          const SizedBox(height: 6),
           TabBar(
             controller: _tabController,
             indicatorColor: Colors.white,
@@ -1679,10 +1574,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
           Expanded(
             child: TabBarView(
               controller: _tabController,
-              children: [
-                _vueInformation(),
-                _vueAmis(),
-              ],
+              children: [_vueInformation(), _vueAmis()],
             ),
           ),
         ],
@@ -1705,7 +1597,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                     controller: _defilementInfos,
                     physics: const AlwaysScrollableScrollPhysics(),
                     children: [
-                      SizedBox(height: MediaQuery.sizeOf(context).height * 0.08),
+                      SizedBox(
+                        height: MediaQuery.sizeOf(context).height * 0.08,
+                      ),
                       EspaceVideSocial(
                         icone: _informations.isEmpty
                             ? Icons.campaign_outlined
@@ -1752,10 +1646,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     const filtres = <(String, String, IconData)>[
       ('tout', 'Tout', Icons.apps),
       ('neuf', 'Nouveau', Icons.bolt),
-      ('confirme', 'Confirmé', Icons.verified_outlined),
-      ('verifier', 'À vérifier', Icons.report_gmailerrorred_outlined),
       ('populaire', 'Populaire', Icons.local_fire_department),
-      ('epingle', 'Épinglé', Icons.push_pin),
     ];
     final theme = Theme.of(context);
     return SizedBox(
@@ -1858,7 +1749,11 @@ class _FilVilleScreenState extends State<FilVilleScreen>
         separatorBuilder: (_, _) => const SizedBox(height: 12),
         itemBuilder: (_, _) => Row(
           children: [
-            const BlocSquelette(largeur: 52, hauteur: 52, forme: BoxShape.circle),
+            const BlocSquelette(
+              largeur: 52,
+              hauteur: 52,
+              forme: BoxShape.circle,
+            ),
             const SizedBox(width: 14),
             Expanded(
               child: Column(
@@ -1880,8 +1775,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// la met en évidence et défile jusqu'à elle.
   Future<void> _allerVersInformation(String infoId) async {
     if (!mounted) return;
-    Journal.i('SOCIAL', 'Retour vers une information taguée',
-        {'info': infoId});
+    Journal.i('SOCIAL', 'Retour vers une information taguée', {'info': infoId});
     setState(() => _infoEnEvidence = infoId);
     _tabController.index = 0;
     // Laisse l'onglet et la liste se construire avant de défiler.
@@ -1915,8 +1809,10 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     if (essais > 50 || !_defilementInfos.hasClients) return;
     final pos = _defilementInfos.position;
     if (pos.pixels >= pos.maxScrollExtent) return; // fin atteinte
-    final cible = (pos.pixels + pos.viewportDimension)
-        .clamp(0.0, pos.maxScrollExtent);
+    final cible = (pos.pixels + pos.viewportDimension).clamp(
+      0.0,
+      pos.maxScrollExtent,
+    );
     _defilementInfos.jumpTo(cible);
     WidgetsBinding.instance.addPostFrameCallback(
       (_) => _rechercherInfo(infoId, essais + 1),
@@ -1930,13 +1826,16 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     final carte = AnimatedContainer(
       duration: const Duration(milliseconds: 250),
       decoration: BoxDecoration(
+        // Information mise en évidence au retour d'un tag : cadre BLEU (le
+        // bleu de l'application), et non orange — l'orange reste la couleur
+        // d'accent des actions, pas celle du repère « on t'a tagué ici ».
         color: enEvidence
-            ? KinColors.accent.withValues(alpha: 0.12)
+            ? KinColors.bleu.withValues(alpha: 0.10)
             : theme.colorScheme.surface,
         borderRadius: BorderRadius.circular(SocialUI.rayonCarte),
         border: Border.all(
           color: enEvidence
-              ? KinColors.accent
+              ? KinColors.bleu
               : theme.colorScheme.outlineVariant.withValues(alpha: 0.6),
           width: enEvidence ? 2 : 1,
         ),
@@ -1956,7 +1855,11 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                     gradient: SocialUI.degradeEntete,
                     borderRadius: BorderRadius.circular(14),
                   ),
-                  child: const Icon(Icons.campaign, color: Colors.white, size: 22),
+                  child: const Icon(
+                    Icons.campaign,
+                    color: Colors.white,
+                    size: 22,
+                  ),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -1976,11 +1879,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                             ),
                           ),
                           const SizedBox(width: 4),
-                          Icon(
-                            Icons.verified,
-                            size: 15,
-                            color: KinColors.bleu,
-                          ),
+                          Icon(Icons.verified, size: 15, color: KinColors.bleu),
                         ],
                       ),
                       Text(
@@ -1996,10 +1895,14 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                 if (nouvelle)
                   Container(
                     margin: const EdgeInsets.only(left: 6),
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 4,
+                    ),
                     decoration: BoxDecoration(
-                      gradient: SocialUI.degradeAccent,
+                      // Bleu (et non l'ambre de mise en avant) : « Nouveau »
+                      // est une information de fraîcheur, pas une alerte.
+                      color: KinColors.bleu,
                       borderRadius: BorderRadius.circular(20),
                     ),
                     child: const Text(
@@ -2210,8 +2113,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// Appui long sur une information : proposer de la partager (« taguer un
   /// ami » dans KinFlow, ou sur une autre app).
   Future<void> _proposerEnvoiInfo(InformationVille info) async {
-    Journal.i('SOCIAL', 'Appui long : partage d\'une information proposé',
-        {'info': info.id});
+    Journal.i('SOCIAL', 'Appui long : partage d\'une information proposé', {
+      'info': info.id,
+    });
     final choix = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
@@ -2247,9 +2151,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                     child: Icon(Icons.alternate_email, size: 20),
                   ),
                   title: const Text('Taguer un ami'),
-                  subtitle: const Text(
-                    'Envoyer dans une discussion KinFlow',
-                  ),
+                  subtitle: const Text('Envoyer dans une discussion KinFlow'),
                   onTap: () => Navigator.pop(ctx, 'taguer'),
                 ),
                 const Divider(height: 24),
@@ -2278,7 +2180,11 @@ class _FilVilleScreenState extends State<FilVilleScreen>
       await _choisirAmiATaguer(info);
       return;
     }
-    await _appliquerPartageExterne(choix, _texteInfo(info), url: info.sourceUrl);
+    await _appliquerPartageExterne(
+      choix,
+      _texteInfo(info),
+      url: info.sourceUrl,
+    );
   }
 
   /// Texte partageable d'une information KinFlow (contenu + lien éventuel).
@@ -2329,9 +2235,18 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                   children: [
                     for (final a in _amis)
                       ListTile(
-                        leading: AvatarAnimalWidget(
-                          taille: 44,
-                          avatarId: a['avatar'] as String?,
+                        leading: GestureDetector(
+                          onTap: () => ouvrirProfilAmi(
+                            context,
+                            userId: a['ami_id'] as String? ?? '',
+                            nom: _nomComplet(a),
+                            avatarId: a['avatar'] as String?,
+                          ),
+                          child: AvatarAnimalWidget(
+                            taille: 44,
+                            avatarId: a['avatar'] as String?,
+                            userId: a['ami_id'] as String?,
+                          ),
                         ),
                         title: Text(_nomComplet(a)),
                         subtitle: Text(_libellePositionAmi(a)),
@@ -2373,16 +2288,16 @@ class _FilVilleScreenState extends State<FilVilleScreen>
       final message = switch (resultat) {
         'pas_ami' => 'Vous n\'êtes plus amis(es).',
         'info_introuvable' => 'Information indisponible.',
-        _ => 'Tag impossible. Vérifie ta connexion.',
+        _ => 'Tag impossible pour le moment. Réessaie.',
       };
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
       return;
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Information taguée à $nom.')),
-    );
+    // Comme pour un message envoyé, on ouvre directement la discussion avec
+    // l'ami(e) : le message de tag y apparaît, prêt à être consulté.
+    if (mounted) await _ouvrirDiscussionAmi(ami);
   }
 
   Widget _boutonReaction({
@@ -2420,11 +2335,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
               mainAxisAlignment: MainAxisAlignment.center,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(
-                  icon,
-                  size: 18,
-                  color: actif ? couleurFondee : couleur,
-                ),
+                Icon(icon, size: 18, color: actif ? couleurFondee : couleur),
                 const SizedBox(width: 6),
                 Text(
                   '$compteur',
@@ -2478,8 +2389,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     final affichage = url.length > maxCaracteres
         ? '${url.substring(0, maxCaracteres)}…'
         : url;
-    final tailleBleue =
-        bleuCaracteres < affichage.length ? bleuCaracteres : affichage.length;
+    final tailleBleue = bleuCaracteres < affichage.length
+        ? bleuCaracteres
+        : affichage.length;
     return Material(
       color: Colors.transparent,
       borderRadius: BorderRadius.circular(12),
@@ -2530,7 +2442,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     if (uri == null || !uri.hasScheme) {
       uri = Uri.parse('https://${url.trim()}');
     }
-    Journal.i('SOCIAL', 'Ouverture de l\'article d\'origine', {'url': url.trim()});
+    Journal.i('SOCIAL', 'Ouverture de l\'article d\'origine', {
+      'url': url.trim(),
+    });
     final ouvert = await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!ouvert && mounted) {
       Journal.a('SOCIAL', 'Impossible d\'ouvrir le lien', {'url': url.trim()});
@@ -2576,8 +2490,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     }
     for (final monEmoji in info.mesEmojis) {
       if (!affiches.any((a) => a.$1 == monEmoji)) {
-        final compte =
-            info.emojis.where((x) => x.$1 == monEmoji).map((x) => x.$2);
+        final compte = info.emojis
+            .where((x) => x.$1 == monEmoji)
+            .map((x) => x.$2);
         affiches.add((monEmoji, compte.isEmpty ? 0 : compte.first));
       }
       if (affiches.length >= 5) break;
@@ -2614,9 +2529,8 @@ class _FilVilleScreenState extends State<FilVilleScreen>
         borderRadius: BorderRadius.circular(20),
         // Son propre émoji → la liste réapparaît pour le changer (ou le
         // retirer). Un émoji des autres → on réagit avec, tout simplement.
-        onTap: () => actif
-            ? _ouvrirPaletteEmojis(info)
-            : _reagirEmoji(info, emoji),
+        onTap: () =>
+            actif ? _ouvrirPaletteEmojis(info) : _reagirEmoji(info, emoji),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           decoration: BoxDecoration(
@@ -2691,7 +2605,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  aUnEmoji ? 'Changer (ou retirer) ton émoji' : 'Choisis ton émoji',
+                  aUnEmoji
+                      ? 'Changer (ou retirer) ton émoji'
+                      : 'Choisis ton émoji',
                   style: const TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.w700,
@@ -2706,18 +2622,14 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                       InkWell(
                         borderRadius: BorderRadius.circular(24),
                         onTap: () => Navigator.pop(context, e),
-                        child: Text(
-                          e,
-                          style: const TextStyle(fontSize: 26),
-                        ),
+                        child: Text(e, style: const TextStyle(fontSize: 26)),
                       ),
                   ],
                 ),
                 if (aUnEmoji) ...[
                   const SizedBox(height: 8),
                   TextButton.icon(
-                    onPressed: () =>
-                        Navigator.pop(context, _retirerEmoji),
+                    onPressed: () => Navigator.pop(context, _retirerEmoji),
                     icon: const Icon(Icons.delete_outline, size: 18),
                     label: const Text('Retirer mon émoji'),
                     style: TextButton.styleFrom(
@@ -2748,11 +2660,9 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// précédent, retaper le même le retire.
   Future<void> _reagirEmoji(InformationVille info, String emoji) async {
     final retrait = info.mesEmojis.contains(emoji);
-    Journal.i(
-      'SOCIAL',
-      retrait ? 'Émoji retiré' : 'Émoji posé ($emoji)',
-      {'info': info.id},
-    );
+    Journal.i('SOCIAL', retrait ? 'Émoji retiré' : 'Émoji posé ($emoji)', {
+      'info': info.id,
+    });
     setState(() {
       final index = _informations.indexWhere((i) => i.id == info.id);
       if (index == -1) return;
@@ -2793,8 +2703,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     }
   }
 
-  /// Transforme une date en libellé relatif français (infos < 7j). Pour les
-  /// positions d'amis (plus anciennes), on utilise `tempsRelatif` commun.
+  /// Transforme une date en libellé relatif français (infos < 7j).
   static String _tempsRelatifCourt(DateTime t) {
     final diff = DateTime.now().difference(t);
     if (diff.inSeconds < 60) return "à l'instant";

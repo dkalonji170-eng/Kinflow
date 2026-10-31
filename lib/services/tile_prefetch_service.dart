@@ -5,12 +5,16 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_map_tile_caching/flutter_map_tile_caching.dart';
 import 'package:latlong2/latlong.dart';
 
+import '../config/carte.dart' show CarteConfig;
+
 class TilePrefetchService {
   TilePrefetchService({required String nomMagasin})
       : _magasin = FMTCStore(nomMagasin);
 
-  static const String _urlVoyager =
-      'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+  /// Même fond que la carte affichée (MapTiler ou OSM) : le préchargement
+  /// doit alimenter le cache réellement lu par la carte, sinon il ne sert
+  /// à rien.
+  static String get _urlVoyager => CarteConfig.urlFondClair;
 
   static const Duration _dureeMinEntre = Duration(seconds: 30);
   static const int _maxTuilesParZoom = 200;

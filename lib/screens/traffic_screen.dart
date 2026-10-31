@@ -20,9 +20,12 @@ import '../services/diagnostics_service.dart';
 import '../services/itineraire_service.dart';
 import '../services/location_service.dart';
 import '../widgets/avatar_animal.dart';
+import '../widgets/carte_grade.dart';
+import '../widgets/grade_rang.dart';
 import '../widgets/logo_kinflow.dart';
 import '../services/route_service.dart';
 import '../services/search_service.dart';
+import '../services/serie_activite_service.dart';
 import '../services/supabase_service.dart';
 import '../services/traffic_service.dart';
 import '../services/traffic_stats_service.dart';
@@ -33,6 +36,7 @@ import '../utils/formatage.dart'
     show formaterDistance, formaterDuree, formaterHeure;
 import '../utils/geo.dart'
     show
+        capTrace,
         deltaRotation,
         distanceALignes,
         distanceMetres,
@@ -53,12 +57,22 @@ class TrafficScreen extends StatefulWidget {
   const TrafficScreen({
     super.key,
     this.amiALocaliser,
+    this.arriveeInitiale,
+    this.arriveeNomInitial,
   });
 
   /// Ami(e) à localiser dès l'ouverture (bouton « Localiser » de l'onglet
   /// Amis(es)) : seul cet ami est dessiné sur la carte, et la vue se centre
   /// sur lui. Null en usage normal : aucun ami n'est alors affiché.
   final AmiPosition? amiALocaliser;
+
+  /// Destination d'itinéraire demandée à l'ouverture (ami(e) IA « Kinflow ») :
+  /// dès que la position GPS est connue, un trajet est calculé jusqu'à ce
+  /// point. Null en usage normal.
+  final LatLng? arriveeInitiale;
+
+  /// Nom (affichable) de la destination [arriveeInitiale], si connu.
+  final String? arriveeNomInitial;
 
   @override
   State<TrafficScreen> createState() => _TrafficScreenState();
@@ -147,6 +161,11 @@ class _TrafficScreenState extends State<TrafficScreen>
   /// pas réellement avancé, on ne bouge pas le point bleu d'une fix à l'autre.
   (LatLng, DateTime)? _positionAcceptee;
 
+  /// Précision horizontale (mètres) de la dernière fix ACCEPTÉE. Sert à
+  /// ignorer une mesure nettement moins précise qui ne prouve aucun
+  /// déplacement réel (voir le filtre de précision dans le flux GPS).
+  double? _precisionAccepteeMetres;
+
   /// Horodatage du dernier fix BRUT reçu du flux (même rejeté par le filtre
   /// anti-bruit). Sert de battement de cœur : si le flux se tait trop
   /// longtemps, on le relance (cf. [_surveillerFluxGps]).
@@ -174,6 +193,35 @@ class _TrafficScreenState extends State<TrafficScreen>
   /// plus court que ce seuil alors que la vitesse effective est quasi nulle
   /// est traité comme du bruit de mesure et ignoré.
   static const double _seuilBruitPositionMetres = 5.0;
+
+  /// Ancre du cap déduit du déplacement : la direction n'est recalculée
+  /// qu'après une base de plusieurs mètres, pour que l'angle ne soit pas
+  /// dominé par le bruit de mesure du GPS. La base est ADAPTATIVE : longue
+  /// quand on roule (angle fiable), courte à pied pour ne pas retarder la
+  /// détection des virages (voir [_baseCapPour]).
+  LatLng? _ancreCap;
+
+  /// Base (mètres) du cap déduit du déplacement à vitesse normale.
+  ///
+  /// Ramenée de 8 à 6 m : la carte se redresse plus tôt au début d'un virage.
+  /// Le bruit angulaire est déjà contenu par le filtre circulaire du cap et
+  /// par le contrôleur d'orientation (double seuil), on peut donc raccourcir
+  /// la base sans faire pivoter la carte au hasard.
+  static const double _baseCap = 6.0;
+
+  /// Vitesse (m/s) en dessous de laquelle le GPS natif n'est plus fiable et
+  /// où l'on raccourcit la base du cap déduit : ~7 km/h.
+  static const double _vitesseBasseMs = 2.0;
+
+  /// Vitesse (m/s) minimale pour faire confiance à la course GPS native.
+  /// Abaissée de 2,5 à 2,0 m/s (~7 km/h) : en circulation dense ou à vélo, le
+  /// cap natif reste exploitable et réagit plus vite que le cap déduit.
+  static const double _vitesseCapNatifMs = 2.0;
+
+  /// Distance maximale (mètres) à l'itinéraire pour que sa direction serve
+  /// de cap : au-delà, l'utilisateur est hors tracé et c'est la course GPS
+  /// (ou le déplacement brut) qui reprend la main.
+  static const double _distanceMaxCapItineraire = 35.0;
 
   // ---------------------------------------------------------------------------
   // Amis(es) : positions partagées en direct
@@ -251,22 +299,22 @@ class _TrafficScreenState extends State<TrafficScreen>
   bool _contactDepuisDernierTrace = false;
 
   // ---------------------------------------------------------------------------
-  // Bannière itinéraire : devient un peu transparente quand l'utilisateur ne
-  // la touche pas pendant un moment, et redevient opaque dès qu'un contact
-  // survient (elle n'occulte plus la carte en conduite).
+  // Bannière itinéraire : elle MONTE hors de l'écran (elle disparaît) et
+  // REDESCEND au contact, au lieu de rester au milieu de la carte en
+  // semi-transparence. Chaque appui sur la carte bascule l'état.
   // ---------------------------------------------------------------------------
 
-  /// Délai d'inactivité avant que la bannière ne passe en semi-transparence.
-  static const _dureeAvantFonduBanniere = Duration(seconds: 5);
+  /// Vrai quand la bannière est remontée hors de l'écran : la carte est
+  /// entièrement dégagée. Un appui sur la carte la fait redescendre, un
+  /// nouvel appui la remonte, et ainsi de suite.
+  bool _banniereMasquee = false;
 
-  /// Opacité de la bannière une fois « endormie » : on distingue encore les
-  /// chiffres mais la carte remonte au premier plan.
-  static const double _opaciteBanniereFoncee = 0.7;
+  /// Minuteur qui fait remonter la bannière toute seule au bout de 5 s (le
+  /// même délai que l'auto-zoom) : elle ne squatte pas la carte.
+  Timer? _minuteurBanniere;
 
-  Timer? _minuteurFonduBanniere;
-
-  /// Vrai quand la bannière est en semi-transparence (inactivité prolongée).
-  bool _banniereOpacifiee = false;
+  /// Durée d'affichage d'une bannière redescendue avant qu'elle remonte.
+  static const Duration _dureeAffichageBanniere = Duration(seconds: 5);
 
   // ---------------------------------------------------------------------------
   // Mode navigation : la carte suit la position et pivote selon le cap
@@ -391,6 +439,23 @@ class _TrafficScreenState extends State<TrafficScreen>
   bool _propositionSignalementOuverte = false;
   bool afficherQuestionnaire = false;
 
+  /// Rang du compte (niveau, total de signalements, reste avant le grade
+  /// suivant) : affiché dans le panneau de signalement pour rattacher chaque
+  /// geste au compte et à sa progression.
+  Map<String, dynamic>? _rang;
+
+  /// Série de jours consécutifs de signalement (calculée en local).
+  int _serie = 0;
+  bool _serieChargee = false;
+
+  /// Prénom du compte (cache local) : le panneau de signalement parle à la
+  /// personne, pas à un utilisateur anonyme.
+  String _prenom = '';
+
+  /// Chargement du grade en cours : le premier panneau de signalement attend
+  /// ce futur (au plus 1,5 s) pour afficher la progression dès l'ouverture.
+  Future<void>? _chargementRang;
+
   /// Position préparée pour le prochain signalement : fix GPS one-shot obtenu
   /// sans afficher le point bleu ni démarrer le suivi continu. Évite de
   /// dépendre d'un fix au moment même de l'envoi.
@@ -485,8 +550,12 @@ class _TrafficScreenState extends State<TrafficScreen>
     _chargerAmisCache();
     _chargerAmis();
     SupabaseService().assurerPartagePosition();
-    _minuteurAmis = Timer.periodic(_rafraichissementAmis, (_) => _chargerAmis());
+    _minuteurAmis = Timer.periodic(
+      _rafraichissementAmis,
+      (_) => _chargerAmis(),
+    );
     chargerEtatActuel();
+    _chargementRang = _chargerRang();
     _ecouterTelechargementTuiles();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _activerGpsPourTrafic();
@@ -525,6 +594,44 @@ class _TrafficScreenState extends State<TrafficScreen>
     }
   }
 
+  /// Charge le grade du compte et la série de jours. Silencieux : si le
+  /// serveur ne répond pas, le panneau reste utilisable, simplement sans
+  /// progression affichée.
+  Future<void> _chargerRang() async {
+    Map<String, dynamic>? rang;
+    try {
+      rang = await SupabaseService().monRangSignalements();
+    } catch (_) {}
+    // Ouvrir l'app compte comme une journée d'activité : la progression d'un
+    // compte se gagne en utilisant KinFlow, pas seulement en signalant.
+    await SerieActivite.instance.marquerActivite();
+    final profil = await SupabaseService().chargerProfilCache();
+    if (!mounted) return;
+    setState(() {
+      if (rang != null) _rang = rang;
+      _serie = SerieActivite.instance.serie;
+      _serieChargee = true;
+      _prenom = (profil?['prenom'] as String? ?? '').trim();
+    });
+  }
+
+  /// Carte de progression du compte, ou null tant que le grade est inconnu
+  /// (on préfère ne rien montrer plutôt qu'un grade inventé).
+  Widget? _construireCarteGrade() {
+    final rang = _rang;
+    if (rang == null) return null;
+    final nb = (rang['nb_signalements'] as num?)?.toInt() ?? 0;
+    final niveau = (rang['niveau'] as num?)?.toInt() ?? GradeRang.niveauPour(nb);
+    return CarteGrade(
+      niveau: niveau,
+      nbSignalements: nb,
+      estMax: rang['est_max'] == true,
+      serie: _serie,
+      afficherSerie: _serieChargee,
+      dense: true,
+    );
+  }
+
   /// Ouvre le profil ; à son retour, recharge l'avatar (l'animal a pu
   /// changer dans « Modifier le profil »).
   Future<void> _ouvrirProfil() async {
@@ -541,13 +648,16 @@ class _TrafficScreenState extends State<TrafficScreen>
   Future<void> _chargerAmis() async {
     try {
       final service = SupabaseService();
-      final lignes = await service.mesAmis();
+      final brut = await service.mesAmis();
       // Les messages non lus reçus ont atteint ce téléphone : on les marque
       // « reçus » pour que l'expéditeur voie la double coche.
       unawaited(service.marquerMessagesRecus());
       if (!mounted) return;
       // Hors ligne (liste vide) : on conserve les amis déjà affichés.
-      if (lignes.isEmpty && _amis.isNotEmpty) return;
+      if (brut.isEmpty && _amis.isNotEmpty) return;
+      final surnoms = await service.chargerSurnomsAmis();
+      if (!mounted) return;
+      final lignes = service.appliquerSurnomsAmis(brut, surnoms);
       final amis = <AmiPosition>[
         for (final ligne in lignes) ?AmiPosition.depuisJson(ligne),
       ];
@@ -555,7 +665,7 @@ class _TrafficScreenState extends State<TrafficScreen>
       _centrerSurAmiSiBesoin();
       _suivreAmiSurItineraire();
       // Cache local : les amis restent visibles sans connexion.
-      await service.majCacheAmis(lignes);
+      await service.majCacheAmis(brut);
     } catch (e) {
       debugPrint('[KinFlow] Erreur _chargerAmis: $e');
     }
@@ -564,12 +674,18 @@ class _TrafficScreenState extends State<TrafficScreen>
   /// Affiche tout de suite les amis depuis le cache local, même hors
   /// connexion (positions de la dernière actualisation réussie).
   Future<void> _chargerAmisCache() async {
-    final cache = await SupabaseService().chargerAmisCache();
+    final service = SupabaseService();
+    final cache = await service.chargerAmisCache();
     if (!mounted || cache == null) return;
-    final lignes = (cache['amis'] as List?) ?? const [];
+    final brut = <Map<String, dynamic>>[
+      for (final e in (cache['amis'] as List?) ?? const [])
+        if (e is Map) Map<String, dynamic>.from(e),
+    ];
+    final surnoms = await service.chargerSurnomsAmis();
+    if (!mounted) return;
     final amis = <AmiPosition>[
-      for (final e in lignes)
-        if (e is Map) ?AmiPosition.depuisJson(Map<String, dynamic>.from(e)),
+      for (final ligne in service.appliquerSurnomsAmis(brut, surnoms))
+        ?AmiPosition.depuisJson(ligne),
     ];
     if (amis.isEmpty) return;
     setState(() => _amis = amis);
@@ -704,7 +820,10 @@ class _TrafficScreenState extends State<TrafficScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       if (afficherPositionUtilisateur && positionStream == null) {
-        Journal.i('POSITION', 'Application reprise au premier plan : réabonnement au flux GPS');
+        Journal.i(
+          'POSITION',
+          'Application reprise au premier plan : réabonnement au flux GPS',
+        );
         suivrePosition();
       }
     }
@@ -715,7 +834,7 @@ class _TrafficScreenState extends State<TrafficScreen>
     WidgetsBinding.instance.removeObserver(this);
     _repriseNavTimer?.cancel();
     _minuteurAutoZoom?.cancel();
-    _minuteurFonduBanniere?.cancel();
+    _minuteurBanniere?.cancel();
     _minuteurAmis?.cancel();
     _relanceGpsTimer?.cancel();
     _surveillanceGpsTimer?.cancel();
@@ -788,6 +907,12 @@ class _TrafficScreenState extends State<TrafficScreen>
         'SIGNALEMENT',
         'Proposition de l\'état de route à l\'ouverture de la carte',
       );
+      // Le grade arrive en général avant la feuille ; on l'attend un court
+      // instant pour que la progression soit visible dès le premier panneau.
+      try {
+        await _chargementRang?.timeout(const Duration(milliseconds: 1500));
+      } catch (_) {}
+      if (!mounted) return;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) ouvrirEtatRoutes();
       });
@@ -839,8 +964,64 @@ class _TrafficScreenState extends State<TrafficScreen>
     return _demanderPositionSignalement();
   }
 
+  /// Position à utiliser comme DÉPART d'un itinéraire quand l'utilisateur
+  /// appuie sur « Définir itinéraire » avant que le point bleu n'existe.
+  ///
+  /// On ne refuse plus le tracé : on demande un fix GPS à l'instant (message
+  /// d'attente discret, sablier sur « Ma position »), puis on l'installe comme
+  /// position courante — point bleu affiché et suivi GPS démarré — pour que
+  /// l'itinéraire parte de là où se trouve réellement l'utilisateur. Renvoie
+  /// null si le GPS ne donne rien (l'appelant affiche alors l'erreur).
+  Future<Position?> _positionPourItineraire() async {
+    final vivante = positionActuelle;
+    if (vivante != null) return vivante;
+    if (!mounted) return null;
+
+    Journal.i(
+      'POSITION',
+      'Position inconnue : recherche avant de tracer l\'itinéraire',
+    );
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Text('Recherche de votre position…'),
+        duration: Duration(seconds: 8),
+      ),
+    );
+    setState(() => chargementPosition = true);
+
+    // Fix FRAIS : on ne réutilise pas un fix de signalement mémorisé (il peut
+    // avoir plusieurs minutes). Deux demandes rapprochées partagent en
+    // revanche la même requête en cours.
+    final fix = await _demanderPositionSignalement();
+
+    if (!mounted) return fix;
+    messenger.hideCurrentSnackBar();
+    setState(() => chargementPosition = false);
+    if (fix == null) {
+      Journal.a('POSITION', 'Aucun fix GPS : itinéraire impossible');
+      return null;
+    }
+
+    setState(() {
+      positionActuelle = fix;
+      afficherPositionUtilisateur = true;
+    });
+    _mettreAJourZonePosition(fix);
+    suivrePosition();
+    Journal.s('POSITION', 'Position trouvée pour le départ de l\'itinéraire', {
+      'lat': fix.latitude,
+      'lon': fix.longitude,
+    });
+    return fix;
+  }
+
   /// Ouvre la feuille d'état de route (modal moderne). Une seule feuille à la
   /// fois à l'écran.
+  ///
+  /// Le panneau est **obligatoire** : il ne se ferme que par un choix d'état.
+  /// Le geste retour est bloqué dans la feuille ; si malgré tout elle
+  /// disparaît (rotation, ancien appareil), elle est rouverte.
   Future<void> ouvrirEtatRoutes({String? dernierEtat}) async {
     if (_propositionSignalementOuverte) return;
     _propositionSignalementOuverte = true;
@@ -851,19 +1032,43 @@ class _TrafficScreenState extends State<TrafficScreen>
     // affiché, aucun suivi continu démarré).
     _prechargerPositionSignalement();
 
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      isDismissible: false,
-      enableDrag: false,
-      builder: (contextFeuille) => TrafficStateSheet(
-        dernierEtat: dernierEtat,
-        onChoix: enregistrerSignalement,
-      ),
-    );
-
-    _propositionSignalementOuverte = false;
+    var choixFait = false;
+    var reouvertures = 0;
+    try {
+      while (!choixFait) {
+        if (!mounted) return;
+        await showModalBottomSheet<void>(
+          context: context,
+          isScrollControlled: true,
+          useSafeArea: true,
+          isDismissible: false,
+          enableDrag: false,
+          builder: (contextFeuille) => TrafficStateSheet(
+            dernierEtat: dernierEtat,
+            carteGrade: _construireCarteGrade(),
+            rappelCompte: _prenom.isEmpty
+                ? null
+                : '$_prenom, ton signalement part de ton compte et met la '
+                      'carte à jour pour les autres conducteurs.',
+            onChoix: (etat) {
+              choixFait = true;
+              enregistrerSignalement(etat);
+            },
+          ),
+        );
+        // Filet de sécurité : une feuille fermée sans choix ne doit pas
+        // laisser passer l'utilisateur (3 tentatives max pour éviter une
+        // boucle si la plateforme refuse d'afficher la feuille).
+        if (!choixFait && mounted && reouvertures < 3) {
+          reouvertures++;
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+        } else {
+          break;
+        }
+      }
+    } finally {
+      _propositionSignalementOuverte = false;
+    }
   }
 
   Future<void> enregistrerSignalement(String etat) async {
@@ -871,11 +1076,19 @@ class _TrafficScreenState extends State<TrafficScreen>
       'etat': etat,
     });
 
+    // Niveau connu AVANT l'envoi : il permet de détecter un passage de grade
+    // et de le célébrer au bon moment.
+    final ancienNiveau = (_rang?['niveau'] as num?)?.toInt();
+
     // La feuille se ferme aussitôt le choix fait : le reste (envoi serveur,
     // position) se déroule en arrière-plan sans bloquer la carte.
     if (mounted) Navigator.of(context).pop();
 
     await trafficService.enregistrerEtat(etat);
+
+    // Série de jours d'activité : comptée en local, elle ne dépend pas du
+    // réseau et ne dépend pas du signalement (ouvrir l'app suffit).
+    final serie = await SerieActivite.instance.marquerActivite();
 
     // La position a été préparée dès l'ouverture de la feuille (point bleu
     // vivant, sinon fix one-shot). Si elle manque encore, on en demande une
@@ -924,7 +1137,123 @@ class _TrafficScreenState extends State<TrafficScreen>
     }
 
     if (!mounted) return;
-    setState(() => etatActuel = etat);
+    setState(() {
+      etatActuel = etat;
+      _serie = serie;
+      _serieChargee = true;
+    });
+
+    // Progression personnelle : on rafraîchit le grade tout de suite pour que
+    // le prochain panneau affiche le nouveau palier, puis on annonce le gain.
+    Map<String, dynamic>? rang;
+    try {
+      rang = await SupabaseService().monRangSignalements();
+    } catch (_) {}
+    if (!mounted) return;
+    if (rang != null) setState(() => _rang = rang);
+
+    final niveau = (rang?['niveau'] as num?)?.toInt();
+    _annoncerProgression(
+      niveau: niveau,
+      ancienNiveau: ancienNiveau,
+      serie: serie,
+    );
+  }
+
+  /// Après un signalement : félicite un passage de grade, sinon remercie
+  /// simplement. Aucun compteur, aucun palier, aucun « encore N » : la
+  /// progression se gagne en utilisant l'app, elle ne s'affiche pas.
+  void _annoncerProgression({
+    required int? niveau,
+    required int? ancienNiveau,
+    required int serie,
+  }) {
+    if (!mounted) return;
+
+    if (niveau != null && ancienNiveau != null && niveau > ancienNiveau) {
+      _afficherFranchissement(niveau, serie);
+      return;
+    }
+
+    final message = serie > 1
+        ? 'Merci ! Ton signalement est en ligne · $serie jours d\'activité'
+        : 'Merci ! Ton signalement est en ligne.';
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+  }
+
+  /// Petite carte de félicitations quand un grade est franchi.
+  void _afficherFranchissement(int niveau, int serie) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        final sombre = Theme.of(ctx).brightness == Brightness.dark;
+        final couleur = GradeRang.couleur(niveau);
+        return AlertDialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(22),
+            side: BorderSide(color: couleur.withValues(alpha: 0.5)),
+          ),
+          title: Column(
+            children: [
+              GradeRang(niveau: niveau, taille: 34),
+              const SizedBox(height: 10),
+              Text(
+                'Grade franchi',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                  color: couleur,
+                ),
+              ),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                GradeRang.noms[niveau - 1],
+                style: TextStyle(
+                  fontSize: 17,
+                  fontWeight: FontWeight.w700,
+                  color: sombre
+                      ? KinColors.texteSombre
+                      : KinColors.texteClair,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Ton grade est lié à ton compte : il te suit sur la carte, '
+                'dans tes discussions et pour tes amis(es).'
+                '${serie > 1 ? '\n$serie jours d\'activité d\'affilée.' : ''}',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  height: 1.4,
+                  color: sombre
+                      ? KinColors.texteSecondaireSombre
+                      : KinColors.texteSecondaireClair,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Continuer'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -971,7 +1300,37 @@ class _TrafficScreenState extends State<TrafficScreen>
         premierePosition: aucunMarqueurAvant,
         apres: activerSuiviNavigation,
       );
+      _lancerItineraireInitialSiBesoin();
+    } else if (widget.arriveeInitiale != null && cartePrete) {
+      // Pas de position pour l'instant : on se contente de réessayer quand
+      // positionActuelle sera mise à jour (suivrePosition / obtenirPosition).
+      _lancerItineraireInitialSiBesoin();
     }
+  }
+
+  /// Vrai tant que l'itinéraire demandé à l'ouverture ([arriveeInitiale], ami(e)
+  /// IA « Kinflow ») n'a pas encore été tracé. Remis à false dès le premier
+  /// calcul pour ne pas recalculer à chaque fix GPS.
+  bool _itineraireInitialEnAttente = true;
+
+  /// Trace l'itinéraire demandé à l'ouverture (si aucun n'est déjà affiché),
+  /// depuis la position GPS courante jusqu'à [arriveeInitiale]. Appelé dès que
+  /// la position est connue. No-op en usage normal (aucune destination).
+  void _lancerItineraireInitialSiBesoin() {
+    final arrivee = widget.arriveeInitiale;
+    if (!_itineraireInitialEnAttente || arrivee == null) return;
+    if (positionActuelle == null || _itineraire != null) {
+      return;
+    }
+    _itineraireInitialEnAttente = false;
+    final depart = LatLng(
+      positionActuelle!.latitude,
+      positionActuelle!.longitude,
+    );
+    Journal.i('ITINERAIRE', 'Itinéraire initial demandé par Kinflow', {
+      'destination': widget.arriveeNomInitial ?? 'inconnue',
+    });
+    unawaited(calculerItineraire(depart, arrivee));
   }
 
   /// Démarre le flux GPS continu, met à jour la position et surveille la
@@ -984,7 +1343,10 @@ class _TrafficScreenState extends State<TrafficScreen>
       final dernier = _dernierFixGps;
       if (dernier == null ||
           DateTime.now().difference(dernier) > const Duration(seconds: 60)) {
-        Journal.a('POSITION', 'Aucun fix GPS depuis 60 s : redémarrage du flux');
+        Journal.a(
+          'POSITION',
+          'Aucun fix GPS depuis 60 s : redémarrage du flux',
+        );
         positionStream?.cancel();
         positionStream = null;
         if (!mounted || !afficherPositionUtilisateur) return;
@@ -1032,7 +1394,13 @@ class _TrafficScreenState extends State<TrafficScreen>
         Geolocator.getPositionStream(
           locationSettings: const LocationSettings(
             accuracy: LocationAccuracy.bestForNavigation,
-            distanceFilter: 1,
+            // 0 = TOUTES les mesures disponibles (≈ 1 Hz), sans attendre un
+            // mètre de déplacement. Avec un filtre à 1 m, un déplacement lent
+            // (embouteillage, marche) ne produisait une mesure qu'au bout de
+            // plusieurs secondes : le point bleu restait figé puis sautait.
+            // Les fixes trop bruitées sont écartées plus bas, par le filtre
+            // anti-bruit et le contrôle de précision — pas par le GPS.
+            distanceFilter: 0,
           ),
         ).listen(
           (Position position) {
@@ -1068,12 +1436,37 @@ class _TrafficScreenState extends State<TrafficScreen>
             );
             final vitesseEffectiveMs = dureeSec > 0
                 ? distanceDepuisAcceptee / dureeSec
-                : 0;
-            if (distanceDepuisAcceptee < _seuilBruitPositionMetres &&
+                : 0.0;
+
+            // Précision fine : une fix NETTEMENT moins précise que la
+            // dernière retenue, et dont le déplacement reste dans sa propre
+            // marge d'erreur, n'apporte aucune information sur la position —
+            // l'afficher ne ferait que faire sautiller le point bleu de
+            // quelques mètres (typique en ville, sous les arbres). On attend
+            // une mesure qui prouve réellement l'avancée.
+            final precisionAcceptee = _precisionAccepteeMetres;
+            if (precisionAcceptee != null &&
+                position.accuracy > precisionAcceptee * 1.5 + 3 &&
+                distanceDepuisAcceptee < position.accuracy * 0.6) {
+              return;
+            }
+
+            // Seuil de bruit ADAPTATIF : une valeur fixe de 5 m obligeait le
+            // point bleu à rester immobile pendant plusieurs secondes en
+            // circulation lente, puis à sauter d'un coup de 5 m dès que le
+            // seuil était franchi. On se cale sur la précision annoncée par
+            // le GPS (jamais moins de 2 m), ce qui laisse avancer le point au
+            // rythme réel du déplacement tout en ignorant la dérive à l'arrêt.
+            final seuilBruit = (position.accuracy * 0.5).clamp(
+              2.0,
+              _seuilBruitPositionMetres,
+            );
+            if (distanceDepuisAcceptee < seuilBruit &&
                 vitesseEffectiveMs < _seuilVitesseEffectiveMs) {
               return;
             }
             _positionAcceptee = (pointFix, DateTime.now());
+            _precisionAccepteeMetres = position.accuracy;
 
             setState(() {
               positionActuelle = position;
@@ -1093,11 +1486,39 @@ class _TrafficScreenState extends State<TrafficScreen>
                 }
               }
 
-              // Tout fix ACCEPTÉ ici est un réel déplacement (vitesse effective
-              // ≥ 0,45 m/s) : le cap GPS est alors exploitable pour la règle
-              // d'orientation 10°/5 m, y compris à la marche.
-              if (position.heading >= 0) {
+              // Cap utilisé pour l'orientation de la carte.
+              //
+              // Trois sources, par ordre de préférence, car aucune ne suffit
+              // seule :
+              //  1. la DIRECTION DE L'ITINÉRAIRE quand on suit réellement un
+              //     tracé : c'est la direction « voulue », stable et sans
+              //     bruit, qui ne fait pivoter la carte qu'aux vrais virages ;
+              //  2. la course GPS native (`position.heading`), fiable en
+              //     voiture mais souvent -1 (ou 0) à pied et à faible vitesse
+              //     — la carte ne se redressait alors jamais ;
+              //  3. le cap DÉDUIT DU DÉPLACEMENT, toujours disponible dès
+              //     qu'on avance, mais bruité sur une base courte.
+              final capItineraire = _capItineraire(pointFix);
+              final capNatifFiable =
+                  position.heading >= 0 && position.speed >= _vitesseCapNatifMs;
+              if (capItineraire != null) {
+                capUtilisateur = capItineraire;
+                _ancreCap = pointFix;
+              } else if (capNatifFiable) {
                 capUtilisateur = position.heading;
+                _ancreCap = pointFix;
+              } else {
+                final ancre = _ancreCap;
+                if (ancre == null) {
+                  _ancreCap = pointFix;
+                } else {
+                  final metres = distanceMetresHaversine(ancre, pointFix);
+                  if (metres >=
+                      _baseCapPour(vitesseEffectiveMs, position.accuracy)) {
+                    capUtilisateur = normaliserDegre(capTrace(ancre, pointFix));
+                    _ancreCap = pointFix;
+                  }
+                }
               }
 
               // Les boutons d'action attachés à la position suivent le point bleu.
@@ -1129,7 +1550,10 @@ class _TrafficScreenState extends State<TrafficScreen>
                 _relanceGpsTimer = null;
                 if (!mounted || !afficherPositionUtilisateur) return;
                 if (positionStream != null) return;
-                Journal.i('POSITION', 'Nouvelle tentative de souscription au flux GPS');
+                Journal.i(
+                  'POSITION',
+                  'Nouvelle tentative de souscription au flux GPS',
+                );
                 suivrePosition();
               });
             }
@@ -1251,6 +1675,51 @@ class _TrafficScreenState extends State<TrafficScreen>
     if (_guidageVoixActif) {
       _voixGuidage.raisonner(indexCourant: nouveau, position: p);
     }
+  }
+
+  /// Cap (degrés, 0 = nord) de la portion d'itinéraire que l'utilisateur est
+  /// en train de suivre, ou null s'il n'y a pas d'itinéraire actif ou qu'il
+  /// en est trop éloigné ([_distanceMaxCapItineraire]).
+  ///
+  /// S'aligner sur la ROUTE plutôt que sur la course GPS supprime les
+  /// rotations à contretemps : au milieu d'une épingle ou d'un tracé
+  /// sinueux, la course GPS intègre les micro-écarts et le bruit, tandis que
+  /// la tangente du tracé donne une direction franche et stable, qui ne fait
+  /// pivoter la carte qu'aux vrais sommets. La direction est lissée sur
+  /// quelques points autour de la position projetée pour ne pas réagir à un
+  /// sommet isolé.
+  double? _capItineraire(LatLng position) {
+    final itineraire = _itineraire;
+    if (itineraire == null) return null;
+    final points = itineraire.points;
+    if (points.length < 2) return null;
+    final proj = projeterSurAlignes(position, points);
+    if (proj == null || proj.d > _distanceMaxCapItineraire) return null;
+    final iDebut = (proj.index - 1).clamp(0, points.length - 1);
+    final iFin = (proj.index + 2).clamp(0, points.length - 1);
+    if (iFin <= iDebut) return null;
+    final debut = points[iDebut];
+    final fin = points[iFin];
+    if (debut.latitude == fin.latitude && debut.longitude == fin.longitude) {
+      return null;
+    }
+    return normaliserDegre(capTrace(debut, fin));
+  }
+
+  /// Base (mètres) sur laquelle déduire le cap du déplacement quand ni
+  /// l'itinéraire ni la course GPS native ne sont exploitables.
+  ///
+  /// À pied (~1,4 m/s), une base fixe de 8 m imposait ~6 s avant de détecter
+  /// un virage : la carte se redressait APRÈS le coin, pas dessus. On
+  /// raccourcit donc la base à basse vitesse — sans jamais descendre sous la
+  /// précision annoncée du GPS, sinon le bruit angulaire déclenche des
+  /// rotations fantômes.
+  ///
+  /// Bases ramenées de 4/8 m à 3/6 m et plafond de 12 à 10 m : le cap est
+  /// recalculé plus tôt, la carte réagit donc plus tôt au début du virage.
+  double _baseCapPour(double vitesseMs, double accuracy) {
+    final base = vitesseMs < _vitesseBasseMs ? 3.0 : _baseCap;
+    return (accuracy * 0.75).clamp(base, 10.0).toDouble();
   }
 
   // ---------------------------------------------------------------------------
@@ -1430,42 +1899,46 @@ class _TrafficScreenState extends State<TrafficScreen>
   }
 
   // ---------------------------------------------------------------------------
-  // Bannière itinéraire : semi-transparence après inactivité
+  // Bannière itinéraire : montée / descente au contact
   // ---------------------------------------------------------------------------
 
-  /// Re-arme le compte à rebours qui assombrira la bannière. Appelé dès
-  /// qu'un nouveau tracé est affiché ou que l'utilisateur touche l'écran.
-  void _rearmFonduBanniere() {
-    _minuteurFonduBanniere?.cancel();
-    if (!mounted || _itineraire == null) return;
-    _minuteurFonduBanniere = Timer(_dureeAvantFonduBanniere, _fonduBanniere);
+  /// Fait redescendre la bannière et arme sa remontée automatique : 5 s plus
+  /// tard elle remonte toute seule, comme après l'auto-zoom.
+  void _afficherBanniere() {
+    if (!mounted) return;
+    _minuteurBanniere?.cancel();
+    setState(() => _banniereMasquee = false);
+    _minuteurBanniere = Timer(_dureeAffichageBanniere, () {
+      _minuteurBanniere = null;
+      _masquerBanniere();
+    });
   }
 
-  /// Le délai d'inactivité est écoulé : la bannière passe en
-  /// semi-transparence (elle ne s'efface pas, on peut toujours la lire).
-  void _fonduBanniere() {
-    _minuteurFonduBanniere = null;
-    if (!mounted || _itineraire == null) return;
-    setState(() => _banniereOpacifiee = true);
+  /// Fait monter la bannière hors de l'écran (elle disparaît) et annule la
+  /// remontée automatique en attente.
+  void _masquerBanniere() {
+    _minuteurBanniere?.cancel();
+    _minuteurBanniere = null;
+    if (!mounted || _banniereMasquee) return;
+    setState(() => _banniereMasquee = true);
   }
 
-  /// Redonne à la bannière sa pleine opacité et relance son compte à rebours,
-  /// sans effet si elle était déjà opaque. Branché sur tout contact.
-  void _restaurerBanniere() {
-    _minuteurFonduBanniere?.cancel();
+  /// Annule la remontée automatique en attente (nouvel itinéraire, annulation).
+  void _annulerMinuteurBanniere() {
+    _minuteurBanniere?.cancel();
+    _minuteurBanniere = null;
+  }
+
+  /// Bascule la bannière : visible → elle monte et disparaît ; masquée → elle
+  /// redescend (puis remonte seule après 5 s). Branché sur l'appui sur la
+  /// carte et sur l'appui/le glissement de la bannière elle-même.
+  void _basculerBanniere() {
     if (!mounted || _itineraire == null) return;
-    if (_banniereOpacifiee) {
-      setState(() => _banniereOpacifiee = false);
+    if (_banniereMasquee) {
+      _afficherBanniere();
+    } else {
+      _masquerBanniere();
     }
-    _rearmFonduBanniere();
-  }
-
-  /// Désactive le fondu (annulation, suppression, écran fermé) et ramène la
-  /// bannière opaque pour le prochain tracé.
-  void _desactiverFonduBanniere() {
-    _minuteurFonduBanniere?.cancel();
-    _minuteurFonduBanniere = null;
-    _banniereOpacifiee = false;
   }
 
   /// Zoom automatique UNIQUE (jamais répété) : une fois le tracé vu en entier,
@@ -1474,9 +1947,14 @@ class _TrafficScreenState extends State<TrafficScreen>
   /// première ligne qui part du point bleu pointe vers le haut de l'écran
   /// (les pointillés noirs s'il est hors route, sinon le premier segment
   /// coloré). Aucun suivi continu : l'utilisateur garde la main sur la caméra.
+  ///
+  /// C'est aussi le moment où la bannière d'itinéraire remonte : la carte doit
+  /// être dégagée dès que l'itinéraire est « lancé ».
   void _autoZoomSurPosition() {
     _minuteurAutoZoom = null;
     if (!mounted || _itineraire == null) return;
+    // La bannière remonte en même temps que la carte zoome.
+    _masquerBanniere();
     final position = positionActuelle;
     if (position == null || !cartePrete) return;
     if (_chargementItineraire || _travaillerCarteSuspendu) return;
@@ -1650,6 +2128,11 @@ class _TrafficScreenState extends State<TrafficScreen>
           onDemanderPoserMaison: () => _demanderPoserLieu(TypeLieuPose.maison),
           onDemanderPoserTravail: () =>
               _demanderPoserLieu(TypeLieuPose.travail),
+          // Position de l'utilisateur : sert de référence pour classer les
+          // résultats du plus proche au plus loin (centre de Kinshasa si le
+          // GPS n'est pas encore actif).
+          procheLatitude: positionActuelle?.latitude,
+          procheLongitude: positionActuelle?.longitude,
         ),
       ),
     );
@@ -1723,7 +2206,8 @@ class _TrafficScreenState extends State<TrafficScreen>
     // revient sur la carte avec le tracé déjà affiché). Uniquement quand
     // aucun itinéraire n'est déjà actif : sinon le lieu reste une étape
     // ajoutable via le panneau d'actions, comportement habituel.
-    // Sans position GPS allumée, le message d'activation habituel s'affiche.
+    // Sans position GPS allumée, la position est d'abord recherchée puis le
+    // trajet se trace (voir [demarrerItineraire]).
     if (_estLieuPersonnel(resultat.nom) && _itineraire == null) {
       demarrerItineraire(position);
     }
@@ -1885,12 +2369,18 @@ class _TrafficScreenState extends State<TrafficScreen>
     // Tout nouvel itinéraire part par défaut sans suivi d'ami(e) ; l'appelant
     // repose [_itineraireVersAmiId] après coup s'il s'agit d'un(e) ami(e).
     _itineraireVersAmiId = null;
-    final position = positionActuelle;
+    // La position peut ne pas être encore connue (GPS en cours de fixation,
+    // bouton « Ma position » jamais utilisé) : on la CHERCHE d'abord, puis on
+    // trace l'itinéraire — au lieu de refuser avec un message d'erreur. Le fix
+    // obtenu devient le point bleu et le départ du trajet.
+    final position = await _positionPourItineraire();
+    if (!mounted) return;
     if (position == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            "Activez d'abord votre position pour définir un itinéraire.",
+            'Impossible de trouver votre position. Vérifiez que le GPS est '
+            'activé, puis réessayez.',
           ),
         ),
       );
@@ -1904,8 +2394,7 @@ class _TrafficScreenState extends State<TrafficScreen>
     // cause des sens uniques alors que départ et arrivée sont quasi confondus.
     // Le calcul n'est alors même pas lancé.
     if (_estPointPersonnel(cible) &&
-        distanceMetresHaversine(depart, cible) <
-            _distanceMinItineraireMetres) {
+        distanceMetresHaversine(depart, cible) < _distanceMinItineraireMetres) {
       Journal.a('ITINERAIRE', 'Distance trop courte (lieu personnel)', {
         'distanceMeters': distanceMetresHaversine(depart, cible),
         'minimumMeters': _distanceMinItineraireMetres,
@@ -1968,7 +2457,8 @@ class _TrafficScreenState extends State<TrafficScreen>
   Future<void> calculerItineraire(LatLng depart, LatLng arrivee) async {
     if (_chargementItineraire) return;
     _annulerMinuteurAutoZoom();
-    _desactiverFonduBanniere();
+    _annulerMinuteurBanniere();
+    _banniereMasquee = false;
     final premierItineraire = _itineraire == null;
 
     setState(() {
@@ -2117,10 +2607,10 @@ class _TrafficScreenState extends State<TrafficScreen>
         // minuteur d'auto-zoom de se lancer sur CE nouveau tracé) et la
         // bannière repart opaque avant de pâlir en cas d'inactivité.
         _contactDepuisDernierTrace = false;
-        _banniereOpacifiee = false;
+        _banniereMasquee = false;
+        _annulerMinuteurBanniere();
       }
     });
-    _rearmFonduBanniere();
 
     if (resultat == null) {
       Journal.e('ITINERAIRE', 'Calcul impossible : aucun itinéraire obtenu');
@@ -2301,7 +2791,8 @@ class _TrafficScreenState extends State<TrafficScreen>
     _voixGuidage.arreter();
     _guidageVoixActif = false;
     _annulerMinuteurAutoZoom();
-    _desactiverFonduBanniere();
+    _annulerMinuteurBanniere();
+    _banniereMasquee = false;
     setState(() {
       _generationItineraire++;
       lieuRecherche = _arriveeItineraire;
@@ -2403,9 +2894,9 @@ class _TrafficScreenState extends State<TrafficScreen>
       actionsSurEtape = false;
       afficherActionsPosition = false;
       _contactDepuisDernierTrace = false;
-      _banniereOpacifiee = false;
+      _banniereMasquee = false;
+      _annulerMinuteurBanniere();
     });
-    _rearmFonduBanniere();
     _ajusterVueSurItineraire(suivant.points, apres: _demarrerMinuteurAutoZoom);
   }
 
@@ -2488,9 +2979,18 @@ class _TrafficScreenState extends State<TrafficScreen>
         actionsSurEpingle = false;
         actionsSurPosition = false;
       });
-    } else {
-      afficherInfosLieu(point.latitude, point.longitude);
+      return;
     }
+
+    // Pendant un itinéraire, l'appui sur la carte (hors pin) fait MONTER ou
+    // redescendre la bannière : chaque appui bascule l'état, comme demandé.
+    // On ne superpose pas la fiche du lieu pour ne pas cacher le tracé.
+    if (_itineraire != null) {
+      _basculerBanniere();
+      return;
+    }
+
+    afficherInfosLieu(point.latitude, point.longitude);
   }
 
   LatLng? _pointPresse(LatLng point) {
@@ -2526,7 +3026,9 @@ class _TrafficScreenState extends State<TrafficScreen>
 
   void _onDefinirItineraire() {
     final point = pointActions;
-    if (point == null || _chargementItineraire) return;
+    // Pendant la recherche de la position (itinéraire demandé sans point
+    // bleu), le bouton est neutralisé : on évite une double demande.
+    if (point == null || _chargementItineraire || chargementPosition) return;
     // Le pin de l'ami(e) porte les MÊMES boutons que le point vert :
     // « Ajouter à l'itinéraire » si un trajet est déjà affiché, sinon
     // « Définir itinéraire », qui trace jusqu'à lui/elle.
@@ -2638,12 +3140,6 @@ class _TrafficScreenState extends State<TrafficScreen>
             ),
           ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Quitter'),
-          ),
-        ],
       ),
     );
   }
@@ -2652,7 +3148,8 @@ class _TrafficScreenState extends State<TrafficScreen>
     var recalculerSansEtape = false;
     final etapeSelectionnee = actionsSurEtape ? pointActions : null;
     _annulerMinuteurAutoZoom();
-    _desactiverFonduBanniere();
+    _annulerMinuteurBanniere();
+    _banniereMasquee = false;
     if (actionsSurPosition || actionsSurDestination) {
       _voixGuidage.arreter();
       _guidageVoixActif = false;
@@ -2806,18 +3303,6 @@ class _TrafficScreenState extends State<TrafficScreen>
                   ),
                 ),
               ),
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: Text(
-                  "Fermer",
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: sombre
-                        ? KinColors.texteSecondaireSombre
-                        : KinColors.texteSecondaireClair,
-                  ),
-                ),
-              ),
             ],
           ),
         ],
@@ -2951,6 +3436,7 @@ class _TrafficScreenState extends State<TrafficScreen>
               icon: AvatarAnimalWidget(
                 taille: 34,
                 avatarId: _avatar.isEmpty ? null : _avatar,
+                userId: SupabaseService().userId,
               ),
               tooltip: 'Profil',
             ),
@@ -3011,6 +3497,7 @@ class _TrafficScreenState extends State<TrafficScreen>
                     _ajusterVueSurItineraire(points, apres: apres);
                   }
                   _centrerSurAmiSiBesoin();
+                  _lancerItineraireInitialSiBesoin();
                 },
                 epingle: epingle,
                 onPoserEpingle: (point) =>
@@ -3058,7 +3545,8 @@ class _TrafficScreenState extends State<TrafficScreen>
                     ? "Ajouter à l'itinéraire"
                     : 'Définir itinéraire',
                 onDefinirItineraire: _onDefinirItineraire,
-                desactiverItineraire: _chargementItineraire,
+                desactiverItineraire:
+                    _chargementItineraire || chargementPosition,
                 onSupprimer: _onSupprimer,
                 onVoirDetails: actionsSurPosition
                     ? _voirDetailsPosition
@@ -3087,7 +3575,11 @@ class _TrafficScreenState extends State<TrafficScreen>
           clipBehavior: Clip.hardEdge,
           child: _panneauRetraissi
               ? const SizedBox.shrink()
-              : TrafficPanel(
+              : GestureDetector(
+                  // Le panneau se replie aussi au balayage : vers le bas il
+                  // descend, vers le haut il remonte.
+                  onVerticalDragEnd: _glisserPanneau,
+                  child: TrafficPanel(
                   chargementPosition: chargementPosition,
                   onPosition: obtenirPosition,
                   onRecherche: ouvrirRecherche,
@@ -3104,24 +3596,20 @@ class _TrafficScreenState extends State<TrafficScreen>
                     );
                   },
                 ),
+                ),
         ),
       ],
     );
   }
 
-  /// Poignée horizontale centrée : glisser vers le haut déplie, vers le bas replie.
+  /// Poignée horizontale centrée : glisser vers le haut déplie, vers le bas
+  /// replie — et un simple appui bascule (replié ↔ déplié), comme demandé.
   Widget _construirePoigneePanneau() {
     final sombre = Theme.of(context).brightness == Brightness.dark;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onVerticalDragEnd: (details) {
-        final vitesse = details.primaryVelocity ?? 0;
-        if (vitesse < 0 && _panneauRetraissi) {
-          setState(() => _panneauRetraissi = false);
-        } else if (vitesse > 0 && !_panneauRetraissi) {
-          setState(() => _panneauRetraissi = true);
-        }
-      },
+      onTap: _basculerPanneau,
+      onVerticalDragEnd: _glisserPanneau,
       child: Container(
         height: 20,
         width: double.infinity,
@@ -3137,6 +3625,23 @@ class _TrafficScreenState extends State<TrafficScreen>
         ),
       ),
     );
+  }
+
+  /// Glissement vertical sur la poignée ou sur le panneau : vers le bas il se
+  /// replie, vers le haut il se déploie.
+  void _glisserPanneau(DragEndDetails details) {
+    final vitesse = details.primaryVelocity ?? 0;
+    if (vitesse < -120 && _panneauRetraissi) {
+      setState(() => _panneauRetraissi = false);
+    } else if (vitesse > 120 && !_panneauRetraissi) {
+      setState(() => _panneauRetraissi = true);
+    }
+  }
+
+  /// Appui sur la poignée : bascule le panneau, exactement comme le balayage.
+  void _basculerPanneau() {
+    HapticFeedback.selectionClick();
+    setState(() => _panneauRetraissi = !_panneauRetraissi);
   }
 
   /// Barre de progression affichée pendant un téléchargement de cartes.
@@ -3232,7 +3737,11 @@ class _TrafficScreenState extends State<TrafficScreen>
 
   /// Bannière du trajet en cours : « Itinéraire tracé », heure d'arrivée
   /// estimée (distance · durée) et pastille discrète quand une étape est
-  /// ajoutée au parcours. Apparition douce (fondu + glissement).
+  /// ajoutée au parcours.
+  ///
+  /// Tous les textes sont lisibles en entier (aucune troncature « … ») et la
+  /// bannière ne reste pas au milieu de la carte : un appui sur la carte la
+  /// fait MONTER hors de l'écran, l'appui suivant la fait REDESCENDRE.
   ///
   /// Distance, durée et heure d'arrivée restent figées entre deux paliers et
   /// se recalculent seulement à chaque 1/5 du trajet (20 %, 40 %, 60 %,
@@ -3256,27 +3765,43 @@ class _TrafficScreenState extends State<TrafficScreen>
       top: 8,
       left: 12,
       right: 12,
-      child: GestureDetector(
-        onTap: _restaurerBanniere,
-        child: Center(
-          child: TweenAnimationBuilder<double>(
-            tween: Tween(begin: 0.0, end: 1.0),
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeOutCubic,
-            builder: (context, t, child) => Opacity(
-              opacity: t,
-              child: Transform.translate(
-                offset: Offset(0, -10 * (1 - t)),
-                child: child,
+      child: IgnorePointer(
+        // Masquée, la bannière ne capte plus aucun appui : la carte reste
+        // entièrement manipulable.
+        ignoring: _banniereMasquee,
+        child: AnimatedSlide(
+          // La bannière MONTE hors de l'écran (elle disparaît) et redescend
+          // au contact suivant : plus de semi-transparence au milieu de la
+          // carte, qui cachait l'itinéraire.
+          offset: _banniereMasquee ? const Offset(0, -1.4) : Offset.zero,
+          duration: const Duration(milliseconds: 320),
+          curve: Curves.easeInOutCubic,
+          child: Center(
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(begin: 0.0, end: 1.0),
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeOutCubic,
+              builder: (context, t, child) => Opacity(
+                opacity: t,
+                child: Transform.translate(
+                  offset: Offset(0, -10 * (1 - t)),
+                  child: child,
+                ),
               ),
-            ),
-            child: AnimatedOpacity(
-              // Semi-transparente après une inactivité, pleine opacité dès que
-              // l'utilisateur touche l'écran : la carte ressort en conduite.
-              opacity: _banniereOpacifiee ? _opaciteBanniereFoncee : 1.0,
-              duration: const Duration(milliseconds: 500),
-              curve: Curves.easeOut,
-              child: Material(
+              child: GestureDetector(
+                // La bannière se replie comme le panneau du bas : un appui la
+                // fait monter, un nouvel appui la fait redescendre ; un
+                // glissement vers le haut ou vers le bas fait la même chose.
+                onTap: _basculerBanniere,
+                onVerticalDragEnd: (details) {
+                  final vitesse = details.primaryVelocity ?? 0;
+                  if (vitesse < -120) {
+                    _masquerBanniere();
+                  } else if (vitesse > 120) {
+                    _afficherBanniere();
+                  }
+                },
+                child: Material(
                 color: sombre ? KinColors.surfaceSombre : Colors.white,
                 elevation: 4,
                 shadowColor: Colors.black.withValues(alpha: 0.28),
@@ -3309,31 +3834,35 @@ class _TrafficScreenState extends State<TrafficScreen>
                         ),
                       ),
                       const SizedBox(width: 12),
-                      // Flexible : la bannière reste dans l'écran (le détail
-                      // distance/durée se coupe en « … » si besoin) au lieu de
-                      // déborder à droite sur petit écran.
+                      // Flexible : la bannière reste dans l'écran. Les textes
+                      // s'écrivent en ENTIER (ils passent à la ligne) : plus
+                      // aucune information coupée en « … ».
                       Flexible(
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Row(
-                              mainAxisSize: MainAxisSize.min,
+                            // Titre et pastille d'étapes : un Wrap, pour que
+                            // rien ne soit jamais tronqué (la pastille passe
+                            // sous le titre sur écran étroit).
+                            Wrap(
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              spacing: 8,
+                              runSpacing: 4,
                               children: [
-                                Flexible(
-                                  child: Text(
-                                    'Itinéraire tracé',
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.w700,
-                                      color: couleurTitre,
-                                    ),
+                                Text(
+                                  'Itinéraire tracé',
+                                  // Aucune troncature : le titre s'écrit en
+                                  // entier et passe à la ligne si l'écran
+                                  // est étroit.
+                                  softWrap: true,
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w700,
+                                    color: couleurTitre,
                                   ),
                                 ),
-                                if (avecEtape) ...[
-                                  const SizedBox(width: 8),
+                                if (avecEtape)
                                   Container(
                                     padding: const EdgeInsets.symmetric(
                                       horizontal: 7,
@@ -3368,47 +3897,48 @@ class _TrafficScreenState extends State<TrafficScreen>
                                       ],
                                     ),
                                   ),
-                                ],
                               ],
                             ),
                             const SizedBox(height: 3),
-                            Row(
-                              mainAxisSize: MainAxisSize.min,
+                            // Ligne « arrivée · distance · durée » : un Wrap
+                            // pour que chaque information passe à la ligne au
+                            // lieu d'être coupée par des points de suspension.
+                            Wrap(
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              spacing: 6,
+                              runSpacing: 2,
                               children: [
-                                const Icon(
-                                  Icons.schedule,
-                                  size: 13,
-                                  color: KinColors.accent,
-                                ),
-                                const SizedBox(width: 4),
-                                Flexible(
-                                  child: Text(
-                                    'Arrivée à ${formaterHeure(arrivee)}',
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w700,
-                                      color: couleurArrivee,
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(
+                                      Icons.schedule,
+                                      size: 13,
+                                      color: KinColors.accent,
                                     ),
-                                  ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      'Arrivée à ${formaterHeure(arrivee)}',
+                                      softWrap: true,
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w700,
+                                        color: couleurArrivee,
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                                const SizedBox(width: 6),
                                 Text(
                                   '·',
                                   style: TextStyle(color: couleurSecondaire),
                                 ),
-                                const SizedBox(width: 6),
-                                Flexible(
-                                  child: Text(
-                                    '${formaterDistance(_banniereDistanceRestante)} · '
-                                    '${formaterDuree(_banniereDureeRestante)}',
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: couleurSecondaire,
-                                    ),
+                                Text(
+                                  '${formaterDistance(_banniereDistanceRestante)} · '
+                                  '${formaterDuree(_banniereDureeRestante)}',
+                                  softWrap: true,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: couleurSecondaire,
                                   ),
                                 ),
                               ],
@@ -3451,8 +3981,9 @@ class _TrafficScreenState extends State<TrafficScreen>
                                             _departItineraireQuitte
                                                 ? 'Recalculer'
                                                 : 'Changer d\'itinéraire',
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
+                                            // Pas de troncature : le libellé
+                                            // s'écrit en entier.
+                                            softWrap: true,
                                             style: TextStyle(
                                               fontSize: 11.5,
                                               fontWeight: FontWeight.w700,
@@ -3512,6 +4043,7 @@ class _TrafficScreenState extends State<TrafficScreen>
                     ],
                   ),
                 ),
+              ),
               ),
             ),
           ),

@@ -102,8 +102,8 @@ List<Poi> parserPois(dynamic json) {
             tags['shop'] ??
             tags['tourism'] ??
             tags['leisure'] ??
-            tags['office']
-        ).toString();
+            tags['office'])
+        .toString();
     if (type.isEmpty) continue;
 
     final nom = (tags['name'] ?? '').toString();
@@ -117,9 +117,7 @@ List<Poi> parserPois(dynamic json) {
     if (liste.length < maxPoisParType) liste.add(poi);
   }
 
-  final limites = <Poi>[
-    for (final liste in parType.values) ...liste,
-  ];
+  final limites = <Poi>[for (final liste in parType.values) ...liste];
 
   limites.sort((a, b) {
     final aNom = a.nom.isEmpty ? 1 : 0;
@@ -311,24 +309,23 @@ out center tags;
     for (var tentative = 0; tentative < maxTentatives; tentative++) {
       final endpoint = endpointsPoisOverpass[
           (_indexMiroirPois + tentative) % endpointsPoisOverpass.length];
-      // File d'attente globale : les POIs partent en série avec les routes
-      // et la recherche, jamais en rafale.
-      await OverpassGate.attendreCreneau();
       if (CircuitBreakerPois.ouvert) {
         throw Exception('Overpass POI: disjoncteur ouvert pendant la boucle');
       }
       try {
-        final reponse = await http
-            .post(
-              Uri.parse(endpoint),
-              headers: {'User-Agent': 'KinFlow-App/1.0 (projet kinflow)'},
-              body: {'data': query},
-            )
-            .timeout(const Duration(seconds: 25));
+        // File d'attente globale : une seule requête en vol dans toute l'app,
+        // les POIs partent en série avec les routes et la recherche.
+        final reponse = await OverpassGate.executer(
+          () => http.post(
+            Uri.parse(endpoint),
+            headers: {'User-Agent': 'KinFlow-App/1.0 (projet kinflow)'},
+            body: {'data': query},
+          ).timeout(const Duration(seconds: 25)),
+        );
 
         if (reponse.statusCode == 200) {
-          _indexMiroirPois = (_indexMiroirPois + tentative + 1) %
-              endpointsPoisOverpass.length;
+          _indexMiroirPois =
+              (_indexMiroirPois + tentative + 1) % endpointsPoisOverpass.length;
           CircuitBreakerPois.enregistrerSucces();
           return compute(parserPois, json.decode(reponse.body));
         }
@@ -340,25 +337,29 @@ out center tags;
         }
 
         CircuitBreakerPois.enregistrerEchec();
-        final retryAfter =
-            int.tryParse(reponse.headers['retry-after'] ?? '');
+        final retryAfter = int.tryParse(reponse.headers['retry-after'] ?? '');
         final delai = retryAfter != null && retryAfter > 0
             ? Duration(seconds: retryAfter)
             : _jitterPois(baseBackoff * (1 << tentative));
-        Journal.a('CARTE', 'Surcharge Overpass POI, nouvelle tentative dans ${delai.inSeconds} s', {
-          'code_http': reponse.statusCode,
-          'tentative': tentative + 1,
-          'miroir': endpoint,
-        });
+        Journal.a(
+          'CARTE',
+          'Surcharge Overpass POI, nouvelle tentative dans ${delai.inSeconds} s',
+          {
+            'code_http': reponse.statusCode,
+            'tentative': tentative + 1,
+            'miroir': endpoint,
+          },
+        );
         await Future<void>.delayed(delai);
       } on TimeoutException {
         CircuitBreakerPois.enregistrerEchec();
         if (tentative >= maxTentatives - 1) rethrow;
         final delai = _jitterPois(baseBackoff * (1 << tentative));
-        Journal.a('CARTE', 'Délai dépassé Overpass POI, nouvelle tentative dans ${delai.inSeconds} s', {
-          'tentative': tentative + 1,
-          'miroir': endpoint,
-        });
+        Journal.a(
+          'CARTE',
+          'Délai dépassé Overpass POI, nouvelle tentative dans ${delai.inSeconds} s',
+          {'tentative': tentative + 1, 'miroir': endpoint},
+        );
         await Future<void>.delayed(delai);
       } on http.ClientException {
         CircuitBreakerPois.enregistrerEchec();

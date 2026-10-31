@@ -129,7 +129,11 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
           padding: const EdgeInsets.all(20),
           child: Column(
             children: [
-              AvatarAnimalWidget(taille: 90, avatarId: avatarChoisi),
+              AvatarAnimalWidget(
+                taille: 90,
+                avatarId: avatarChoisi,
+                userId: SupabaseService().userId,
+              ),
 
               const SizedBox(height: 12),
 

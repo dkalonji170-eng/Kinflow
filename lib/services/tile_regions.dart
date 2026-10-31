@@ -6,8 +6,15 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_map_tile_caching/flutter_map_tile_caching.dart';
 import 'package:latlong2/latlong.dart';
 
-const String urlTuilesVoyager =
-    'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+import '../config/carte.dart' show CarteConfig;
+
+/// Tuiles du fond clair : MapTiler quand une clé est configurée, sinon OSM.
+///
+/// Cette URL doit rester EXACTEMENT celle du fond affiché par la carte :
+/// le cache de tuiles est indexé par URL. Si les deux divergent, les tuiles
+/// téléchargées d'avance ne sont jamais réutilisées et la carte reste vide
+/// hors connexion.
+String get urlTuilesVoyager => CarteConfig.urlFondClair;
 const String urlTuilesSatellite =
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
 const String urlTuilesLabels =
