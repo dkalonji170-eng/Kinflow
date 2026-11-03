@@ -38,8 +38,8 @@ class BulleVocale extends StatefulWidget {
     this.formes,
     this.graine,
     this.avatarId,
-    this.userId,
     this.onAvatarTap,
+    this.citation,
   });
 
   /// Fichier déjà présent sur l'appareil (optimiste : message que je viens
@@ -70,13 +70,13 @@ class BulleVocale extends StatefulWidget {
   /// (mon animal pour mes vocaux, le sien pour les vocaux reçus).
   final String? avatarId;
 
-  /// Identifiant de la personne qui parle : sert à charger son grade et à
-  /// l'afficher sur l'animal de la bulle.
-  final String? userId;
-
-  /// Appui sur l'animal : ouvre la fiche de la personne en grand (grade
-  /// détaillé). Null quand l'animal n'est pas cliquable.
+  /// Identifiant de la personne qui parle : sert à ouvrir sa fiche depuis
+  /// l'animal de la bulle.
   final VoidCallback? onAvatarTap;
+
+  /// Aperçu du message auquel ce vocal répond, affiché en haut de la bulle
+  /// (barre + nom + résumé). Null quand le vocal ne répond à rien.
+  final Widget? citation;
 
   @override
   State<BulleVocale> createState() => _BulleVocaleState();
@@ -557,6 +557,10 @@ class _BulleVocaleState extends State<BulleVocale> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
+          if (widget.citation != null) ...[
+            SizedBox(width: double.infinity, child: widget.citation),
+            const SizedBox(height: 6),
+          ],
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -600,28 +604,59 @@ class _BulleVocaleState extends State<BulleVocale> {
                     _formeOnde(progression),
                     const SizedBox(height: 3),
                     Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Text(
-                          texteEcoule,
-                          style: TextStyle(
-                            fontSize: 11,
-                            // Pendant un glissement, le temps affiché est le
-                            // temps VISÉ : on le met en gras pour qu'il se
-                            // distingue nettement du temps de lecture.
-                            fontWeight: _apercuFraction != null
-                                ? FontWeight.w800
-                                : FontWeight.w400,
-                            color: Colors.white70,
+                        // Chaque extrémité est flexible et se réduit
+                        // (FittedBox) si la place manque : le libellé de
+                        // vitesse « 1,5× » est plus large que « 1× » et faisait
+                        // déborder la ligne de quelques pixels.
+                        Flexible(
+                          child: FittedBox(
+                            fit: BoxFit.scaleDown,
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              texteEcoule,
+                              softWrap: false,
+                              style: TextStyle(
+                                fontSize: 11,
+                                // Chiffres tabulaires : le temps ne change pas de
+                                // largeur en défilant.
+                                fontFeatures: const [
+                                  FontFeature.tabularFigures(),
+                                ],
+                                // Pendant un glissement, le temps affiché est le
+                                // temps VISÉ : on le met en gras pour qu'il se
+                                // distingue nettement du temps de lecture.
+                                fontWeight: _apercuFraction != null
+                                    ? FontWeight.w800
+                                    : FontWeight.w400,
+                                color: Colors.white70,
+                              ),
+                            ),
                           ),
                         ),
-                        const Spacer(),
-                        _boutonVitesse(),
-                        const SizedBox(width: 8),
-                        Text(
-                          texteTotal,
-                          style: const TextStyle(
-                            fontSize: 11,
-                            color: Colors.white70,
+                        Flexible(
+                          child: FittedBox(
+                            fit: BoxFit.scaleDown,
+                            alignment: Alignment.centerRight,
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                _boutonVitesse(),
+                                const SizedBox(width: 8),
+                                Text(
+                                  texteTotal,
+                                  softWrap: false,
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    fontFeatures: [
+                                      FontFeature.tabularFigures(),
+                                    ],
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                       ],
@@ -668,7 +703,6 @@ class _BulleVocaleState extends State<BulleVocale> {
     final animal = AvatarAnimalWidget(
       taille: taille,
       avatarId: widget.avatarId,
-      userId: widget.userId,
     );
     final pastille = widget.onAvatarTap == null
         ? animal

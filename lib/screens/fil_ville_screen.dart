@@ -13,9 +13,12 @@ import '../services/supabase_service.dart';
 import '../theme/kinflow_theme.dart';
 import '../widgets/avatar_animal.dart';
 import '../widgets/logo_kinflow.dart';
+import '../widgets/menu_ami.dart';
 import '../widgets/profil_ami_dialog.dart';
 import '../widgets/social_ui.dart';
+import 'blocked_users_screen.dart';
 import 'chat_ami_screen.dart';
+import 'partage_position_screen.dart';
 import 'scan_qr_ami_screen.dart';
 
 /// Le fil de la ville : la suite d'informations publiées par KinFlow.
@@ -105,7 +108,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     _tabController.addListener(_surChangementOnglet);
     _lireDernierVu();
     _chargerPrenom();
-    SupabaseService().assurerPartagePosition();
     // On affiche d'abord ce qui est en cache local (visible même hors
     // connexion), puis on rafraîchit depuis le réseau.
     _chargerFilCache();
@@ -252,15 +254,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     }).toList();
   }
 
-  /// Vrai si la position de l'ami(e) a été mise à jour très récemment
-  /// (moins de 5 minutes) : sert de pastille « en ligne ».
-  bool _positionRecente(Map<String, dynamic> ami) {
-    final brut = ami['maj_a'];
-    final majA = brut == null ? null : DateTime.tryParse(brut.toString());
-    if (majA == null) return false;
-    return DateTime.now().difference(majA.toLocal()).inMinutes < 5;
-  }
-
   Future<void> _marquerToutVu() async {
     await SupabaseService().marquerFilVu();
   }
@@ -387,7 +380,8 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     });
   }
 
-  /// Menu ⋮ de l'en-tête Social : ajouter un ami(e) ou afficher mon code ami.
+  /// Menu ⋮ de l'en-tête Social : ajouter un ami(e), afficher mon code ami ou
+  /// gérer le partage de ma position.
   Widget _menuAmis() {
     final pret = _monCodeAmi.isNotEmpty;
     return PopupMenuButton<String>(
@@ -398,6 +392,16 @@ class _FilVilleScreenState extends State<FilVilleScreen>
           _ouvrirAjoutAmi();
         } else if (valeur == 'code') {
           _ouvrirMonCodeAmi();
+        } else if (valeur == 'position') {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const PartagePositionScreen()),
+          );
+        } else if (valeur == 'bloques') {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const BlockedUsersScreen()),
+          );
         }
       },
       itemBuilder: (context) => [
@@ -416,6 +420,23 @@ class _FilVilleScreenState extends State<FilVilleScreen>
             contentPadding: EdgeInsets.zero,
             leading: Icon(Icons.qr_code_2),
             title: Text('Mon code d\'ami'),
+          ),
+        ),
+        const PopupMenuItem(
+          value: 'position',
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.share_location),
+            title: Text('Partage de position'),
+          ),
+        ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(
+          value: 'bloques',
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.block),
+            title: Text('Utilisateurs bloqués'),
           ),
         ),
       ],
@@ -1100,7 +1121,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
             child: AvatarAnimalWidget(
               taille: 48,
               avatarId: demande['avatar'] as String?,
-              userId: demande['demandeur'] as String?,
             ),
           ),
           const SizedBox(width: 12),
@@ -1181,7 +1201,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     final nonLus = _nonLus[ami['ami_id']] ?? 0;
     final apercu = _apercuMessageAmi(ami);
     final positionLine = _libellePositionAmi(ami);
-    final recent = _positionRecente(ami);
     final sousTitre = apercu.isNotEmpty ? apercu : positionLine;
     final texteSousTitre = sousTitre.isEmpty
         ? 'Démarrer la discussion'
@@ -1202,31 +1221,22 @@ class _FilVilleScreenState extends State<FilVilleScreen>
         child: InkWell(
           borderRadius: BorderRadius.circular(18),
           onTap: () => _ouvrirDiscussionAmi(ami),
+          onLongPress: () => _ouvrirMenuAmi(ami),
           child: Padding(
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
             child: Row(
               children: [
-                Stack(
-                  children: [
-                    GestureDetector(
-                      onTap: () => ouvrirProfilAmi(
-                        context,
-                        userId: ami['ami_id'] as String? ?? '',
-                        nom: _nomComplet(ami),
-                        avatarId: ami['avatar'] as String?,
-                      ),
-                      child: AvatarAnimalWidget(
-                        taille: 52,
-                        avatarId: ami['avatar'] as String?,
-                        userId: ami['ami_id'] as String?,
-                      ),
-                    ),
-                    Positioned(
-                      right: 0,
-                      bottom: 0,
-                      child: PastillePresence(active: recent),
-                    ),
-                  ],
+                GestureDetector(
+                  onTap: () => ouvrirProfilAmi(
+                    context,
+                    userId: ami['ami_id'] as String? ?? '',
+                    nom: _nomComplet(ami),
+                    avatarId: ami['avatar'] as String?,
+                  ),
+                  child: AvatarAnimalWidget(
+                    taille: 52,
+                    avatarId: ami['avatar'] as String?,
+                  ),
                 ),
                 const SizedBox(width: 14),
                 Expanded(
@@ -1316,9 +1326,26 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     return apercu['moi'] == true ? 'Vous : $contenu' : contenu;
   }
 
+  /// Appui long sur une carte d'ami(e) : ouvre le même menu que les trois
+  /// points de la discussion (localiser, autorisations, renommer, retirer).
+  Future<void> _ouvrirMenuAmi(Map<String, dynamic> ami) async {
+    Journal.i('SOCIAL', 'Menu ami ouvert (appui long)', {
+      'ami': _nomComplet(ami),
+    });
+    await afficherMenuAmi(
+      context,
+      amiId: ami['ami_id'] as String? ?? '',
+      nom: _nomComplet(ami),
+      avatar: ami['avatar'] as String?,
+      onModifie: () {
+        if (mounted) _chargerAmis(silencieux: true);
+      },
+    );
+  }
+
   /// Ouvre directement la discussion avec l'ami(e). Les actions (localiser,
-  /// tracer l'itinéraire, retirer) sont regroupées dans le menu ⋮ de l'écran
-  /// de discussion.
+  /// tracer l'itinéraire, retirer) sont aussi accessibles par appui long sur
+  /// la carte ou via le menu ⋮ de l'écran de discussion.
   Future<void> _ouvrirDiscussionAmi(Map<String, dynamic> ami) async {
     Journal.i('SOCIAL', 'Discussion ouverte', {'ami': _nomComplet(ami)});
     await Navigator.push(
@@ -1389,27 +1416,28 @@ class _FilVilleScreenState extends State<FilVilleScreen>
         verts = r.$1;
         rouges = r.$2;
       }
-      _informations[index] = InformationVille(
-        id: i.id,
-        contenu: i.contenu,
-        sourceUrl: i.sourceUrl,
-        latitude: i.latitude,
-        longitude: i.longitude,
+      _informations[index] = i.copyWith(
         nbVerts: verts,
         nbRouges: rouges,
         maReaction: attendu,
-        emojis: i.emojis,
-        mesEmojis: i.mesEmojis,
-        creeA: i.creeA,
+        effacerReaction: attendu == null,
       );
     });
 
     final resultat = await SupabaseService().reagirInformation(info.id, sens);
     if (!mounted) return;
 
+    // `null` = échec réseau/serveur. Une réaction retirée revient avec le
+    // sentinelle `reactionAucune` : on peut donc distinguer un retrait réussi
+    // d'un échec, et annuler l'optimiste dans le second cas.
+    final echec = resultat == null;
+    final serveur = resultat == SupabaseService.reactionAucune
+        ? null
+        : resultat;
+
     // Le serveur contredit l'attendu (échec réseau/refus) : on remet
     // l'état d'origine. Sinon l'optimiste était juste, on ne touche à rien.
-    if ((resultat == null) != retrait) {
+    if (echec || serveur != attendu) {
       setState(() {
         final index = _informations.indexWhere((i) => i.id == info.id);
         if (index != -1) _informations[index] = info;
@@ -2245,7 +2273,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                           child: AvatarAnimalWidget(
                             taille: 44,
                             avatarId: a['avatar'] as String?,
-                            userId: a['ami_id'] as String?,
                           ),
                         ),
                         title: Text(_nomComplet(a)),
@@ -2672,19 +2699,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
         i.mesEmojis,
         emoji,
       );
-      _informations[index] = InformationVille(
-        id: i.id,
-        contenu: i.contenu,
-        sourceUrl: i.sourceUrl,
-        latitude: i.latitude,
-        longitude: i.longitude,
-        nbVerts: i.nbVerts,
-        nbRouges: i.nbRouges,
-        maReaction: i.maReaction,
-        emojis: emojis,
-        mesEmojis: mesEmojis,
-        creeA: i.creeA,
-      );
+      _informations[index] = i.copyWith(emojis: emojis, mesEmojis: mesEmojis);
     });
 
     final resultat = await SupabaseService().reagirEmoji(info.id, emoji);

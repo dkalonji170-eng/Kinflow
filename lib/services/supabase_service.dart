@@ -225,6 +225,24 @@ class SupabaseService {
       final auth = e as AuthException;
       return auth.message;
     } catch (_) {}
+    if (e is StorageException) {
+      final texte = '${e.message} ${e.error ?? ''}'.toLowerCase();
+      if (texte.contains('bucket not found') ||
+          texte.contains('nosuchbucket')) {
+        return 'Stockage des médias non configuré sur le serveur '
+            '(bucket manquant).';
+      }
+      if (texte.contains('row-level security') ||
+          texte.contains('accessdenied') ||
+          texte.contains('unauthorized')) {
+        return 'Envoi refusé par le stockage. Vérifie que tu es bien '
+            'connecté, puis réessaie.';
+      }
+      if (texte.contains('too large') || texte.contains('payload')) {
+        return 'Cette photo est trop lourde pour le serveur.';
+      }
+      return e.message;
+    }
     if (e is TimeoutException) {
       return 'Le serveur met trop de temps à répondre. Vérifie ta connexion internet puis réessaie.';
     }
@@ -409,6 +427,30 @@ class SupabaseService {
             )
             .timeout(_timeout),
       );
+
+      if (result is Map) {
+        final map = result.cast<String, dynamic>();
+        if (map['erreur'] == 'trop_de_tentatives') {
+          _derniereErreur =
+              'Trop de tentatives. Réessayez dans quelques minutes.';
+          Journal.a('CONNEXION', 'Adoption bloquée par rate limiting', {
+            'retry_after_secondes': map['retry_after_secondes'],
+          });
+          return null;
+        }
+        Journal.s('CONNEXION', 'Connexion réussie', {'nom': nomNettoye});
+        final profilMap = map;
+        try {
+          await marquerCompteLie(
+            nom: (profilMap['nom'] as String? ?? nomNettoye).trim(),
+            prenom: (profilMap['prenom'] as String? ?? '').trim(),
+            avatar: (profilMap['avatar'] as String? ?? ''),
+            code: (profilMap['code'] as String? ?? code).trim(),
+          );
+        } catch (_) {}
+        return profilMap;
+      }
+
       if (result == null) {
         _derniereErreur = 'Nom ou code incorrect.';
         Journal.a('CONNEXION', 'Connexion refusée : nom ou code incorrect', {
@@ -416,17 +458,12 @@ class SupabaseService {
         });
         return null;
       }
-      Journal.s('CONNEXION', 'Connexion réussie', {'nom': nomNettoye});
-      final profilMap = (result as Map).cast<String, dynamic>();
-      try {
-        await marquerCompteLie(
-          nom: (profilMap['nom'] as String? ?? nomNettoye).trim(),
-          prenom: (profilMap['prenom'] as String? ?? '').trim(),
-          avatar: (profilMap['avatar'] as String? ?? ''),
-          code: (profilMap['code'] as String? ?? code).trim(),
-        );
-      } catch (_) {}
-      return profilMap;
+
+      _derniereErreur = 'Nom ou code incorrect.';
+      Journal.a('CONNEXION', 'Connexion refusée : nom ou code incorrect', {
+        'nom': nomNettoye,
+      });
+      return null;
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur connexion par code: $_derniereErreur');
@@ -563,10 +600,18 @@ class SupabaseService {
     }
   }
 
+  /// Valeur renvoyée quand une réaction a bien été retirée.
+  ///
+  /// La fonction SQL renvoie `null` à la fois pour un retrait réussi et pour
+  /// une erreur, ce qui empêchait l'interface d'annuler un retrait optimiste
+  /// quand le réseau échouait. On utilise donc un sentinelle côté client :
+  /// `null` = échec, [reactionAucune] = retrait confirmé.
+  static const String reactionAucune = 'AUCUNE';
+
   /// Réagit à une information ('VERT' ou 'ROUGE'). Retaper la même couleur
   /// retire la réaction ; taper l'autre couleur la remplace.
-  /// Retourne le nouvel état ('VERT' ou 'ROUGE'), ou null si la réaction a
-  /// été retirée — ou bien en cas d'échec (serveur/réseau).
+  /// Retourne le nouvel état ('VERT' ou 'ROUGE'), [reactionAucune] si la
+  /// réaction a été retirée, ou null en cas d'échec (serveur/réseau).
   Future<String?> reagirInformation(String informationId, String sens) async {
     try {
       await ready;
@@ -579,11 +624,9 @@ class SupabaseService {
             params: {'p_id': informationId, 'p_sens': sens},
           )
           .timeout(_timeout);
-      final sensResultat = resultat is String ? resultat : null;
-      if (sensResultat == null) {
-        Journal.a('FIL', 'Réaction retirée ou absente', {
-          'information': informationId,
-        });
+      final sensResultat = resultat is String ? resultat : reactionAucune;
+      if (sensResultat == reactionAucune) {
+        Journal.s('FIL', 'Réaction retirée', {'information': informationId});
       } else {
         Journal.s('FIL', 'Réaction enregistrée', {
           'information': informationId,
@@ -614,13 +657,16 @@ class SupabaseService {
             params: {'p_id': informationId, 'p_emoji': emoji},
           )
           .timeout(_timeout);
-      if (resultat is bool) {
+      if (resultat == true) {
         Journal.s('FIL', 'Émoji enregistré', {
           'information': informationId,
           'emoji': emoji,
         });
-        return resultat;
+        return true;
       }
+      // `false` = emoji refusé (info inconnue, session absente…). On le traite
+      // comme un échec pour que l'interface annule la bascule optimiste.
+      _derniereErreur = 'émoji refusé par le serveur';
       return null;
     } catch (e) {
       _derniereErreur = _detailErreur(e);
@@ -1298,6 +1344,10 @@ class SupabaseService {
   ///
   /// [audioFormes] : forme d'onde du vocal (0..100, une valeur par barre),
   /// stockée avec le message pour être redessinée chez le destinataire.
+  ///
+  /// [repondreA] : identifiant du message auquel celui-ci répond. On enregistre
+  /// la RÉFÉRENCE (pas une copie du texte) : l'aperçu est reconstruit à
+  /// l'affichage, et le message cité peut donc être modifié sans la casser.
   Future<String?> envoyerMessageAmi({
     required String amiId,
     required String contenu,
@@ -1305,6 +1355,7 @@ class SupabaseService {
     int? audioDureeMs,
     List<int>? audioFormes,
     String? imageChemin,
+    String? repondreA,
   }) async {
     try {
       await ready;
@@ -1324,6 +1375,8 @@ class SupabaseService {
                 'p_audio_formes': audioFormes,
               if (imageChemin != null && imageChemin.isNotEmpty)
                 'p_image_chemin': imageChemin,
+              if (repondreA != null && repondreA.isNotEmpty)
+                'p_reply_to_message_id': repondreA,
             },
           )
           .timeout(_timeout);
@@ -1881,28 +1934,28 @@ class SupabaseService {
     }
   }
 
-  /// Garantit que le partage de position est actif. Dans KinFlow, le partage
-  /// est TOUJOURS actif (il n'y a plus d'interrupteur) : on l'active côté
-  /// serveur si ce n'est pas déjà le cas. Retourne true si actif.
-  Future<bool> assurerPartagePosition() async {
-    final actif = await monPartagePosition();
-    if (actif) return true;
-    return definirPartagePosition(true);
-  }
-
   /// Active ou désactive le partage de ma position avec mes amis(es).
-  Future<bool> definirPartagePosition(bool actif) async {
+  ///
+  /// [dureeMinutes] vaut null pour « jusqu'à désactivation ». La désactivation
+  /// efface immédiatement les coordonnées côté serveur.
+  Future<bool> definirPartagePosition(bool actif, {int? dureeMinutes}) async {
     try {
       await ready;
       await ensureSignedIn();
       final client = _client;
       if (client == null) return false;
       final resultat = await client
-          .rpc('definir_partage_position', params: {'p_actif': actif})
+          .rpc(
+            'definir_partage_position',
+            params: {'p_actif': actif, 'p_duree_minutes': dureeMinutes},
+          )
           .timeout(_timeout);
       final ok = resultat == true;
       if (ok) {
-        Journal.s('AMIS', 'Partage de position modifié', {'actif': actif});
+        Journal.s('AMIS', 'Partage de position modifié', {
+          'actif': actif,
+          'duree_minutes': dureeMinutes,
+        });
       }
       return ok;
     } catch (e) {
@@ -1931,52 +1984,20 @@ class SupabaseService {
     }
   }
 
-  /// Récupère mon rang selon le nombre de signalements routiers
-  Future<Map<String, dynamic>?> monRangSignalements() async {
+  /// Détail du consentement de partage : actif + date d'expiration.
+  Future<Map<String, dynamic>> monPartagePositionDetails() async {
+    await ready;
+    final client = _client;
+    if (client == null) return {'actif': false, 'expire_a': null};
     try {
-      await ready;
-      await ensureSignedIn();
-      final client = _client;
-      if (client == null) return null;
-      final res = await client.rpc('mon_rang_signalements').timeout(_timeout);
-      if (res is List && res.isNotEmpty) {
-        return Map<String, dynamic>.from(res.first);
-      }
-      if (res is Map) {
-        return Map<String, dynamic>.from(res);
-      }
-      return null;
-    } catch (e) {
-      _derniereErreur = _detailErreur(e);
-      debugPrint('[KinFlow] Erreur monRangSignalements: $_derniereErreur');
-      return null;
-    }
-  }
-
-  /// Récupère le rang d'un utilisateur selon son nombre de signalements
-  Future<Map<String, dynamic>?> rangSignalementsUtilisateur(
-    String userId,
-  ) async {
-    try {
-      await ready;
-      final client = _client;
-      if (client == null || userId.isEmpty) return null;
-      final res = await client
-          .rpc('rang_signalements_utilisateur', params: {'p_user_id': userId})
+      final resultat = await client
+          .rpc('mon_partage_position_details')
           .timeout(_timeout);
-      if (res is List && res.isNotEmpty) {
-        return Map<String, dynamic>.from(res.first);
-      }
-      if (res is Map) {
-        return Map<String, dynamic>.from(res);
-      }
-      return null;
+      if (resultat is Map) return resultat.cast<String, dynamic>();
+      return {'actif': false, 'expire_a': null};
     } catch (e) {
-      _derniereErreur = _detailErreur(e);
-      debugPrint(
-        '[KinFlow] Erreur rangSignalementsUtilisateur: $_derniereErreur',
-      );
-      return null;
+      debugPrint('[KinFlow] Erreur monPartagePositionDetails: $e');
+      return {'actif': false, 'expire_a': null};
     }
   }
 
@@ -1999,12 +2020,383 @@ class SupabaseService {
     }
   }
 
+  // --- Blocage et signalement d'utilisateurs --------------------------------
+
+  Future<String?> bloquerUtilisateur(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final res = await client
+          .rpc('bloquer_utilisateur', params: {'p_id': id})
+          .timeout(_timeout);
+      return res is String ? res : null;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur bloquerUtilisateur: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<bool> debloquerUtilisateur(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      final res = await client
+          .rpc('debloquer_utilisateur', params: {'p_id': id})
+          .timeout(_timeout);
+      return res == true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur debloquerUtilisateur: $_derniereErreur');
+      return false;
+    }
+  }
+
+  Future<bool> estBloque(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      final res = await client
+          .rpc('est_bloque', params: {'p_id': id})
+          .timeout(_timeout);
+      return res == true;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur estBloque: $e');
+      return false;
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> mesBlocages() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final res = await client.rpc('mes_blocages').timeout(_timeout);
+      if (res is! List) return const [];
+      return [
+        for (final e in res)
+          if (e is Map) e.cast<String, dynamic>(),
+      ];
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur mesBlocages: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  Future<String?> signalerUtilisateur({
+    required String id,
+    required String motif,
+    String description = '',
+    String? messageId,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final res = await client
+          .rpc(
+            'signaler_utilisateur',
+            params: {
+              'p_id': id,
+              'p_motif': motif,
+              'p_description': description,
+              'p_message_id': messageId,
+            },
+          )
+          .timeout(_timeout);
+      return res is String ? res : null;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur signalerUtilisateur: $_derniereErreur');
+      return null;
+    }
+  }
+
+  // --- Compte permanent ------------------------------------------------------
+
+  /// Email du compte permanent, ou null si l'identité est encore anonyme.
+  String? get emailCompte => _client?.auth.currentUser?.email;
+
+  bool get emailCompteConfirme =>
+      _client?.auth.currentUser?.emailConfirmedAt != null;
+
+  bool get possedeComptePermanent => emailCompte != null;
+
+  /// Convertit l'utilisateur anonyme courant en compte email/mot de passe,
+  /// sans changer d'identifiant : profil, amis et messages sont conservés.
+  /// Retourne 'ok', 'confirmation_requise', 'email_invalide',
+  /// 'mot_de_passe_trop_court' ou 'erreur'.
+  Future<String> sauvegarderComptePermanent({
+    required String email,
+    required String motDePasse,
+  }) async {
+    final emailNettoye = email.trim().toLowerCase();
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(emailNettoye)) {
+      _derniereErreur = 'Adresse e-mail invalide.';
+      return 'email_invalide';
+    }
+    if (motDePasse.length < 6) {
+      _derniereErreur = 'Le mot de passe doit contenir au moins 6 caractères.';
+      return 'mot_de_passe_trop_court';
+    }
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) {
+        _derniereErreur = 'Pas de connexion au serveur.';
+        return 'erreur';
+      }
+      final res = await client.auth
+          .updateUser(UserAttributes(email: emailNettoye, password: motDePasse))
+          .timeout(_timeout);
+      final user = res.user;
+      if (user == null) {
+        _derniereErreur = 'Le serveur n\'a pas confirmé la sauvegarde.';
+        return 'erreur';
+      }
+      final id = user.id;
+      try {
+        await client
+            .from('profiles')
+            .update({'email': emailNettoye})
+            .eq('id', id)
+            .timeout(_timeout);
+      } catch (_) {}
+      Journal.s('COMPTE', 'Compte permanent activé');
+      if (user.emailConfirmedAt == null) return 'confirmation_requise';
+      return 'ok';
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur sauvegarderComptePermanent: $_derniereErreur',
+      );
+      Journal.e('COMPTE', 'Sauvegarde du compte échouée', {
+        'erreur': _derniereErreur,
+      });
+      return 'erreur';
+    }
+  }
+
+  /// Connexion par email/mot de passe sur un nouvel appareil.
+  Future<Map<String, dynamic>?> connecterAvecEmail({
+    required String email,
+    required String motDePasse,
+  }) async {
+    try {
+      await ready;
+      final client = _client;
+      if (client == null) {
+        _derniereErreur = 'Pas de connexion au serveur.';
+        return null;
+      }
+      final res = await client.auth
+          .signInWithPassword(
+            email: email.trim().toLowerCase(),
+            password: motDePasse,
+          )
+          .timeout(_timeout);
+      final user = res.user;
+      if (user == null) {
+        _derniereErreur = 'Email ou mot de passe incorrect.';
+        return null;
+      }
+      final profil = await client
+          .from('profiles')
+          .select()
+          .eq('id', user.id)
+          .maybeSingle()
+          .timeout(_timeout);
+      if (profil == null) {
+        _derniereErreur = 'Profil introuvable pour ce compte.';
+        try {
+          await client.auth.signOut().timeout(_timeout);
+        } catch (_) {}
+        return null;
+      }
+      await sauverProfilCache(profil);
+      try {
+        await marquerCompteLie(
+          nom: (profil['nom'] as String? ?? '').trim(),
+          prenom: (profil['prenom'] as String? ?? '').trim(),
+          avatar: (profil['avatar'] as String? ?? ''),
+          code: (profil['code'] as String? ?? ''),
+        );
+      } catch (_) {}
+      Journal.s('CONNEXION', 'Connexion email réussie');
+      return profil;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur connexion email: $_derniereErreur');
+      Journal.e('CONNEXION', 'Connexion email échouée', {
+        'erreur': _derniereErreur,
+      });
+      return null;
+    }
+  }
+
+  // --- Suppression de compte -------------------------------------------------
+
+  /// Supprime définitivement le compte et toutes ses données.
+  /// Retourne 'supprime' ou 'erreur' (détail dans [derniereErreur]).
+  Future<String> supprimerMonCompte() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) {
+        _derniereErreur = 'Pas de connexion au serveur.';
+        return 'erreur';
+      }
+      final res = await client.functions
+          .invoke('supprimer-compte')
+          .timeout(const Duration(seconds: 40));
+      if (res.status != 200) {
+        _derniereErreur =
+            'Suppression impossible (code ${res.status}). Réessayez plus tard.';
+        return 'erreur';
+      }
+      try {
+        await client.auth.signOut().timeout(_timeout);
+      } catch (_) {}
+      await effacerCompteLieLocal();
+      await effacerCachesHorsLigne();
+      Journal.s('COMPTE', 'Compte supprimé définitivement');
+      return 'supprime';
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur supprimerMonCompte: $_derniereErreur');
+      Journal.e('COMPTE', 'Suppression du compte échouée', {
+        'erreur': _derniereErreur,
+      });
+      return 'erreur';
+    }
+  }
+
+  // --- Notifications push ----------------------------------------------------
+
+  Future<bool> enregistrerTokenPush(
+    String token, {
+    String plateforme = 'android',
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      final res = await client
+          .rpc(
+            'enregistrer_token_push',
+            params: {'p_token': token, 'p_plateforme': plateforme},
+          )
+          .timeout(_timeout);
+      return res == true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur enregistrerTokenPush: $_derniereErreur');
+      return false;
+    }
+  }
+
+  Future<bool> supprimerTokenPush(String token) async {
+    try {
+      await ready;
+      final client = _client;
+      if (client == null) return false;
+      final res = await client
+          .rpc('supprimer_token_push', params: {'p_token': token})
+          .timeout(_timeout);
+      return res == true;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur supprimerTokenPush: $e');
+      return false;
+    }
+  }
+
+  Future<Map<String, dynamic>> mesPreferencesNotifications() async {
+    const defaut = {
+      'push_actif': true,
+      'embouteillages': true,
+      'routes_bloquees': true,
+      'messages': true,
+      'demandes_amis': true,
+      'infos': true,
+    };
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return Map<String, dynamic>.from(defaut);
+      final res = await client
+          .rpc('mes_preferences_notifications')
+          .timeout(_timeout);
+      if (res is Map) {
+        return {...defaut, ...res.cast<String, dynamic>()};
+      }
+      return Map<String, dynamic>.from(defaut);
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur mesPreferencesNotifications: $e');
+      return Map<String, dynamic>.from(defaut);
+    }
+  }
+
+  Future<Map<String, dynamic>> definirPreferencesNotifications(
+    Map<String, dynamic> preferences,
+  ) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const {};
+      final res = await client
+          .rpc(
+            'definir_preferences_notifications',
+            params: {'p_preferences': preferences},
+          )
+          .timeout(_timeout);
+      if (res is Map) return res.cast<String, dynamic>();
+      return const {};
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur definirPreferencesNotifications: $_derniereErreur',
+      );
+      return const {};
+    }
+  }
+
   Future<void> signOut() async {
     final client = _client;
     if (client == null) {
       await effacerCompteLieLocal();
       await effacerCachesHorsLigne();
       return;
+    }
+    // Coupe le partage AVANT de perdre la session : sinon les dernières
+    // coordonnées resteraient visibles par les amis après la déconnexion.
+    try {
+      await client
+          .rpc(
+            'definir_partage_position',
+            params: {'p_actif': false, 'p_duree_minutes': null},
+          )
+          .timeout(_timeout);
+    } catch (e) {
+      debugPrint('[KinFlow] Désactivation position au signOut: $e');
+    }
+    try {
+      await client.rpc('supprimer_mes_tokens_push').timeout(_timeout);
+    } catch (e) {
+      debugPrint('[KinFlow] Suppression tokens push au signOut: $e');
     }
     try {
       await client.auth.signOut().timeout(_timeout);

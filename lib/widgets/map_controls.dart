@@ -274,7 +274,7 @@ class BoutonPoserEpingle extends StatelessWidget {
 class BoutonPoser extends StatelessWidget {
   final VoidCallback onPressed;
 
-  /// Vrai pour la pose d'un lieu personnel (maison/travail) : gabarit réduit
+  /// Vrai pour la pose du lieu de travail : gabarit réduit
   /// (icône et texte plus petits) pour ne pas dominer la carte qu'on déplace
   /// sous la prévisualisation. La pose d'épingle garde le gabarit d'origine.
   final bool compact;

@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:ui';
-import 'package:flutter/foundation.dart' show kIsWeb, PlatformDispatcher;
+import 'package:flutter/foundation.dart'
+    show kIsWeb, PlatformDispatcher, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:flutter/services.dart'
+    show Clipboard, ClipboardData, DeviceOrientation, SystemChrome;
 import 'package:provider/provider.dart';
 import 'theme/theme_provider.dart';
 import 'theme/kinflow_theme.dart';
@@ -27,14 +29,28 @@ bool _fmtcStarted = false;
 /// autre (ex. erreur pendant l'erreur), on n'empile pas la pile.
 int _profondeurPlantage = 0;
 
-void _signalerPlantage(String origine, Object erreur, [StackTrace? stack]) {
+void _signalerPlantage(
+  String origine,
+  Object erreur, [
+  StackTrace? stack,
+  String? details,
+]) {
   if (_profondeurPlantage >= 2) return;
   _profondeurPlantage++;
   try {
-    Journal.e('PLANTAGE', 'Erreur non gérée ($origine)', {'erreur': '$erreur'});
+    Journal.e('PLANTAGE', 'Erreur non gérée ($origine)', {
+      'erreur': '$erreur',
+      // Pour une erreur de mise en page (RenderFlex overflow), ce texte
+      // contient le widget fautif et son fichier:ligne. Indispensable pour
+      // corriger le bon écran.
+      if (details != null && details.trim().isNotEmpty) 'details': details,
+    });
     reportCrash(origine, erreur, stack ?? StackTrace.current);
     try {
-      final contenu = '[$origine] ${DateTime.now()}\nERREUR: $erreur\nSTACK:\n${stack ?? StackTrace.current}';
+      final contenu =
+          '[$origine] ${DateTime.now()}\nERREUR: $erreur\n'
+          '${details == null ? '' : 'DÉTAILS:\n$details\n'}'
+          'STACK:\n${stack ?? StackTrace.current}';
       transmettreCrash(contenu);
     } catch (_) {}
   } catch (_) {
@@ -42,6 +58,15 @@ void _signalerPlantage(String origine, Object erreur, [StackTrace? stack]) {
   } finally {
     _profondeurPlantage--;
   }
+}
+
+/// Résumé d'un [FlutterErrorDetails] : message + widget/fichier:ligne, borné
+/// pour ne pas gonfler le journal (les piles complètes sont déjà transmises
+/// séparément par [reportCrash]).
+String _resumeFlutterError(FlutterErrorDetails details) {
+  final texte = details.toString();
+  const limite = 2000;
+  return texte.length > limite ? '${texte.substring(0, limite)}…' : texte;
 }
 
 void main() {
@@ -52,7 +77,12 @@ void main() {
       Journal.i('DEMARRAGE', 'Application lancée');
 
       FlutterError.onError = (details) {
-        _signalerPlantage('FlutterError', details.exception, details.stack);
+        _signalerPlantage(
+          'FlutterError',
+          details.exception,
+          details.stack,
+          _resumeFlutterError(details),
+        );
       };
 
       PlatformDispatcher.instance.onError = (error, stack) {
@@ -69,6 +99,18 @@ void main() {
 }
 
 Future<void> _runApp() async {
+  // L'application est dessinée pour le portrait : on verrouille l'orientation
+  // sur téléphone/tablette. Le web et le bureau gardent leur orientation libre
+  // (fenêtre redimensionnable).
+  if (!kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS)) {
+    await SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
+  }
+
   tileDownloadService = TileDownloadService();
 
   final app = ChangeNotifierProvider(

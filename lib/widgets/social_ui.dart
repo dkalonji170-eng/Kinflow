@@ -12,11 +12,7 @@ abstract final class SocialUI {
   static const LinearGradient degradeEntete = LinearGradient(
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
-    colors: [
-      KinColors.primaryFonce,
-      KinColors.primary,
-      KinColors.primaryClair,
-    ],
+    colors: [KinColors.primaryFonce, KinColors.primary, KinColors.primaryClair],
   );
 
   /// Dégradé ambre de mise en avant (nouvelles infos, épinglé).
@@ -98,7 +94,11 @@ class _GlissementDegrade extends GradientTransform {
 
   @override
   Matrix4? transform(Rect bounds, {TextDirection? textDirection}) {
-    return Matrix4.translationValues(bounds.width * (valeur * 2 - 1) * 1.4, 0, 0);
+    return Matrix4.translationValues(
+      bounds.width * (valeur * 2 - 1) * 1.4,
+      0,
+      0,
+    );
   }
 }
 
@@ -125,66 +125,9 @@ class BlocSquelette extends StatelessWidget {
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surfaceContainerHighest,
         shape: forme,
-        borderRadius:
-            forme == BoxShape.circle ? null : BorderRadius.circular(rayon),
-      ),
-    );
-  }
-}
-
-/// Pastille de statistique affichée dans l'en-tête dégradé : un petit icône,
-/// une valeur et un libellé. Fond translucide pour rester lisible.
-class PastilleStat extends StatelessWidget {
-  const PastilleStat({
-    super.key,
-    required this.icone,
-    required this.valeur,
-    required this.libelle,
-  });
-
-  final IconData icone;
-  final String valeur;
-  final String libelle;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.16),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icone, size: 18, color: Colors.white),
-          const SizedBox(width: 8),
-          Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                valeur,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w800,
-                  height: 1.1,
-                ),
-              ),
-              Text(
-                libelle,
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.85),
-                  fontSize: 11,
-                  fontWeight: FontWeight.w500,
-                  height: 1.1,
-                ),
-              ),
-            ],
-          ),
-        ],
+        borderRadius: forme == BoxShape.circle
+            ? null
+            : BorderRadius.circular(rayon),
       ),
     );
   }
@@ -302,38 +245,9 @@ class EspaceVideSocial extends StatelessWidget {
                 height: 1.4,
               ),
             ),
-            if (action != null) ...[
-              const SizedBox(height: 20),
-              action!,
-            ],
+            if (action != null) ...[const SizedBox(height: 20), action!],
           ],
         ),
-      ),
-    );
-  }
-}
-
-/// Petite pastille ronde de présence (en ligne / position récente).
-class PastillePresence extends StatelessWidget {
-  const PastillePresence({
-    super.key,
-    required this.active,
-    this.taille = 14,
-  });
-
-  final bool active;
-  final double taille;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Container(
-      width: taille,
-      height: taille,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        color: active ? KinColors.vertArrivee : theme.colorScheme.outline,
-        border: Border.all(color: theme.colorScheme.surface, width: 2),
       ),
     );
   }

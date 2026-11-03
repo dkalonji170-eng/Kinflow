@@ -1,7 +1,6 @@
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
-import 'package:latlong2/latlong.dart';
 
 import '../config/ia_config.dart';
 import '../models/ami_position.dart';
@@ -55,8 +54,8 @@ class IAService {
       'name': 'localiser_ami',
       'description':
           'Localise un(de un(e) ami(e) sur la carte et ouvre la carte centrée '
-              'sur lui/elle. À utiliser quand l\'utilisateur demande où est un '
-              'ami, ou veut le/la localiser.',
+          'sur lui/elle. À utiliser quand l\'utilisateur demande où est un '
+          'ami, ou veut le/la localiser.',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -72,9 +71,9 @@ class IAService {
       'name': 'itineraire_vers',
       'description':
           'Trace un itinéraire (route) depuis la position actuelle de '
-              'l\'utilisateur jusqu\'à une destination donnée. À utiliser quand '
-              'l\'utilisateur demande un trajet, un chemin, ou « jusqu\'à » un '
-              'lieu.',
+          'l\'utilisateur jusqu\'à une destination donnée. À utiliser quand '
+          'l\'utilisateur demande un trajet, un chemin, ou « jusqu\'à » un '
+          'lieu.',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -82,7 +81,7 @@ class IAService {
             'type': 'string',
             'description':
                 'Nom du lieu de destination (ex : « aéroport de N\'dolo », '
-                    '« marché Central »).',
+                '« marché Central »).',
           },
         },
         'required': ['destination'],
@@ -92,8 +91,8 @@ class IAService {
       'name': 'rechercher_lieu',
       'description':
           'Cherche un lieu / point d\'intérêt (restaurant, pharmacie, école, '
-              'station-service…) et retourne les résultats. À utiliser quand '
-              'l\'utilisateur cherche un endroit.',
+          'station-service…) et retourne les résultats. À utiliser quand '
+          'l\'utilisateur cherche un endroit.',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -109,8 +108,8 @@ class IAService {
       'name': 'envoyer_message_ami',
       'description':
           'Envoie un message texte à un(de un(e) ami(e). À utiliser quand '
-              'l\'utilisateur veut écrire à un ami (ex : « dis à Marie que '
-              'j\'arrive »).',
+          'l\'utilisateur veut écrire à un ami (ex : « dis à Marie que '
+          'j\'arrive »).',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -164,7 +163,8 @@ RÈGLES :
   Future<ReponseIA> envoyer(String texte) async {
     if (!IAConfig.estConfiguree) {
       return ReponseIA(
-        texte: 'Kinflow n\'est pas encore configuré : ajoute ta clé API Gemini '
+        texte:
+            'Kinflow n\'est pas encore configuré : ajoute ta clé API Gemini '
             'dans lib/config/ia_config.dart pour me donner vie. 🤖',
       );
     }
@@ -246,7 +246,8 @@ RÈGLES :
             : reponse.body,
       });
       return ReponseIA(
-        texte: 'Oups, j\'ai eu un souci de connexion (${reponse.statusCode}). '
+        texte:
+            'Oups, j\'ai eu un souci de connexion (${reponse.statusCode}). '
             'Réessaie dans un instant. 🙈',
       );
     }
@@ -260,7 +261,9 @@ RÈGLES :
       final json = jsonDecode(brut) as Map<String, dynamic>;
       final candidats = (json['candidates'] as List?) ?? const [];
       if (candidats.isEmpty) {
-        return ReponseIA(texte: 'Hmm, je n\'ai rien à répondre pour l\'instant.');
+        return ReponseIA(
+          texte: 'Hmm, je n\'ai rien à répondre pour l\'instant.',
+        );
       }
       final contenu =
           (candidats.first as Map<String, dynamic>)['content'] as Map?;
@@ -286,10 +289,7 @@ RÈGLES :
 
       // On garde la réponse du modèle dans l'historique Gemini (texte +
       // functionCall) pour que le tour suivant soit cohérent.
-      _historique.add({
-        'role': 'model',
-        'parts': parts,
-      });
+      _historique.add({'role': 'model', 'parts': parts});
 
       return ReponseIA(texte: buffer.toString(), actions: actions);
     } catch (e) {
@@ -364,11 +364,13 @@ RÈGLES :
     return partiel;
   }
 
-  static String _normaliser(String s) =>
-      s.toLowerCase().trim().replaceAll(RegExp(r'[éèêë]'), 'e')
-          .replaceAll(RegExp(r'[àâä]'), 'a')
-          .replaceAll(RegExp(r'[îï]'), 'i')
-          .replaceAll(RegExp(r'[ôö]'), 'o')
-          .replaceAll(RegExp(r'[ûüù]'), 'u')
-          .replaceAll(RegExp(r'\s+'), ' ');
+  static String _normaliser(String s) => s
+      .toLowerCase()
+      .trim()
+      .replaceAll(RegExp(r'[éèêë]'), 'e')
+      .replaceAll(RegExp(r'[àâä]'), 'a')
+      .replaceAll(RegExp(r'[îï]'), 'i')
+      .replaceAll(RegExp(r'[ôö]'), 'o')
+      .replaceAll(RegExp(r'[ûüù]'), 'u')
+      .replaceAll(RegExp(r'\s+'), ' ');
 }

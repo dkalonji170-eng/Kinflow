@@ -2,20 +2,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../services/diagnostics_service.dart';
-import '../services/serie_activite_service.dart';
 import '../services/supabase_service.dart';
 import '../widgets/avatar_animal.dart';
-import '../widgets/carte_grade.dart';
-import '../widgets/grade_rang.dart';
 import 'edit_profile_screen.dart';
 
-/// Mon profil : l'avatar (avec le grade dessiné dans le rond) puis trois
-/// sections DÉPLIABLES, comme dans les Paramètres — un appui sur la ligne fait
-/// descendre la flèche et ouvre le contenu :
+/// Mon profil : l'avatar puis deux sections DÉPLIABLES, comme dans les
+/// Paramètres — un appui sur la ligne fait descendre la flèche et ouvre le
+/// contenu :
 ///
 ///  - « Code du compte » : le code privé qui sert à se reconnecter ;
-///  - « Code ami » : le code public à partager pour qu'on t'ajoute ;
-///  - « Grade » : ton grade actuel et les symboles de tous les grades.
+///  - « Code ami » : le code public à partager pour qu'on t'ajoute.
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
 
@@ -37,11 +33,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
   String _codeAmi = "";
   bool _chargementCodeAmi = true;
 
-  Map<String, dynamic>? _rangSignalements;
-  bool _chargementRang = true;
-  int _serie = 0;
-  int _meilleureSerie = 0;
-
   String _formaterCode(String c) {
     final propre = c.trim();
     if (propre.length == 8) {
@@ -54,7 +45,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
   void initState() {
     super.initState();
     chargerProfil();
-    _chargerRang();
     _chargerCodeAmi();
   }
 
@@ -64,23 +54,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
     setState(() {
       _codeAmi = (codeAmi ?? '').trim();
       _chargementCodeAmi = false;
-    });
-  }
-
-  Future<void> _chargerRang() async {
-    if (!mounted) return;
-    setState(() => _chargementRang = true);
-    Map<String, dynamic>? rang;
-    try {
-      rang = await SupabaseService().monRangSignalements();
-    } catch (_) {}
-    await SerieActivite.instance.charger();
-    if (!mounted) return;
-    setState(() {
-      _rangSignalements = rang;
-      _serie = SerieActivite.instance.serie;
-      _meilleureSerie = SerieActivite.instance.meilleure;
-      _chargementRang = false;
     });
   }
 
@@ -137,7 +110,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Widget _section({
     required IconData icone,
     required String titre,
-    required String resume,
     required List<Widget> contenu,
   }) {
     final theme = Theme.of(context);
@@ -153,7 +125,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
             titre,
             style: const TextStyle(fontWeight: FontWeight.w600),
           ),
-          subtitle: Text(resume),
           // La flèche par défaut (chevron vers le bas) se retourne vers le
           // haut à l'ouverture : c'est le mouvement demandé.
           childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
@@ -213,57 +184,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
-  /// Une ligne de la liste des grades : symbole, nom, et mention du grade
-  /// actuel. Aucun palier chiffré, aucune référence aux signalements.
-  Widget _ligneGrade(int niveau, int niveauActuel) {
-    final couleur = Theme.of(context).colorScheme;
-    final actuel = niveau == niveauActuel;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 4),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-      decoration: BoxDecoration(
-        color: actuel
-            ? couleur.primary.withValues(alpha: 0.10)
-            : Colors.transparent,
-        borderRadius: BorderRadius.circular(10),
-        border: actuel
-            ? Border.all(color: couleur.primary.withValues(alpha: 0.35))
-            : null,
-      ),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 70,
-            child: Center(child: GradeRang(niveau: niveau, taille: 14)),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              GradeRang.noms[niveau - 1],
-              style: TextStyle(
-                fontSize: 13,
-                fontWeight: actuel ? FontWeight.w700 : FontWeight.w500,
-                color: actuel ? couleur.primary : null,
-              ),
-            ),
-          ),
-          Text(
-            actuel ? 'Ton grade' : '',
-            style: TextStyle(
-              fontSize: 11.5,
-              fontWeight: FontWeight.w600,
-              color: couleur.onSurface.withValues(alpha: 0.6),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    final niveauActuel = (_rangSignalements?['niveau'] as num?)?.toInt() ?? 1;
 
     return Scaffold(
       appBar: AppBar(title: const Text("Mon profil"), centerTitle: true),
@@ -274,10 +197,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
             child: AvatarAnimalWidget(
               taille: 108,
               avatarId: avatar,
-              // Grade du compte, dessiné à l'intérieur du rond, sous l'animal.
-              grade: _rangSignalements == null
-                  ? null
-                  : GradeRang(niveau: niveauActuel, taille: 20),
+              // Un halo lumineux pour que l'avatar ressorte sur le fond.
+              brillance: true,
             ),
           ),
           const SizedBox(height: 12),
@@ -294,7 +215,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
           _section(
             icone: Icons.key,
             titre: 'Code du compte',
-            resume: 'Privé — pour te reconnecter',
             contenu: [
               _codeAffichable(
                 valeur: code,
@@ -310,7 +230,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
           _section(
             icone: Icons.person_add_alt_1,
             titre: 'Code ami',
-            resume: 'Public — à partager pour qu\'on t\'ajoute',
             contenu: [
               if (_chargementCodeAmi)
                 const Padding(
@@ -334,57 +253,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             ],
           ),
 
-          // 3) Grade — rang actuel + symboles de tous les grades.
-          _section(
-            icone: Icons.military_tech,
-            titre: 'Grade',
-            resume: _chargementRang
-                ? 'Chargement…'
-                : '${GradeRang.noms[niveauActuel.clamp(1, 8) - 1]}'
-                      ' · Grade $niveauActuel sur ${GradeRang.noms.length}',
-            contenu: [
-              if (_chargementRang)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 6),
-                  child: SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                )
-              else if (_rangSignalements == null)
-                _texteSecondaire('Grade indisponible pour le moment.')
-              else ...[
-                CarteGrade(
-                  niveau: niveauActuel,
-                  nbSignalements:
-                      (_rangSignalements!['nb_signalements'] as num?)?.toInt() ??
-                      0,
-                  estMax: _rangSignalements!['est_max'] == true,
-                  serie: _serie,
-                  piedDePage: _meilleureSerie > _serie
-                      ? 'Meilleure série : $_meilleureSerie jours. '
-                            'Ton grade et ta série sont attachés à ce compte.'
-                      : 'Ton grade et ta série sont attachés à ce compte : '
-                            'ils te suivent partout dans KinFlow.',
-                ),
-                const SizedBox(height: 14),
-                const Text(
-                  'Les grades KinFlow',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 2),
-                _texteSecondaire(
-                  'Ta progression monte en utilisant KinFlow : plus tu '
-                  'utilises ton compte, plus ton grade avance.',
-                ),
-                const SizedBox(height: 8),
-                for (var n = 1; n <= GradeRang.noms.length; n++)
-                  _ligneGrade(n, niveauActuel),
-              ],
-            ],
-          ),
-
+          // 3) Sexe et coordonnées.
           const SizedBox(height: 4),
           Card(
             margin: EdgeInsets.zero,

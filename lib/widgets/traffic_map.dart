@@ -22,7 +22,6 @@ import '../theme/kinflow_theme.dart';
 import '../utils/geo.dart'
     show deltaRotation, distanceMetresHaversine, normaliserDegre;
 import '../utils/latlng_tween.dart';
-import '../utils/temps_relatif.dart';
 import '../services/poi_service.dart'
     show
         Poi,
@@ -217,9 +216,9 @@ const Map<String, double> _zoomMinParClasse = {
   'service': 15.0,
 };
 
-/// Type de lieu personnel que l'utilisateur pose sur la carte : son
-/// domicile (maison) ou son lieu de travail (mallette).
-enum TypeLieuPose { maison, travail }
+/// Type de lieu personnel que l'utilisateur pose sur la carte : son lieu de
+/// travail (mallette).
+enum TypeLieuPose { travail }
 
 class TrafficMap extends StatefulWidget {
   final MapController mapController;
@@ -261,24 +260,20 @@ class TrafficMap extends StatefulWidget {
   /// géographique actuellement au centre de la carte.
   final ValueChanged<LatLng>? onPoserEpingle;
 
-  /// Demande (depuis la recherche de lieu) d'entrer en mode « poser un lieu
-  /// personnel » : une icône de prévisualisation (maison ou mallette) suit
-  /// le centre de l'écran, la carte se laisse pivoter et déplacer dessous
-  /// pour viser le point, puis l'utilisateur la pose avec « Poser ». `null`
-  /// quand aucune pose n'est demandée.
+  /// Demande (depuis la recherche de lieu) d'entrer en mode « poser le lieu
+  /// de travail » : une icône de prévisualisation (mallette) suit le centre
+  /// de l'écran, la carte se laisse pivoter et déplacer dessous pour viser le
+  /// point, puis l'utilisateur la pose avec « Poser ». `null` quand aucune
+  /// pose n'est demandée.
   final TypeLieuPose? poseLieu;
-
-  /// Point du domicile enregistré : une icône maison reste ancrée sur ce
-  /// lieu, collée à la carte tant que le domicile n'est pas changé.
-  final LatLng? pointMaison;
 
   /// Point du lieu de travail enregistré : une mallette reste ancrée sur ce
   /// lieu, collée à la carte tant que le lieu de travail n'est pas changé.
   final LatLng? pointTravail;
 
-  /// Appelé quand l'utilisateur pose l'icône (maison ou travail) : fournit
-  /// le type posé et la coordonnée géographique au centre de la carte, que
-  /// le parent persiste comme domicile ou lieu de travail.
+  /// Appelé quand l'utilisateur pose l'icône du lieu de travail : fournit le
+  /// type posé et la coordonnée géographique au centre de la carte, que le
+  /// parent persiste comme lieu de travail.
   final void Function(TypeLieuPose type, LatLng point)? onPoserLieu;
 
   /// Appelé quand l'utilisateur annule la pose : le parent ressort du mode
@@ -394,7 +389,6 @@ class TrafficMap extends StatefulWidget {
     this.epingle,
     this.onPoserEpingle,
     this.poseLieu,
-    this.pointMaison,
     this.pointTravail,
     this.onPoserLieu,
     this.onAnnulerPoseLieu,
@@ -619,10 +613,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// posée avec le bouton « Poser ».
   bool _modePoserEpingle = false;
 
-  /// Mode pose d'un lieu personnel (maison ou travail, [TypeLieuPose]) :
-  /// même mécanique que l'épingle, mais avec l'icône du lieu demandé. Entré
-  /// à la demande du parent ([widget.poseLieu]), sorti quand l'utilisateur
-  /// pose ou annule.
+  /// Mode pose du lieu de travail ([TypeLieuPose]) : même mécanique que
+  /// l'épingle, mais avec l'icône du lieu demandé. Entré à la demande du
+  /// parent ([widget.poseLieu]), sorti quand l'utilisateur pose ou annule.
   TypeLieuPose? _poseLieuActif;
 
   /// Opacité des boutons flottants (pose d'épingle, cartes) : pleine après
@@ -770,9 +763,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       }
     }
 
-    // Demande de pose d'un lieu personnel : on suit le parent pour entrer ou
-    // sortir du mode « poser maison/travail » (l'épingle et la pose de lieu
-    // ne coexistent jamais, une pose en cours est d'abord refermée).
+    // Demande de pose du lieu de travail : on suit le parent pour entrer ou
+    // sortir du mode « poser le travail » (l'épingle et la pose de lieu ne
+    // coexistent jamais, une pose en cours est d'abord refermée).
     if (widget.poseLieu != _poseLieuActif) {
       if (widget.poseLieu != null) {
         _entrerModePoseLieu(widget.poseLieu!);
@@ -1282,10 +1275,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     widget.onPoserEpingle?.call(centre);
   }
 
-  /// Entre en mode « poser un lieu personnel » (maison ou travail), demandé
-  /// par le parent après un appui sur « Ma maison » ou « Mon travail » dans
-  /// la recherche de lieu : l'icône colle au centre de l'écran, la carte
-  /// reste libre à pivoter dessous.
+  /// Entre en mode « poser le lieu de travail », demandé par le parent après
+  /// un appui sur « Mon travail » dans la recherche de lieu : l'icône colle
+  /// au centre de l'écran, la carte reste libre à pivoter dessous.
   void _entrerModePoseLieu(TypeLieuPose type) {
     if (!mounted) return;
     setState(() {
@@ -1298,7 +1290,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     _annulerSansTap();
   }
 
-  /// Pose l'icône (maison ou travail) à la coordonnée géographique
+  /// Pose l'icône du lieu de travail à la coordonnée géographique
   /// actuellement au centre de l'écran, puis quitte le mode pose : le parent
   /// persiste le lieu correspondant.
   void _poserLieu() {
@@ -2152,7 +2144,18 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   Future<void> _chargerPois() async {
     if (!_fmtcReady || !mounted) return;
     if (widget.suspendreTravailCarte) return;
-    if (CircuitBreakerPois.ouvert) return;
+    if (CircuitBreakerPois.ouvert) {
+      // Disjoncteur ouvert : on ne martèle pas Overpass, mais on reprogramme
+      // une tentative pour la fin du délai. Sinon les badges restaient absents
+      // jusqu'au prochain déplacement de la carte.
+      _debouncePois?.cancel();
+      final delai =
+          CircuitBreakerPois.tempsRestant + const Duration(milliseconds: 500);
+      _debouncePois = Timer(delai, () {
+        if (mounted) unawaited(_chargerPois());
+      });
+      return;
+    }
 
     final camera = widget.mapController.camera;
     if (camera.zoom < zoomMinPois) {
@@ -2187,7 +2190,8 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       }
     } catch (e) {
       debugPrint('[KinFlow] Erreur chargement POI: $e');
-      CircuitBreakerPois.enregistrerEchec();
+      // L'échec est déjà compté UNE fois par `telechargerPois` (et non par
+      // miroir) : compter aussi ici ouvrait le disjoncteur deux fois plus vite.
       _debouncePois?.cancel();
       // Repli exponentiel (5 s, 15 s, 35 s, 75 s… plafonné à 120 s) : quand
       // Overpass souffre, on espace les tentatives au lieu de marteler.
@@ -2204,8 +2208,8 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     if (!_carteRendue) return;
     final zoom = widget.mapController.camera.zoom;
     // La signature embarque aussi la visibilité des badges ancrés des lieux
-    // personnels : elle change dès qu'un badge de maison/travail franchit le
-    // seuil [_zoomMinLieuxPersonnels], même si les tableaux de POIs, eux, ne
+    // personnels : elle change dès qu'un badge de travail franchit le seuil
+    // [_zoomMinLieuxPersonnels], même si les tableaux de POIs, eux, ne
     // bougent pas. Sans cela, le marqueur resterait figé jusqu'au prochain
     // changement de seuil POI.
     final signature =
@@ -3432,37 +3436,32 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// rester bien visible au centre pendant qu'on vise le point.
   static const double _taillePoseLieu = 40;
 
-  /// Zoom en dessous duquel les badges ancrés des lieux personnels (maison,
-  /// travail) disparaissent de la carte. Fortement dézoomés, ces petits repères
+  /// Zoom en dessous duquel les badges ancrés des lieux personnels
+  /// disparaissent de la carte. Fortement dézoomés, ces petits repères
   /// individuels n'ont plus leur place à l'échelle de la ville et ne feraient
   /// qu'encombrer la vue. Aligné sur le seuil d'apparition des POIs
   /// ([zoomMinPois]) : badges et POIs réagissent au même niveau, la transition
   /// est visuellement cohérente. Masquer aussi le badge épinglé en cours de
-  /// destination (maison/travail) relève d'un choix produit différent — ici on
-  /// ne masque que les deux badges ancrés.
+  /// destination relève d'un choix produit différent — ici on ne masque que
+  /// le badge ancré.
   static const double _zoomMinLieuxPersonnels = 14.0;
 
-  /// Vrai quand les badges ancrés des lieux personnels (maison, travail)
-  /// restent visibles au zoom donné. En dessous de [_zoomMinLieuxPersonnels]
-  /// (dézoom prononcé), ils sont masqués, exactement comme les POIs autour du
-  /// même seuil.
+  /// Vrai quand le badge ancré du lieu de travail reste visible au zoom
+  /// donné. En dessous de [_zoomMinLieuxPersonnels] (dézoom prononcé), il est
+  /// masqué, exactement comme les POIs autour du même seuil.
   bool _lieuxPersonnelsVisibles(double zoom) => zoom >= _zoomMinLieuxPersonnels;
 
   /// Vert de la famille POI, commun à tous les badges de lieu personnel.
   static const Color _vertLieuPersonnel = Color(0xFF00B050);
 
-  /// Icône qui distingue les deux lieux personnels : la maison et le travail
-  /// partagent EXACTEMENT le même badge, seul ce pictogramme change.
-  static IconData _iconeLieuPersonnel(TypeLieuPose type) =>
-      type == TypeLieuPose.maison ? Icons.home : Icons.work;
+  /// Icône du lieu de travail posé sur la carte.
+  static IconData _iconeLieuPersonnel(TypeLieuPose _) => Icons.work;
 
-  /// Badge d'un lieu personnel (maison ou travail) : le même badge que les
-  /// POIs — pastille blanche bordée de vert, icône verte — avec un faible
-  /// encombrement sur la carte. Il sert à la fois de prévisualisation pendant
-  /// la pose, de domicile posé et de lieu de travail posé ; [icone] est le SEUL
-  /// élément qui distingue la maison du travail. [taille] : la pose de lieu
-  /// emploie la version agrandie [_taillePoseLieu] pour rester visible au
-  /// centre.
+  /// Badge d'un lieu personnel : le même badge que les POIs — pastille
+  /// blanche bordée de vert, icône verte — avec un faible encombrement sur la
+  /// carte. Il sert à la fois de prévisualisation pendant la pose et de lieu
+  /// de travail posé. [taille] : la pose de lieu emploie la version agrandie
+  /// [_taillePoseLieu] pour rester visible au centre.
   Widget _construireBadgeLieu(IconData icone, {double taille = 30}) {
     return Container(
       width: taille,
@@ -3479,8 +3478,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     );
   }
 
-  /// Badge d'un [type] de lieu personnel (maison ou travail) à la [taille]
-  /// demandée : même code pour les deux, seul le pictogramme diffère.
+  /// Badge du lieu de travail à la [taille] demandée.
   Widget _construireLieu(TypeLieuPose type, {double taille = 30}) =>
       _construireBadgeLieu(_iconeLieuPersonnel(type), taille: taille);
 
@@ -3491,15 +3489,10 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// recalée sur la chaussée à côté du bâtiment où le badge est ancré.
   static const double _seuilCoincidenceLieuM = 50;
 
-  /// Si [point] tombe (à [_seuilCoincidenceLieuM] près) sur la maison ou le
-  /// lieu de travail enregistré, renvoie son type — autrement null.
+  /// Si [point] tombe (à [_seuilCoincidenceLieuM] près) sur le lieu de
+  /// travail enregistré, renvoie son type — autrement null.
   TypeLieuPose? _typeLieuPersonnel(LatLng? point) {
     if (point == null) return null;
-    final maison = widget.pointMaison;
-    if (maison != null &&
-        distanceMetresHaversine(maison, point) < _seuilCoincidenceLieuM) {
-      return TypeLieuPose.maison;
-    }
     final travail = widget.pointTravail;
     if (travail != null &&
         distanceMetresHaversine(travail, point) < _seuilCoincidenceLieuM) {
@@ -3514,8 +3507,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       _typeLieuPersonnel(widget.pointDestination ?? widget.lieuRecherche);
 
   /// Marqueur d'une destination (itinéraire ou lieu recherché) : son BADGE
-  /// rond si le point est une maison ou le lieu de travail, sinon le pin vert
-  /// habituel.
+  /// rond si le point est le lieu de travail, sinon le pin vert habituel.
   Widget _construireMarqueurDestination(LatLng point) {
     final type = _typeLieuPersonnel(point);
     return type == null
@@ -3793,7 +3785,11 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
               mapController: widget.mapController,
               options: MapOptions(
                 initialCenter: const LatLng(-4.325, 15.322),
-                initialZoom: 13,
+                // Zoom d'ouverture calé sur [zoomMinPois] : les badges des
+                // lieux (POIs) sont visibles dès l'affichage de la carte, au
+                // lieu d'un premier écran vide où il fallait zoomer à la main
+                // pour les faire apparaître.
+                initialZoom: 14,
                 onMapEvent: _surEvenementCarte,
                 interactionOptions: const InteractionOptions(
                   scrollWheelVelocity: 0.015,
@@ -3892,15 +3888,15 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
                               // Isolé dans un RepaintBoundary : le point bleu ne
                               // se recolle plus en copie fantôme au-dessus/en
                               // dessous de lui-même quand la caméra pivote et
-                              // zoome en même temps pendant la pose maison/travail
+                              // zoome en même temps pendant la pose du travail
                               // (doublon visible sur le rendu Web).
                               child: const RepaintBoundary(child: _PointBleu()),
                             ),
 
-                          // Lieu recherché : BADGE du lieu personnel si c'est la maison
-                          // ou le travail, sinon le pin vert habituel. Quand la
-                          // destination de l'itinéraire occupe déjà le même point, seul
-                          // son marqueur est dessiné (pas de doublon).
+                          // Lieu recherché : BADGE du lieu de travail si c'en est
+                          // un, sinon le pin vert habituel. Quand la destination de
+                          // l'itinéraire occupe déjà le même point, seul son
+                          // marqueur est dessiné (pas de doublon).
                           if (widget.lieuRecherche != null &&
                               !_coincide(
                                 widget.lieuRecherche,
@@ -3923,8 +3919,8 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
 
                           // Destination de l'itinéraire : son marqueur vert reste en
                           // place même quand un autre lieu est ensuite recherché. Si la
-                          // destination est la maison ou le travail, c'est leur BADGE
-                          // rond (icône domicile/mallette) qui s'affiche, pas un pin.
+                          // destination est le lieu de travail, c'est son BADGE rond
+                          // (icône mallette) qui s'affiche, pas un pin.
                           if (widget.pointDestination != null)
                             Marker(
                               point: widget.pointDestination!,
@@ -3948,39 +3944,17 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
                               child: _construireEtape(i + 1),
                             ),
 
-                          // Lieux personnels posés (domicile, travail) : leurs icônes restent
-                          // ancrées sur ces lieux, collées à la carte (elles suivent les
-                          // déplacements et rotations), tant que l'utilisateur ne les
-                          // change ou ne les supprime pas. Masquées pendant une nouvelle
-                          // pose, remplacées par l'icône de prévisualisation au centre.
-                          // Leur TAILLE suit le zoom ([_BadgeAncrageZoom] lit la caméra) :
-                          // gros en zoom in, petit puis invisible en zoom out.
-                          if (widget.pointMaison != null &&
-                              _poseLieuActif != TypeLieuPose.maison &&
-                              _typeLieuDestination != TypeLieuPose.maison)
-                            Marker(
-                              key: const ValueKey('badge_maison'),
-                              point: widget.pointMaison!,
-                              width: _BadgeAncrageZoom.tailleBoite,
-                              height: _BadgeAncrageZoom.tailleBoite,
-                              // Reste droit pendant la rotation de la carte.
-                              rotate: true,
-                              // Le badge change de taille à chaque
-                              // mouvement/zoom de caméra. Isolé dans un
-                              // RepaintBoundary, il ne laisse plus filer de
-                              // copie fantôme décalée au-dessus/en dessous
-                              // pendant l'animation de pose (doublon Web).
-                              child: RepaintBoundary(
-                                child: _BadgeAncrageZoom(
-                                  construire: (taille) => _construireLieu(
-                                    TypeLieuPose.maison,
-                                    taille: taille,
-                                  ),
-                                ),
-                              ),
-                            ),
-
+                          // Lieu de travail posé : son icône reste ancrée sur ce
+                          // lieu, collée à la carte (elle suit les déplacements et
+                          // rotations), tant que l'utilisateur ne le change ou ne le
+                          // supprime pas. Masquée pendant une nouvelle pose,
+                          // remplacée par l'icône de prévisualisation au centre.
+                          // Sa TAILLE suit le zoom ([_BadgeAncrageZoom] lit la caméra) :
+                          // grosse en zoom in, petite puis invisible en zoom out.
                           if (widget.pointTravail != null &&
+                              _lieuxPersonnelsVisibles(
+                                widget.mapController.camera.zoom,
+                              ) &&
                               _poseLieuActif != TypeLieuPose.travail &&
                               _typeLieuDestination != TypeLieuPose.travail)
                             Marker(
@@ -4127,7 +4101,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
               children: [
                 // Icône de prévisualisation au centre de l'écran : elle ne
                 // capte aucun toucher — la carte reste libre à pivoter et à
-                // se déplacer dessous pour viser le lieu (maison ou travail).
+                // se déplacer dessous pour viser le lieu de travail.
                 // Elle change de TAILLE à chaque mouvement/zoom de caméra,
                 // comme les badges. Isolée dans un RepaintBoundary, elle ne
                 // laisse plus filer de copie fantôme décalée au-dessus/en
@@ -4360,16 +4334,17 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   }
 }
 
-/// Badge maison/travail ANCRÉ à taille SUIVANT LE ZOOM : il lit la caméra dans
+/// Badge du lieu de travail ANCRÉ à taille SUIVANT LE ZOOM : il lit la caméra dans
 /// son build ([MapCamera.of], fournie par le modèle hérité de FlutterMap), donc
 /// il est reconstruit à chaque changement de zoom/déplacement/rotation de la
-/// carte. Sa taille à l'écran suit ainsi le zoom — gros quand on zoome,
-/// minuscule puis INVISIBLE quand on dézoome — au lieu d'une grosse icône
-/// figée qui reste plantée sur la carte même en dézoom maximal.
+/// carte. Sa taille à l'écran suit ainsi le zoom — gros quand on zoome, mais
+/// jamais sous [tailleMinVisible] — au lieu d'une grosse icône figée qui reste
+/// plantée sur la carte même en dézoom maximal. Le badge n'est construit que
+/// lorsque le zoom atteint [zoomMinPois] (voir `_lieuxPersonnelsVisibles`).
 class _BadgeAncrageZoom extends StatelessWidget {
   const _BadgeAncrageZoom({required this.construire});
 
-  /// Fabrique le badge voulu (maison ou travail) à la taille demandée.
+  /// Fabrique le badge du lieu de travail à la taille demandée.
   final Widget Function(double taille) construire;
 
   /// Zoom de référence : à ce niveau le badge affiche sa [tailleBase].
@@ -4378,9 +4353,11 @@ class _BadgeAncrageZoom extends StatelessWidget {
   /// Taille du badge au zoom de référence (px, gabarit POI actuel).
   static const double tailleBase = 30;
 
-  /// Sous cette taille à l'écran (px) le badge disparaît complètement : le
-  /// dézoom fait « petit petit jusqu'à disparaître ».
-  static const double tailleMinVisible = 7;
+  /// Taille minimale à l'écran (px) une fois le badge affiché. Il ne rétrécit
+  /// plus jusqu'à devenir illisible : sans ce plancher, le badge du travail
+  /// mesurait moins de 7 px (donc invisible) à tous les zooms inférieurs à
+  /// ~15, alors que les POIs, eux, apparaissent dès [zoomMinPois] (14).
+  static const double tailleMinVisible = 22;
 
   /// Taille maximale (px) : le badge ne devient pas absurde en très fort zoom.
   static const double tailleMax = 72;
@@ -4393,17 +4370,15 @@ class _BadgeAncrageZoom extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final taille = _taillePourZoom(MapCamera.of(context).zoom);
-    if (taille <= 0) return const SizedBox.shrink();
     return Align(alignment: Alignment.center, child: construire(taille));
   }
 
   /// Taille d'affichage pour un zoom donné : double à chaque niveau de zoom
-  /// au-dessus de [zoomReference], réduite de moitié en dessous, 0 (invisible)
-  /// sous [tailleMinVisible].
+  /// au-dessus de [zoomReference], réduite de moitié en dessous, mais jamais
+  /// sous [tailleMinVisible] (le badge reste lisible tant qu'il est affiché).
   static double _taillePourZoom(double zoom) {
     final taille = tailleBase * pow(2, zoom - zoomReference);
-    if (taille < tailleMinVisible) return 0;
-    return min(taille, tailleMax);
+    return taille.clamp(tailleMinVisible, tailleMax);
   }
 }
 
@@ -4498,11 +4473,7 @@ class _MarqueurAmi extends StatelessWidget {
                       color: Colors.white,
                       shape: BoxShape.circle,
                     ),
-                    child: AvatarAnimalWidget(
-                      taille: 30,
-                      avatarId: ami.avatar,
-                      userId: ami.id,
-                    ),
+                    child: AvatarAnimalWidget(taille: 30, avatarId: ami.avatar),
                   ),
                 ),
               ],
@@ -4525,44 +4496,6 @@ class _MarqueurAmi extends StatelessWidget {
               ),
             ),
           ),
-          // Âge de la dernière position enregistrée : visible même quand le
-          // téléphone de l'ami(e) est éteint (position « figée » côté serveur).
-          if (ami.majA != null) ...[
-            const SizedBox(height: 2),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(8),
-                boxShadow: const [
-                  BoxShadow(
-                    color: Colors.black26,
-                    blurRadius: 3,
-                    offset: Offset(0, 1),
-                  ),
-                ],
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.schedule, size: 10, color: _vert),
-                  const SizedBox(width: 3),
-                  Flexible(
-                    child: Text(
-                      tempsRelatif(ami.majA!),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w600,
-                        color: _vert,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
         ],
       ),
     );

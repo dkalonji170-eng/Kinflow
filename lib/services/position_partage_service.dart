@@ -44,8 +44,10 @@ class PositionPartageService with WidgetsBindingObserver {
   static const Duration _delaiMinPublication = Duration(seconds: 15);
   static const double _distanceMinPublicationMetres = 20.0;
 
-  /// Démarre le service (idempotent). À appeler une fois au démarrage de
-  /// l'application (après authentification).
+  /// Démarre le flux GPS local (idempotent).
+  ///
+  /// Ne modifie JAMAIS le consentement côté serveur : l'activation passe
+  /// obligatoirement par [activer], appelée depuis l'écran de consentement.
   Future<void> start() async {
     if (_started) return;
     _started = true;
@@ -54,9 +56,6 @@ class PositionPartageService with WidgetsBindingObserver {
       WidgetsBinding.instance.addObserver(this);
       _observationEnregistree = true;
     }
-
-    // S'assure que le partage est actif côté serveur.
-    await _supabaseService.assurerPartagePosition();
 
     // Tant que l'appli est au premier plan, on réessaie toutes les 30 s si le
     // flux n'a pas pu démarrer (GPS activé après coup, permission accordée
@@ -78,6 +77,41 @@ class PositionPartageService with WidgetsBindingObserver {
   bool get _auPremierPlan {
     final etat = WidgetsBinding.instance.lifecycleState;
     return etat == null || etat == AppLifecycleState.resumed;
+  }
+
+  /// Reprend le partage UNIQUEMENT si un consentement actif existe déjà.
+  /// À appeler à l'ouverture de l'accueil ; ne demande jamais d'activation.
+  Future<bool> reprendreSiActif() async {
+    try {
+      final details = await _supabaseService.monPartagePositionDetails();
+      if (details['actif'] != true) return false;
+      await start();
+      return true;
+    } catch (e) {
+      Journal.a('POSITION', 'Reprise du partage impossible', {'erreur': '$e'});
+      return false;
+    }
+  }
+
+  /// Active le partage avec consentement explicite, puis démarre le GPS.
+  Future<bool> activer({int? dureeMinutes}) async {
+    final ok = await _supabaseService.definirPartagePosition(
+      true,
+      dureeMinutes: dureeMinutes,
+    );
+    if (!ok) return false;
+    await start();
+    Journal.s('POSITION', 'Partage de position activé', {
+      'duree_minutes': dureeMinutes,
+    });
+    return true;
+  }
+
+  /// Désactive côté serveur (efface les coordonnées) puis arrête le GPS.
+  Future<void> desactiver() async {
+    await _supabaseService.definirPartagePosition(false);
+    stop();
+    Journal.s('POSITION', 'Partage de position désactivé');
   }
 
   /// Arrête complètement le service (réinitialise les timers/flux).
@@ -102,12 +136,17 @@ class PositionPartageService with WidgetsBindingObserver {
     _relanceTimer = null;
     _dernierFixGps = null;
     _positionAcceptee = null;
+    _dernierePublicationPosition = null;
+    _dernierePositionPubliee = null;
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      Journal.i('POSITION', 'Application au premier plan : démarrage partage position global');
+      Journal.i(
+        'POSITION',
+        'Application au premier plan : démarrage partage position global',
+      );
       unawaited(_demarrerFluxSiPossible());
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached ||
@@ -115,7 +154,10 @@ class PositionPartageService with WidgetsBindingObserver {
       // On s'arrête uniquement quand l'appli quitte réellement le premier plan.
       // `inactive` est transitoire (tiroir de notifications, boîte de dialogue,
       // sélecteur d'applis) : inutile de couper le suivi pour si peu.
-      Journal.i('POSITION', 'Application en arrière-plan : arrêt partage position global');
+      Journal.i(
+        'POSITION',
+        'Application en arrière-plan : arrêt partage position global',
+      );
       _arreterFlux();
     }
   }
@@ -126,14 +168,20 @@ class PositionPartageService with WidgetsBindingObserver {
 
     // Vérifie que l'utilisateur est connecté.
     if (!_supabaseService.isSignedIn) {
-      Journal.i('POSITION', 'Partage global : utilisateur non connecté, flux non démarré');
+      Journal.i(
+        'POSITION',
+        'Partage global : utilisateur non connecté, flux non démarré',
+      );
       return;
     }
 
     // Vérifie le service de localisation (GPS).
     final serviceActif = await Geolocator.isLocationServiceEnabled();
     if (!serviceActif) {
-      Journal.a('POSITION', 'Partage global : service de localisation désactivé');
+      Journal.a(
+        'POSITION',
+        'Partage global : service de localisation désactivé',
+      );
       _arreterFlux();
       return;
     }
@@ -145,17 +193,26 @@ class PositionPartageService with WidgetsBindingObserver {
     if (permission == LocationPermission.denied && !_permissionDemandee) {
       _permissionDemandee = true;
       try {
-        Journal.i('POSITION', 'Partage global : demande de permission localisation');
+        Journal.i(
+          'POSITION',
+          'Partage global : demande de permission localisation',
+        );
         permission = await Geolocator.requestPermission();
       } catch (e) {
-        Journal.a('POSITION', 'Partage global : demande de permission impossible',
-            {'erreur': '$e'});
+        Journal.a(
+          'POSITION',
+          'Partage global : demande de permission impossible',
+          {'erreur': '$e'},
+        );
       }
     }
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
-      Journal.a('POSITION', 'Partage global : permission localisation refusée/indéfinie',
-          {'permission': '$permission'});
+      Journal.a(
+        'POSITION',
+        'Partage global : permission localisation refusée/indéfinie',
+        {'permission': '$permission'},
+      );
       _arreterFlux();
       return;
     }
@@ -170,7 +227,10 @@ class PositionPartageService with WidgetsBindingObserver {
       final dernier = _dernierFixGps;
       if (dernier == null ||
           DateTime.now().difference(dernier) > const Duration(seconds: 60)) {
-        Journal.a('POSITION', 'Partage global : aucun fix GPS depuis 60 s, redémarrage');
+        Journal.a(
+          'POSITION',
+          'Partage global : aucun fix GPS depuis 60 s, redémarrage',
+        );
         _positionStream?.cancel();
         _positionStream = null;
         if (!_started) return;
@@ -191,7 +251,8 @@ class PositionPartageService with WidgetsBindingObserver {
           LatLng(precedente.latitude, precedente.longitude),
           LatLng(position.latitude, position.longitude),
         );
-        significatif = metres > 15 ||
+        significatif =
+            metres > 15 ||
             (position.speed >= 1.0 &&
                 (position.heading - precedente.heading).abs() > 20);
       }
@@ -211,87 +272,97 @@ class PositionPartageService with WidgetsBindingObserver {
     }
 
     try {
-      _positionStream = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.bestForNavigation,
-          distanceFilter: 1,
-        ),
-      ).listen(
-        (Position position) {
-          _dernierFixGps = DateTime.now();
-          journaliserFix(position);
-
-          // Filtre précision
-          if (position.accuracy > _precisionGpsMaxMetres &&
-              _positionAcceptee != null) {
-            return;
-          }
-
-          // Filtre bruit
-          final pointFix = LatLng(position.latitude, position.longitude);
-          final accepte = _positionAcceptee ?? (pointFix, DateTime.now());
-          _positionAcceptee = accepte;
-          final dureeSec = DateTime.now().difference(accepte.$2).inMilliseconds / 1000.0;
-          final distanceDepuisAcceptee = const Distance().distance(
-            accepte.$1,
-            pointFix,
-          );
-          final vitesseEffectiveMs = dureeSec > 0 ? distanceDepuisAcceptee / dureeSec : 0;
-          if (distanceDepuisAcceptee < _seuilBruitPositionMetres &&
-              vitesseEffectiveMs < _seuilVitesseEffectiveMs) {
-            return;
-          }
-          _positionAcceptee = (pointFix, DateTime.now());
-
-          // Publier avec throttling
-          final maintenant = DateTime.now();
-          final derniere = _dernierePublicationPosition;
-          final dernierePoint = _dernierePositionPubliee;
-          final delaiEcoule = derniere == null ||
-              maintenant.difference(derniere) >= _delaiMinPublication;
-          final bougeAssez = dernierePoint == null ||
-              const Distance().distance(dernierePoint, pointFix) >=
-                  _distanceMinPublicationMetres;
-          if (!delaiEcoule && !bougeAssez) {
-            return;
-          }
-
-          _dernierePublicationPosition = maintenant;
-          _dernierePositionPubliee = pointFix;
-
-          // Jamais de publication sans session : après une déconnexion, on ne
-          // veut pas recréer de session anonyme pour publier une position.
-          if (!_supabaseService.isSignedIn) {
-            _arreterFlux();
-            return;
-          }
-
-          unawaited(
-            _supabaseService.publierMaPosition(
-              latitude: pointFix.latitude,
-              longitude: pointFix.longitude,
-              cap: position.heading >= 0 ? position.heading : null,
+      _positionStream =
+          Geolocator.getPositionStream(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.bestForNavigation,
+              distanceFilter: 1,
             ),
+          ).listen(
+            (Position position) {
+              _dernierFixGps = DateTime.now();
+              journaliserFix(position);
+
+              // Filtre précision
+              if (position.accuracy > _precisionGpsMaxMetres &&
+                  _positionAcceptee != null) {
+                return;
+              }
+
+              // Filtre bruit
+              final pointFix = LatLng(position.latitude, position.longitude);
+              final accepte = _positionAcceptee ?? (pointFix, DateTime.now());
+              _positionAcceptee = accepte;
+              final dureeSec =
+                  DateTime.now().difference(accepte.$2).inMilliseconds / 1000.0;
+              final distanceDepuisAcceptee = const Distance().distance(
+                accepte.$1,
+                pointFix,
+              );
+              final vitesseEffectiveMs = dureeSec > 0
+                  ? distanceDepuisAcceptee / dureeSec
+                  : 0;
+              if (distanceDepuisAcceptee < _seuilBruitPositionMetres &&
+                  vitesseEffectiveMs < _seuilVitesseEffectiveMs) {
+                return;
+              }
+              _positionAcceptee = (pointFix, DateTime.now());
+
+              // Publier avec throttling
+              final maintenant = DateTime.now();
+              final derniere = _dernierePublicationPosition;
+              final dernierePoint = _dernierePositionPubliee;
+              final delaiEcoule =
+                  derniere == null ||
+                  maintenant.difference(derniere) >= _delaiMinPublication;
+              final bougeAssez =
+                  dernierePoint == null ||
+                  const Distance().distance(dernierePoint, pointFix) >=
+                      _distanceMinPublicationMetres;
+              if (!delaiEcoule && !bougeAssez) {
+                return;
+              }
+
+              _dernierePublicationPosition = maintenant;
+              _dernierePositionPubliee = pointFix;
+
+              // Jamais de publication sans session : après une déconnexion, on ne
+              // veut pas recréer de session anonyme pour publier une position.
+              if (!_supabaseService.isSignedIn) {
+                _arreterFlux();
+                return;
+              }
+
+              unawaited(
+                _supabaseService.publierMaPosition(
+                  latitude: pointFix.latitude,
+                  longitude: pointFix.longitude,
+                  cap: position.heading >= 0 ? position.heading : null,
+                ),
+              );
+            },
+            onError: (Object e, StackTrace st) {
+              Journal.e('POSITION', 'Partage global : flux GPS interrompu', {
+                'erreur': '$e',
+              });
+              debugPrint('[KinFlow] Partage global : flux GPS interrompu: $e');
+              _positionStream?.cancel();
+              _positionStream = null;
+              if (_started) {
+                _relanceTimer?.cancel();
+                _relanceTimer = Timer(const Duration(seconds: 3), () {
+                  _relanceTimer = null;
+                  if (!_started || _positionStream != null) return;
+                  unawaited(_demarrerFluxSiPossible());
+                });
+              }
+            },
+            cancelOnError: true,
           );
-        },
-        onError: (Object e, StackTrace st) {
-          Journal.e('POSITION', 'Partage global : flux GPS interrompu', {'erreur': '$e'});
-          debugPrint('[KinFlow] Partage global : flux GPS interrompu: $e');
-          _positionStream?.cancel();
-          _positionStream = null;
-          if (_started) {
-            _relanceTimer?.cancel();
-            _relanceTimer = Timer(const Duration(seconds: 3), () {
-              _relanceTimer = null;
-              if (!_started || _positionStream != null) return;
-              unawaited(_demarrerFluxSiPossible());
-            });
-          }
-        },
-        cancelOnError: true,
-      );
     } catch (e) {
-      Journal.e('POSITION', 'Partage global : impossible de démarrer le flux', {'erreur': '$e'});
+      Journal.e('POSITION', 'Partage global : impossible de démarrer le flux', {
+        'erreur': '$e',
+      });
       _arreterFlux();
     }
   }

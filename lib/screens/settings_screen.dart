@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import 'notifications_screen.dart';
 import '../theme/theme_provider.dart';
 import 'about_screen.dart';
+import 'compte_screen.dart';
 import 'help_screen.dart';
 import 'splash_screen.dart';
 import '../services/diagnostics_service.dart';
@@ -102,6 +103,19 @@ class SettingsScreen extends StatelessWidget {
               Navigator.push(
                 context,
                 MaterialPageRoute(builder: (context) => const HelpScreen()),
+              );
+            },
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.manage_accounts),
+            title: const Text("Mon compte"),
+            subtitle: const Text("Sauvegarder le compte, email, suppression"),
+            trailing: const Icon(Icons.arrow_forward_ios),
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const CompteScreen()),
               );
             },
           ),

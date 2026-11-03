@@ -12,8 +12,11 @@ import '../services/diagnostics_service.dart';
 import '../services/enregistreur_vocal.dart';
 import '../services/supabase_service.dart';
 import '../theme/kinflow_theme.dart';
+import '../widgets/autorisations_localisation_sheet.dart';
+import '../widgets/actions_ami.dart';
 import '../widgets/avatar_animal.dart';
 import '../widgets/bulle_vocale.dart';
+import '../widgets/citation_message.dart';
 import '../widgets/profil_ami_dialog.dart';
 import '../widgets/social_ui.dart';
 import 'traffic_screen.dart';
@@ -104,6 +107,26 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
   /// chaque rafraîchissement de la discussion (toutes les 8 s).
   final Map<String, Future<String?>> _urlsPhotos = {};
 
+  // --- Réponse à un message (façon WhatsApp) ---------------------------------
+  /// Message actuellement cité : il est affiché en aperçu au-dessus du clavier,
+  /// et l'envoi l'emporte comme référence (`reply_to_message_id`).
+  Map<String, dynamic>? _reponseA;
+
+  /// Clé de chaque bulle, par identifiant de message : sert à faire défiler la
+  /// discussion jusqu'au message cité quand on touche un aperçu.
+  final Map<String, GlobalKey> _clesMessages = {};
+
+  /// Message brièvement mis en évidence après une navigation vers lui.
+  String? _messageSurligne;
+  Timer? _minuteurSurligne;
+
+  /// Une réponse ne peut citer qu'un message déjà présent sur le serveur : une
+  /// bulle « en cours » n'a pas encore d'identifiant définitif.
+  bool _peutCiter(Map<String, dynamic> message) {
+    if (message['est_systeme'] == true) return false;
+    return _coteServeur(message);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -132,6 +155,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
     Journal.i('SOCIAL', 'Discussion fermée', {'ami': widget.nom});
     _minuteur?.cancel();
     _minuteurVocal?.cancel();
+    _minuteurSurligne?.cancel();
     _enregistreur.dispose();
     _saisie.removeListener(_surSaisieChangee);
     _saisie.dispose();
@@ -422,7 +446,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
 
   void _descendreEnBas() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_defilement.hasClients) return;
+      if (!mounted || !_defilement.hasClients) return;
       _defilement.animateTo(
         _defilement.position.maxScrollExtent,
         duration: const Duration(milliseconds: 200),
@@ -434,17 +458,46 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
   Future<void> _envoyer() async {
     final texte = _saisie.text.trim();
     if (texte.isEmpty || _envoi) return;
-    setState(() => _envoi = true);
+    final cite = _reponseA;
+    setState(() {
+      _envoi = true;
+      _reponseA = null;
+    });
     _saisie.clear();
-    await _envoyerTexte(texte);
+    await _envoyerTexte(
+      texte,
+      repondreA: cite?['id']?.toString(),
+      apercu: cite == null ? null : _apercuDepuisMessage(cite),
+    );
     if (mounted) setState(() => _envoi = false);
+  }
+
+  /// Aperçu d'un message au format renvoyé par le serveur (`reply_to`), pour
+  /// que la bulle optimiste affiche la citation sans attendre le réseau.
+  Map<String, dynamic> _apercuDepuisMessage(Map<String, dynamic> message) {
+    return {
+      'id': message['id'],
+      'expediteur': message['expediteur'],
+      'moi': message['moi'] == true,
+      'contenu': message['contenu'] ?? '',
+      'type_message': message['type_message'] ?? 'texte',
+      'est_systeme': message['est_systeme'] == true,
+      'modifie_a': message['modifie_a'],
+    };
   }
 
   /// Envoie [texte] avec affichage optimiste : une bulle « en cours » apparaît
   /// aussitôt, puis passe à « envoyé » (simple coche) une fois le serveur
   /// confirmé. En cas d'échec, la bulle garde une icône d'erreur et peut être
   /// renvoyée en la touchant. [remplaceId] sert au renvoi d'un échec.
-  Future<void> _envoyerTexte(String texte, {String? remplaceId}) async {
+  /// [repondreA] est l'identifiant du message cité (facultatif) : il est
+  /// enregistré comme RÉFÉRENCE, avec [apercu] pour l'affichage immédiat.
+  Future<void> _envoyerTexte(
+    String texte, {
+    String? remplaceId,
+    String? repondreA,
+    Map<String, dynamic>? apercu,
+  }) async {
     final tempId =
         remplaceId ?? 'local_${DateTime.now().microsecondsSinceEpoch}';
     setState(() {
@@ -455,6 +508,10 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         'cree_a': DateTime.now().toIso8601String(),
         'moi': true,
         'statut': 'en_cours',
+        if (repondreA != null && repondreA.isNotEmpty) ...{
+          'reply_to_message_id': repondreA,
+          'reply_to': ?apercu,
+        },
       });
     });
     _descendreEnBas();
@@ -462,6 +519,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
     final resultat = await SupabaseService().envoyerMessageAmi(
       amiId: widget.amiId,
       contenu: texte,
+      repondreA: repondreA,
     );
     if (!mounted) return;
     if (resultat == 'envoye') {
@@ -574,8 +632,14 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
     List<int> formes,
   ) async {
     final tempId = 'local_${DateTime.now().microsecondsSinceEpoch}';
+    // Un vocal peut lui aussi répondre à un message : on fige la référence
+    // maintenant, puis on libère l'aperçu de saisie.
+    final cite = _reponseA;
+    final repondreA = cite?['id']?.toString();
+    final apercu = cite == null ? null : _apercuDepuisMessage(cite);
     setState(() {
       _envoiVocal = true;
+      _reponseA = null;
       _messages.add({
         'id': tempId,
         'contenu': '',
@@ -586,10 +650,21 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         'audio_local': chemin,
         'audio_duree_ms': dureeMs,
         'audio_formes': formes,
+        if (repondreA != null && repondreA.isNotEmpty) ...{
+          'reply_to_message_id': repondreA,
+          'reply_to': ?apercu,
+        },
       });
     });
     _descendreEnBas();
-    await _pousserVocal(tempId, chemin, dureeMs, formes);
+    await _pousserVocal(
+      tempId,
+      chemin,
+      dureeMs,
+      formes,
+      repondreA: repondreA,
+      apercu: apercu,
+    );
   }
 
   /// Réessaie l'envoi d'un vocal en échec (bouton sur la bulle en erreur).
@@ -609,6 +684,8 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
             ]
           : const [],
       bucketExistant: message['audio_bucket_local']?.toString(),
+      repondreA: message['reply_to_message_id']?.toString(),
+      apercu: (message['reply_to'] as Map?)?.cast<String, dynamic>(),
     );
   }
 
@@ -620,6 +697,8 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
     int dureeMs,
     List<int> formes, {
     String? bucketExistant,
+    String? repondreA,
+    Map<String, dynamic>? apercu,
   }) async {
     setState(() {
       _envoiVocal = true;
@@ -663,6 +742,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         audioChemin: bucket,
         audioDureeMs: dureeMs,
         audioFormes: formes,
+        repondreA: repondreA,
       );
     }
 
@@ -808,8 +888,13 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
   /// puis passe à « envoyé » une fois le téléversement et le message confirmés.
   Future<void> _envoyerImage(Uint8List octets, String extension) async {
     final tempId = 'local_${DateTime.now().microsecondsSinceEpoch}';
+    // Une photo peut aussi répondre à un message : la référence est figée ici.
+    final cite = _reponseA;
+    final repondreA = cite?['id']?.toString();
+    final apercu = cite == null ? null : _apercuDepuisMessage(cite);
     setState(() {
       _envoiImage = true;
+      _reponseA = null;
       _photosLocales[tempId] = octets;
       _messages.add({
         'id': tempId,
@@ -819,10 +904,14 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         'statut': 'en_cours',
         'type_message': 'image',
         'image_extension': extension,
+        if (repondreA != null && repondreA.isNotEmpty) ...{
+          'reply_to_message_id': repondreA,
+          'reply_to': ?apercu,
+        },
       });
     });
     _descendreEnBas();
-    await _pousserImage(tempId, octets, extension);
+    await _pousserImage(tempId, octets, extension, repondreA: repondreA);
   }
 
   /// Réessaie l'envoi d'une photo en échec (appui sur la bulle).
@@ -835,6 +924,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
       octets,
       message['image_extension']?.toString() ?? 'jpg',
       bucketExistant: message['image_bucket_local']?.toString(),
+      repondreA: message['reply_to_message_id']?.toString(),
     );
   }
 
@@ -845,6 +935,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
     Uint8List octets,
     String extension, {
     String? bucketExistant,
+    String? repondreA,
   }) async {
     setState(() {
       _envoiImage = true;
@@ -880,6 +971,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         amiId: widget.amiId,
         contenu: '',
         imageChemin: bucket,
+        repondreA: repondreA,
       );
     }
 
@@ -894,9 +986,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
       await _charger(silencieux: true);
     } else {
       final televersementEchoue = bucket == null;
-      final detail = televersementEchoue
-          ? SupabaseService().derniereErreur
-          : null;
+      final detail = SupabaseService().derniereErreur;
       Journal.a(
         'SOCIAL',
         televersementEchoue
@@ -914,17 +1004,20 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
           _messages[index] = {..._messages[index], 'statut': 'echec'};
         }
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            resultat == null
-                ? (televersementEchoue
-                      ? 'Téléversement de la photo impossible. Réessaie.'
-                      : 'Photo envoyée mais message non enregistré. Réessaie.')
-                : _messageErreur(resultat),
-          ),
-        ),
-      );
+      // On remonte le détail lisible (bucket manquant, droits, réseau…) au
+      // lieu d'un « impossible » générique qui ne dit pas quoi corriger.
+      final message = resultat == null
+          ? (televersementEchoue
+                ? (detail != null && detail.isNotEmpty
+                      ? 'Photo non envoyée : $detail'
+                      : 'Téléversement de la photo impossible. Réessaie.')
+                : (detail != null && detail.isNotEmpty
+                      ? 'Photo envoyée mais message non enregistré : $detail'
+                      : 'Photo envoyée mais message non enregistré. Réessaie.'))
+          : _messageErreur(resultat);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
     }
   }
 
@@ -951,6 +1044,55 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
       bottomRight: Radius.circular(moi ? 4 : 16),
     );
 
+    final photo = Stack(
+      children: [
+        ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: largeur,
+            maxHeight: 320,
+            minWidth: 120,
+            minHeight: 90,
+          ),
+          child: _apercuPhoto(message),
+        ),
+        Positioned(
+          right: 6,
+          bottom: 6,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.45),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  _heure(message['cree_a']),
+                  style: const TextStyle(fontSize: 11, color: Colors.white),
+                ),
+                if (moi) ...[
+                  const SizedBox(width: 4),
+                  _indicateurStatut(statut),
+                ],
+              ],
+            ),
+          ),
+        ),
+        if (echec)
+          const Positioned(
+            left: 6,
+            top: 6,
+            child: Icon(Icons.error_outline, color: Colors.redAccent, size: 20),
+          ),
+      ],
+    );
+
+    // Une photo qui répond à un message porte la citation AU-DESSUS de l'image,
+    // dans la même bulle arrondie.
+    final avecCitation =
+        (message['reply_to_message_id']?.toString() ?? '').isNotEmpty;
+
     final bulle = Container(
       margin: const EdgeInsets.symmetric(vertical: 3, horizontal: 10),
       decoration: BoxDecoration(
@@ -965,53 +1107,23 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
       ),
       child: ClipRRect(
         borderRadius: rayon,
-        child: Stack(
-          children: [
-            ConstrainedBox(
-              constraints: BoxConstraints(
-                maxWidth: largeur,
-                maxHeight: 320,
-                minWidth: 120,
-                minHeight: 90,
-              ),
-              child: _apercuPhoto(message),
-            ),
-            Positioned(
-              right: 6,
-              bottom: 6,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.45),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Row(
+        child: avecCitation
+            ? SizedBox(
+                width: largeur,
+                child: Column(
                   mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Text(
-                      _heure(message['cree_a']),
-                      style: const TextStyle(fontSize: 11, color: Colors.white),
+                    Container(
+                      color: Colors.black.withValues(alpha: 0.45),
+                      padding: const EdgeInsets.all(6),
+                      child: _citationBulle(message),
                     ),
-                    if (moi) ...[
-                      const SizedBox(width: 4),
-                      _indicateurStatut(statut),
-                    ],
+                    photo,
                   ],
                 ),
-              ),
-            ),
-            if (echec)
-              const Positioned(
-                left: 6,
-                top: 6,
-                child: Icon(
-                  Icons.error_outline,
-                  color: Colors.redAccent,
-                  size: 20,
-                ),
-              ),
-          ],
-        ),
+              )
+            : photo,
       ),
     );
 
@@ -1178,7 +1290,6 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
       avatar: widget.avatar,
       position: LatLng(latitude, longitude),
       cap: _double(resultat['cap']),
-      majA: DateTime.tryParse(resultat['maj_a']?.toString() ?? ''),
     );
 
     // Le message système vient d'être créé : on rafraîchit la discussion et
@@ -1216,295 +1327,13 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
   /// Ouvre la feuille des autorisations : autoriser (ou révoquer) la
   /// localisation simple, et renouveler l'urgence laissée à l'ami(e).
   Future<void> _ouvrirAutorisations() async {
-    Journal.i('SOCIAL', 'Ouverture des autorisations de localisation', {
-      'ami': widget.nom,
-    });
-    await _chargerAutorisations();
-    if (!mounted) return;
-    final etat = _autorisations;
-    if (etat == null) {
-      Journal.a('SOCIAL', 'Autorisations indisponibles', {'ami': widget.nom});
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Autorisations indisponibles. Vérifie ta connexion.'),
-        ),
-      );
-      return;
-    }
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      isScrollControlled: true,
-      backgroundColor: Theme.of(context).colorScheme.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setLocal) {
-          final theme = Theme.of(ctx);
-          final couleur = theme.colorScheme;
-          final jeLAutorise = etat['moi_autorise_ami_loc_simple'] == true;
-          final urgencePourLui =
-              etat['urgence_dispo_pour_ami_localiser_moi'] == true;
-          final nom = widget.nom;
-          final rouge = theme.brightness == Brightness.dark
-              ? const Color(0xFFEF5350)
-              : _rougeUrgence;
-
-          // Une autorisation = une carte : icône teintée, libellé clair et
-          // l'action à droite. Rien d'autre, pour rester lisible d'un coup d'œil.
-          Widget carte({
-            required IconData icone,
-            required String titre,
-            required String sousTitre,
-            required Color teinte,
-            required bool actif,
-            Widget? accessoire,
-          }) {
-            return Container(
-              padding: const EdgeInsets.fromLTRB(14, 12, 12, 12),
-              decoration: BoxDecoration(
-                color: teinte.withValues(alpha: actif ? 0.07 : 0.03),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: teinte.withValues(alpha: actif ? 0.30 : 0.14),
-                ),
-              ),
-              child: Row(
-                children: [
-                  Container(
-                    width: 38,
-                    height: 38,
-                    decoration: BoxDecoration(
-                      color: teinte.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Icon(icone, size: 20, color: teinte),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          titre,
-                          style: theme.textTheme.bodyMedium?.copyWith(
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          sousTitre,
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: couleur.onSurfaceVariant,
-                            height: 1.3,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (accessoire != null) ...[
-                    const SizedBox(width: 8),
-                    accessoire,
-                  ],
-                ],
-              ),
-            );
-          }
-
-          Widget pastille(String texte, Color teinte) {
-            return Container(
-              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-              decoration: BoxDecoration(
-                color: teinte.withValues(alpha: 0.13),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Text(
-                texte,
-                style: TextStyle(
-                  fontSize: 10.5,
-                  fontWeight: FontWeight.w700,
-                  color: teinte,
-                ),
-              ),
-            );
-          }
-
-          return SafeArea(
-            top: false,
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 18),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Autorisations de localisation',
-                              style: theme.textTheme.titleMedium?.copyWith(
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
-                            Text(
-                              'Avec $nom',
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                color: couleur.onSurfaceVariant,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      IconButton(
-                        tooltip: 'Fermer',
-                        onPressed: () => Navigator.of(ctx).pop(),
-                        icon: const Icon(Icons.close),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  carte(
-                    icone: Icons.my_location,
-                    titre: 'Localisation simple',
-                    sousTitre: 'À tout moment, tant que tu l\'autorises.',
-                    teinte: KinColors.primary,
-                    actif: jeLAutorise,
-                    accessoire: Switch(
-                      value: jeLAutorise,
-                      thumbColor: WidgetStateProperty.resolveWith<Color>((
-                        states,
-                      ) {
-                        if (states.contains(WidgetState.selected)) {
-                          return couleur.onPrimary;
-                        }
-                        return couleur.onSurfaceVariant;
-                      }),
-                      trackColor: WidgetStateProperty.resolveWith<Color>((
-                        states,
-                      ) {
-                        if (states.contains(WidgetState.selected)) {
-                          return couleur.primary;
-                        }
-                        return couleur.surfaceContainerHighest;
-                      }),
-                      onChanged: (v) async {
-                        final ok = await SupabaseService()
-                            .definirAutorisationLocSimple(widget.amiId, v);
-                        if (!ctx.mounted) return;
-                        if (ok) {
-                          Journal.i(
-                            'SOCIAL',
-                            'Autorisation de localisation '
-                                '${v ? 'accordée' : 'retirée'} (feuille)',
-                            {'ami': nom},
-                          );
-                          setLocal(
-                            () => etat['moi_autorise_ami_loc_simple'] = v,
-                          );
-                          if (mounted) setState(() => _autorisations = etat);
-                        } else {
-                          Journal.a(
-                            'SOCIAL',
-                            'Changement d\'autorisation non enregistré',
-                            {'ami': nom},
-                          );
-                          ScaffoldMessenger.of(ctx).showSnackBar(
-                            const SnackBar(
-                              content: Text('Changement non enregistré.'),
-                            ),
-                          );
-                        }
-                      },
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  carte(
-                    icone: Icons.sos_outlined,
-                    titre: 'Localisation d\'urgence',
-                    sousTitre: 'Une seule fois, en cas de besoin.',
-                    teinte: rouge,
-                    actif: urgencePourLui,
-                    accessoire: pastille(
-                      urgencePourLui ? 'Disponible' : 'Utilisée',
-                      urgencePourLui ? KinColors.vertArrivee : rouge,
-                    ),
-                  ),
-                  if (!urgencePourLui) ...[
-                    const SizedBox(height: 8),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: FilledButton.tonalIcon(
-                        style: FilledButton.styleFrom(
-                          visualDensity: VisualDensity.compact,
-                        ),
-                        onPressed: () async {
-                          final ok = await SupabaseService().renouvelerUrgence(
-                            widget.amiId,
-                          );
-                          if (!ctx.mounted) return;
-                          if (ok) {
-                            Journal.i(
-                              'SOCIAL',
-                              'Localisation d\'urgence renouvelée',
-                              {'ami': nom},
-                            );
-                            setLocal(
-                              () =>
-                                  etat['urgence_dispo_pour_ami_localiser_moi'] =
-                                      true,
-                            );
-                            if (mounted) setState(() => _autorisations = etat);
-                          } else {
-                            Journal.a(
-                              'SOCIAL',
-                              'Renouvellement d\'urgence non enregistré',
-                              {'ami': nom},
-                            );
-                            ScaffoldMessenger.of(ctx).showSnackBar(
-                              const SnackBar(
-                                content: Text('Renouvellement non enregistré.'),
-                              ),
-                            );
-                          }
-                        },
-                        icon: const Icon(Icons.autorenew, size: 16),
-                        label: const Text('Renouveler'),
-                      ),
-                    ),
-                  ],
-                  const SizedBox(height: 16),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(
-                        Icons.shield_outlined,
-                        size: 15,
-                        color: couleur.onSurfaceVariant,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Personne ne te localise sans ton accord. '
-                          'Tu peux changer d\'avis à tout moment.',
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: couleur.onSurfaceVariant,
-                            height: 1.35,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
+    await ouvrirAutorisationsLocalisation(
+      context,
+      amiId: widget.amiId,
+      nom: widget.nom,
+      onChanged: (etat) {
+        if (mounted) setState(() => _autorisations = etat);
+      },
     );
   }
 
@@ -1547,7 +1376,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
     Navigator.of(context).pop();
   }
 
-  void _menuSelectionne(String valeur) {
+  Future<void> _menuSelectionne(String valeur) async {
     if (valeur == 'localiser_simple') {
       _localiserAvec('simple');
     } else if (valeur == 'localiser_urgence') {
@@ -1556,6 +1385,18 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
       _ouvrirAutorisations();
     } else if (valeur == 'renommer') {
       _renommerAmi();
+    } else if (valeur == 'signaler') {
+      await signalerUtilisateur(context, userId: widget.amiId);
+    } else if (valeur == 'bloquer') {
+      final ok = await bloquerUtilisateur(
+        context,
+        userId: widget.amiId,
+        nom: widget.nom,
+      );
+      if (!ok || !mounted) return;
+      // Bloquer supprime l'amitié : la discussion n'a plus lieu d'être.
+      widget.onAmiSupprime?.call();
+      Navigator.of(context).pop();
     } else if (valeur == 'retirer') {
       _confirmerRetrait();
     }
@@ -1602,17 +1443,8 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
     setState(() => _nomLocal = nom);
   }
 
-  /// Vrai si la position de l'ami(e) a été vue très récemment : indique qu'il
-  /// ou elle est probablement en ligne.
-  bool get _amiEnLigne {
-    final majA = widget.position?.majA;
-    if (majA == null) return false;
-    return DateTime.now().difference(majA.toLocal()).inMinutes < 5;
-  }
-
-  /// Sous-titre de l'en-tête : présence, ou état de la discussion.
+  /// Sous-titre de l'en-tête : état de la discussion.
   String _sousTitreEntete() {
-    if (_amiEnLigne) return 'En ligne';
     return 'Discussion privée';
   }
 
@@ -1625,6 +1457,123 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         '${d.minute.toString().padLeft(2, '0')}';
   }
 
+  /// Date d'envoi d'un message (heure locale), ou null si elle est inconnue.
+  DateTime? _dateMessage(Map<String, dynamic> message) {
+    final brut = message['cree_a'];
+    if (brut == null) return null;
+    return DateTime.tryParse(brut.toString())?.toLocal();
+  }
+
+  bool _memeJour(DateTime a, DateTime b) {
+    return a.year == b.year && a.month == b.month && a.day == b.day;
+  }
+
+  /// Libellé du séparateur de jour, façon WhatsApp : « Aujourd'hui », « Hier »,
+  /// le nom du jour pour la semaine écoulée, puis la date.
+  String _libelleJour(DateTime date) {
+    final maintenant = DateTime.now();
+    final aujourdHui = DateTime(
+      maintenant.year,
+      maintenant.month,
+      maintenant.day,
+    );
+    final jour = DateTime(date.year, date.month, date.day);
+    final difference = aujourdHui.difference(jour).inDays;
+
+    if (difference == 0) return "Aujourd'hui";
+    if (difference == 1) return 'Hier';
+
+    const nomsJours = [
+      'lundi',
+      'mardi',
+      'mercredi',
+      'jeudi',
+      'vendredi',
+      'samedi',
+      'dimanche',
+    ];
+    if (difference > 1 && difference < 7) {
+      final nom = nomsJours[jour.weekday - 1];
+      return '${nom[0].toUpperCase()}${nom.substring(1)}';
+    }
+
+    const nomsMois = [
+      'janvier',
+      'février',
+      'mars',
+      'avril',
+      'mai',
+      'juin',
+      'juillet',
+      'août',
+      'septembre',
+      'octobre',
+      'novembre',
+      'décembre',
+    ];
+    final texte = '${jour.day} ${nomsMois[jour.month - 1]}';
+    return jour.year == maintenant.year ? texte : '$texte ${jour.year}';
+  }
+
+  /// Regroupe les messages par journée, dans l'ordre chronologique.
+  List<_GroupeJour> _groupesParJour() {
+    final groupes = <_GroupeJour>[];
+    for (final message in _messages) {
+      final date = _dateMessage(message);
+      final jour = date == null
+          ? null
+          : DateTime(date.year, date.month, date.day);
+      final dernier = groupes.isEmpty ? null : groupes.last;
+      final memeJour =
+          dernier != null &&
+          ((jour == null && dernier.jour == null) ||
+              (jour != null &&
+                  dernier.jour != null &&
+                  _memeJour(jour, dernier.jour!)));
+      if (!memeJour) groupes.add(_GroupeJour(jour));
+      groupes.last.messages.add(message);
+    }
+    return groupes;
+  }
+
+  /// Construit la liste des messages avec, pour chaque journée, un en-tête
+  /// épinglé en haut : comme dans WhatsApp, le jour reste visible pendant
+  /// tout le défilement sans avoir à le chercher.
+  List<Widget> _sliversMessages(ThemeData theme) {
+    // Fond opaque : l'en-tête reste lisible quand les messages défilent
+    // derrière lui.
+    final couleurFond = theme.colorScheme.surfaceContainerHighest;
+    final couleurTexte = theme.colorScheme.onSurface.withValues(alpha: 0.75);
+
+    final slivers = <Widget>[];
+    for (final groupe in _groupesParJour()) {
+      if (groupe.jour != null) {
+        slivers.add(
+          SliverPersistentHeader(
+            pinned: true,
+            delegate: _EnteteJourDelegate(
+              libelle: _libelleJour(groupe.jour!),
+              couleurFond: couleurFond,
+              couleurTexte: couleurTexte,
+            ),
+          ),
+        );
+      }
+      slivers.add(
+        SliverList(
+          delegate: SliverChildBuilderDelegate((context, index) {
+            final message = groupe.messages[index];
+            // Clé stable par message : sans elle, Flutter réutilise l'état
+            // d'une bulle vocale pour un AUTRE message après un rechargement
+            // (mauvaise source, lecture cassée).
+            return _ligneMessage(message, groupe.jour, index);
+          }, childCount: groupe.messages.length),
+        ),
+      );
+    }
+    return slivers;
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -1634,27 +1583,14 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         titleSpacing: 0,
         title: Row(
           children: [
-            Stack(
-              children: [
-                GestureDetector(
-                  onTap: () => ouvrirProfilAmi(
-                    context,
-                    userId: widget.amiId,
-                    nom: _nomLocal.isEmpty ? widget.nom : _nomLocal,
-                    avatarId: widget.avatar,
-                  ),
-                  child: AvatarAnimalWidget(
-                    taille: 38,
-                    avatarId: widget.avatar,
-                    userId: widget.amiId,
-                  ),
-                ),
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  child: PastillePresence(active: _amiEnLigne, taille: 12),
-                ),
-              ],
+            GestureDetector(
+              onTap: () => ouvrirProfilAmi(
+                context,
+                userId: widget.amiId,
+                nom: _nomLocal.isEmpty ? widget.nom : _nomLocal,
+                avatarId: widget.avatar,
+              ),
+              child: AvatarAnimalWidget(taille: 38, avatarId: widget.avatar),
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -1677,9 +1613,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
                     style: TextStyle(
                       fontSize: 11.5,
                       fontWeight: FontWeight.w500,
-                      color: _amiEnLigne
-                          ? KinColors.vertArrivee
-                          : theme.colorScheme.onSurfaceVariant,
+                      color: theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
                 ],
@@ -1747,6 +1681,26 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
                 ),
                 const PopupMenuDivider(),
                 PopupMenuItem(
+                  value: 'signaler',
+                  child: const ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(Icons.flag_outlined),
+                    title: Text('Signaler'),
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'bloquer',
+                  child: ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(Icons.block, color: theme.colorScheme.error),
+                    title: Text(
+                      'Bloquer',
+                      style: TextStyle(color: theme.colorScheme.error),
+                    ),
+                  ),
+                ),
+                const PopupMenuDivider(),
+                PopupMenuItem(
                   value: 'retirer',
                   child: ListTile(
                     contentPadding: EdgeInsets.zero,
@@ -1770,26 +1724,28 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
           Expanded(
             child: _chargement
                 ? _squeletteDiscussion(theme)
-                : ListView.builder(
+                : CustomScrollView(
                     controller: _defilement,
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    itemCount: _messages.isEmpty ? 2 : _messages.length + 1,
-                    itemBuilder: (context, index) {
-                      if (index == 0) return _carteAmitie(theme);
-                      if (_messages.isEmpty) return _vide(theme);
-                      final message = _messages[index - 1];
-                      // Clé stable par message : sans elle, Flutter réutilise
-                      // l'état d'une bulle vocale pour un AUTRE message après un
-                      // rechargement (mauvaise source, lecture cassée).
-                      return KeyedSubtree(
-                        key: ValueKey(
-                          message['id']?.toString() ?? 'msg_$index',
+                    slivers: [
+                      SliverToBoxAdapter(
+                        child: Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: _carteAmitie(theme),
                         ),
-                        child: _bulle(message),
-                      );
-                    },
+                      ),
+                      if (_messages.isEmpty)
+                        SliverFillRemaining(
+                          hasScrollBody: false,
+                          child: _vide(theme),
+                        )
+                      else ...[
+                        ..._sliversMessages(theme),
+                        const SliverToBoxAdapter(child: SizedBox(height: 8)),
+                      ],
+                    ],
                   ),
           ),
+          _apercuReponseSaisie(theme),
           _barreEnvoi(theme),
         ],
       ),
@@ -1961,11 +1917,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
             nom: nom,
             avatarId: avatarId,
           ),
-          child: AvatarAnimalWidget(
-            taille: 56,
-            avatarId: avatarId,
-            userId: userId,
-          ),
+          child: AvatarAnimalWidget(taille: 56, avatarId: avatarId),
         ),
         const SizedBox(height: 8),
         Text(
@@ -2055,39 +2007,7 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
           ),
         ],
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          Text(
-            texte,
-            style: const TextStyle(
-              color: Colors.white,
-              height: 1.35,
-              fontSize: 15,
-            ),
-          ),
-          const SizedBox(height: 2),
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                _heure(message['cree_a']),
-                style: const TextStyle(fontSize: 11, color: Colors.white70),
-              ),
-              if (message['modifie_a'] != null)
-                Text(
-                  ' • modifié',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: Colors.white70,
-                    fontStyle: FontStyle.italic,
-                  ),
-                ),
-              if (moi) ...[const SizedBox(width: 4), _indicateurStatut(statut)],
-            ],
-          ),
-        ],
-      ),
+      child: _contenuTexte(message, texte, statut, moi),
     );
 
     // Appui normal : copie le texte (un message en échec se renvoie au lieu
@@ -2097,12 +2017,75 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: echec
-            ? () => _envoyerTexte(texte, remplaceId: message['id']?.toString())
+            ? () => _envoyerTexte(
+                texte,
+                remplaceId: message['id']?.toString(),
+                repondreA: message['reply_to_message_id']?.toString(),
+                apercu: (message['reply_to'] as Map?)?.cast<String, dynamic>(),
+              )
             : () => _copierMessage(message),
         onLongPress: () => _menuAppuiLong(message),
         child: bulle,
       ),
     );
+  }
+
+  /// Contenu d'une bulle texte. Quand le message répond à un autre, la citation
+  /// occupe toute la largeur de la bulle (comme WhatsApp) ; sinon la bulle
+  /// reste ajustée au texte.
+  Widget _contenuTexte(
+    Map<String, dynamic> message,
+    String texte,
+    String statut,
+    bool moi,
+  ) {
+    final avecCitation =
+        (message['reply_to_message_id']?.toString() ?? '').isNotEmpty;
+
+    Widget colonne(CrossAxisAlignment align) => Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: align,
+      children: [
+        if (avecCitation) ...[
+          _citationBulle(message),
+          const SizedBox(height: 6),
+        ],
+        Text(
+          texte,
+          style: const TextStyle(
+            color: Colors.white,
+            height: 1.35,
+            fontSize: 15,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            Text(
+              _heure(message['cree_a']),
+              style: const TextStyle(fontSize: 11, color: Colors.white70),
+            ),
+            if (message['modifie_a'] != null)
+              Text(
+                ' • modifié',
+                style: const TextStyle(
+                  fontSize: 11,
+                  color: Colors.white70,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            if (moi) ...[const SizedBox(width: 4), _indicateurStatut(statut)],
+          ],
+        ),
+      ],
+    );
+
+    if (!avecCitation) return colonne(CrossAxisAlignment.end);
+    // Largeur intrinsèque bornée par la largeur maximale de la bulle : la
+    // citation et le texte partagent ainsi la même largeur.
+    return IntrinsicWidth(child: colonne(CrossAxisAlignment.stretch));
   }
 
   /// Un message est vocal s'il vient du serveur avec ce type, ou s'il s'agit
@@ -2132,18 +2115,21 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
       indicateur: moi ? _indicateurStatut(statut) : null,
       formes: _formesVocal(message),
       graine: message['audio_chemin']?.toString() ?? message['id']?.toString(),
+      // Citation du message auquel ce vocal répond (aperçu dans la bulle).
+      citation: (message['reply_to_message_id']?.toString() ?? '').isNotEmpty
+          ? _citationBulle(message)
+          : null,
       // Le rond de l'animal est DANS la bulle, à gauche du triangle : le mien
       // pour mes vocaux, celui de l'ami(e) pour les vocaux reçus.
       avatarId: moi ? (_monCompte?['avatar']) : widget.avatar,
-      userId: moi ? SupabaseService().userId : widget.amiId,
       onAvatarTap: moi
           ? null
           : () => ouvrirProfilAmi(
-                context,
-                userId: widget.amiId,
-                nom: widget.nom,
-                avatarId: widget.avatar,
-              ),
+              context,
+              userId: widget.amiId,
+              nom: widget.nom,
+              avatarId: widget.avatar,
+            ),
     );
 
     // Un vocal en échec se renvoie d'un appui. L'appui long ouvre le menu
@@ -2173,6 +2159,273 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
       for (final v in brut)
         if (v is num) (v / 100).clamp(0.0, 1.0),
     ];
+  }
+
+  // --- Réponse à un message (façon WhatsApp) ---------------------------------
+
+  /// Une ligne de la discussion : la bulle, glissable vers la droite pour
+  /// répondre, et brièvement surlignée quand on vient de naviguer jusqu'à elle.
+  Widget _ligneMessage(Map<String, dynamic> message, Object? jour, int index) {
+    final id = message['id']?.toString() ?? '';
+    final cle = id.isEmpty
+        ? null
+        : _clesMessages.putIfAbsent(id, () => GlobalKey());
+    final surligne = id.isNotEmpty && _messageSurligne == id;
+
+    // Conteneur transparent en temps normal : la mise en évidence apparaît et
+    // s'efface en douceur autour de la bulle.
+    final bulle = AnimatedContainer(
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOut,
+      decoration: BoxDecoration(
+        color: surligne
+            ? Theme.of(context).colorScheme.primary.withValues(alpha: 0.16)
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: KeyedSubtree(
+        key: cle ?? ValueKey('msg_${jour}_$index'),
+        child: _bulle(message),
+      ),
+    );
+
+    if (!_peutCiter(message)) return bulle;
+
+    // Glissement vers la droite → mode réponse. `confirmDismiss` renvoie false :
+    // la bulle revient à sa place, seul l'aperçu de réponse est activé.
+    return Dismissible(
+      key: ValueKey('reponse_$id'),
+      direction: DismissDirection.startToEnd,
+      dismissThresholds: const {DismissDirection.startToEnd: 0.22},
+      confirmDismiss: (_) async {
+        _preparerReponse(message);
+        return false;
+      },
+      background: _fondGlissementReponse(),
+      child: bulle,
+    );
+  }
+
+  /// Fond révélé pendant le glissement d'un message : l'icône « répondre ».
+  Widget _fondGlissementReponse() {
+    final couleur = Theme.of(context).colorScheme.primary;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Container(
+          width: 34,
+          height: 34,
+          decoration: BoxDecoration(
+            color: couleur.withValues(alpha: 0.14),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(Icons.reply, size: 18, color: couleur),
+        ),
+      ),
+    );
+  }
+
+  /// Passe en mode réponse : l'aperçu du message s'affiche au-dessus du
+  /// clavier et le champ de saisie prend le focus.
+  void _preparerReponse(Map<String, dynamic> message) {
+    if (!_peutCiter(message)) return;
+    HapticFeedback.selectionClick();
+    Journal.i('SOCIAL', 'Message sélectionné pour une réponse', {
+      'ami': widget.nom,
+      'type': message['type_message'] ?? 'texte',
+    });
+    setState(() => _reponseA = message);
+    _focusSaisie.requestFocus();
+  }
+
+  /// Annule la réponse en cours : retour à une saisie normale.
+  void _annulerReponse() {
+    if (_reponseA == null) return;
+    setState(() => _reponseA = null);
+    Journal.i('SOCIAL', 'Réponse annulée', {'ami': widget.nom});
+  }
+
+  /// Résumé d'un message pour l'aperçu d'une citation (jamais le message
+  /// entier) : le texte s'il existe, sinon une étiquette selon le type.
+  String _resumeMessage(Map<String, dynamic> message) {
+    final type = message['type_message']?.toString() ?? 'texte';
+    if (type == 'vocal') return '🎤 Message vocal';
+    if (type == 'image') return '📷 Photo';
+    if (type == 'texte' && message['est_systeme'] != true) {
+      final texte = (message['contenu'] as String? ?? '').trim();
+      if (texte.isNotEmpty) return texte;
+    }
+    final texte = (message['contenu'] as String? ?? '').trim();
+    return texte.isEmpty ? 'Message' : texte;
+  }
+
+  /// Aperçu du message cité, juste au-dessus du clavier, avec la croix qui
+  /// annule la réponse.
+  Widget _apercuReponseSaisie(ThemeData theme) {
+    final message = _reponseA;
+    if (message == null) return const SizedBox.shrink();
+    final couleur = theme.colorScheme.primary;
+    final moi = message['moi'] == true;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 0),
+      child: Material(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(12),
+        clipBehavior: Clip.antiAlias,
+        child: Stack(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 5, 2, 5),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'Réponse à ${moi ? 'vous' : _nomAmiCourant()}',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: couleur,
+                          ),
+                        ),
+                        const SizedBox(height: 1),
+                        Text(
+                          _resumeMessage(message),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: _annulerReponse,
+                    icon: const Icon(Icons.close, size: 18),
+                    visualDensity: VisualDensity.compact,
+                    tooltip: 'Annuler la réponse',
+                  ),
+                ],
+              ),
+            ),
+            Positioned(
+              left: 0,
+              top: 0,
+              bottom: 0,
+              child: Container(width: 3, color: couleur),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Citation affichée DANS une bulle : barre colorée, nom de l'expéditeur du
+  /// message cité et résumé. Un appui ramène au message d'origine.
+  Widget _citationBulle(Map<String, dynamic> message) {
+    final id = message['reply_to_message_id']?.toString() ?? '';
+    if (id.isEmpty) return const SizedBox.shrink();
+    final brut = message['reply_to'];
+    final apercu = brut is Map ? brut.cast<String, dynamic>() : null;
+    final moi = apercu?['moi'] == true;
+    return CitationMessage(
+      nom: apercu == null ? 'Message' : (moi ? 'Vous' : _nomAmiCourant()),
+      resume: apercu == null
+          ? "Message d'origine indisponible"
+          : _resumeMessage(apercu),
+      onTap: () => _allerAuMessage(id),
+    );
+  }
+
+  /// Retrouve le message cité et fait défiler la conversation jusqu'à lui.
+  /// Les messages hors écran ne sont pas construits : on avance par paliers
+  /// dans la bonne direction jusqu'à ce que sa bulle existe, puis on la centre.
+  Future<void> _allerAuMessage(String id) async {
+    if (id.isEmpty) return;
+    Journal.i('SOCIAL', 'Navigation vers le message cité', {'ami': widget.nom});
+
+    var index = _messages.indexWhere((m) => m['id']?.toString() == id);
+    if (index == -1) {
+      // Peut-être arrivé après le dernier rafraîchissement : on recharge une
+      // fois avant de renoncer.
+      await _charger(silencieux: true);
+      if (!mounted) return;
+      index = _messages.indexWhere((m) => m['id']?.toString() == id);
+    }
+    if (index == -1) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Le message d'origine n'est plus disponible dans la conversation.",
+          ),
+        ),
+      );
+      return;
+    }
+
+    final cle = _clesMessages.putIfAbsent(id, () => GlobalKey());
+    for (var essai = 0; essai < 60; essai++) {
+      final contexte = cle.currentContext;
+      if (contexte != null) {
+        if (!contexte.mounted) return;
+        await Scrollable.ensureVisible(
+          contexte,
+          alignment: 0.35,
+          duration: const Duration(milliseconds: 280),
+          curve: Curves.easeInOut,
+        );
+        _surlignerMessage(id);
+        return;
+      }
+      if (!mounted || !_defilement.hasClients) return;
+      final position = _defilement.position;
+
+      // Sens du déplacement : on se cale sur le message construit le plus
+      // proche, pour savoir si la cible est au-dessus ou en dessous.
+      var sens = 0;
+      for (var i = 0; i < _messages.length; i++) {
+        if (i == index) continue;
+        final idAutre = _messages[i]['id']?.toString() ?? '';
+        if (idAutre.isEmpty) continue;
+        if (_clesMessages[idAutre]?.currentContext == null) continue;
+        sens = i < index ? 1 : -1;
+        break;
+      }
+      if (sens == 0) break;
+
+      final pas = position.viewportDimension * 0.7;
+      final cible = (position.pixels + sens * pas)
+          .clamp(position.minScrollExtent, position.maxScrollExtent)
+          .toDouble();
+      if ((cible - position.pixels).abs() < 1) break;
+      _defilement.jumpTo(cible);
+      await Future<void>.delayed(const Duration(milliseconds: 16));
+      if (!mounted) return;
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Impossible de retrouver ce message dans la discussion.'),
+      ),
+    );
+  }
+
+  /// Met brièvement le message en évidence, le temps de le repérer.
+  void _surlignerMessage(String id) {
+    _minuteurSurligne?.cancel();
+    if (!mounted) return;
+    setState(() => _messageSurligne = id);
+    _minuteurSurligne = Timer(const Duration(milliseconds: 1800), () {
+      if (!mounted || _messageSurligne != id) return;
+      setState(() => _messageSurligne = null);
+    });
   }
 
   // --- Appui sur un message : copier, modifier, supprimer --------------------
@@ -2224,6 +2477,13 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (_peutCiter(message))
+              ListTile(
+                leading: const Icon(Icons.reply),
+                title: const Text('Répondre'),
+                subtitle: const Text('Citer ce message dans ta réponse'),
+                onTap: () => Navigator.pop(context, 'repondre'),
+              ),
             if (!vocal && !image && texte.isNotEmpty)
               ListTile(
                 leading: const Icon(Icons.copy_outlined),
@@ -2258,7 +2518,9 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
     );
 
     if (!mounted || choix == null) return;
-    if (choix == 'copier') {
+    if (choix == 'repondre') {
+      _preparerReponse(message);
+    } else if (choix == 'copier') {
       await _copierMessage(message);
     } else if (choix == 'modifier') {
       await _modifierMessage(message);
@@ -2730,9 +2992,8 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
   /// Barre affichée pendant l'enregistrement d'un vocal : minuteur en direct,
   /// bouton annuler (✕) et bouton envoyer (avion en papier).
   Widget _barreEnregistrement() {
-    final texte =
-        '${(_secondesVocal ~/ 60).toString().padLeft(2, '0')}:'
-        '${(_secondesVocal % 60).toString().padLeft(2, '0')}';
+    final minutes = (_secondesVocal ~/ 60).toString().padLeft(2, '0');
+    final secondes = (_secondesVocal % 60).toString().padLeft(2, '0');
     return SafeArea(
       top: false,
       child: Container(
@@ -2745,16 +3006,32 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         child: Row(
           children: [
             const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 8),
+              padding: EdgeInsets.only(left: 8, right: 8),
               child: Icon(Icons.mic, color: Colors.white, size: 20),
             ),
-            Expanded(
+            // Le libellé peut être raccourci sur les petits écrans, mais le
+            // minuteur garde toujours sa place entière, à droite.
+            const Expanded(
               child: Text(
-                'Enregistrement en cours  •  $texte',
-                style: const TextStyle(color: Colors.white),
+                'Enregistrement',
+                style: TextStyle(color: Colors.white),
+                maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
             ),
+            // Chiffres tabulaires : chaque seconde a exactement la même
+            // largeur, le compteur ne « saute » plus d'un chiffre à l'autre.
+            Text(
+              '$minutes:$secondes',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.4,
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+            ),
+            const SizedBox(width: 2),
             IconButton(
               onPressed: () => _arreterEnregistrement(annuler: true),
               icon: const Icon(Icons.close, color: Colors.white),
@@ -2769,6 +3046,76 @@ class _ChatAmiScreenState extends State<ChatAmiScreen> {
         ),
       ),
     );
+  }
+}
+
+/// Messages d'une même journée, avec l'en-tête de date qui les précède.
+class _GroupeJour {
+  _GroupeJour(this.jour);
+
+  /// Jour concerné, ou null si la date est inconnue.
+  final DateTime? jour;
+
+  final List<Map<String, dynamic>> messages = [];
+}
+
+/// En-tête de jour épinglé en haut de la discussion (façon WhatsApp).
+class _EnteteJourDelegate extends SliverPersistentHeaderDelegate {
+  _EnteteJourDelegate({
+    required this.libelle,
+    required this.couleurFond,
+    required this.couleurTexte,
+  });
+
+  final String libelle;
+  final Color couleurFond;
+  final Color couleurTexte;
+
+  static const double _hauteur = 34;
+
+  @override
+  double get minExtent => _hauteur;
+
+  @override
+  double get maxExtent => _hauteur;
+
+  @override
+  Widget build(
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
+    return Center(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        decoration: BoxDecoration(
+          color: couleurFond,
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.10),
+              blurRadius: 6,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Text(
+          libelle,
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            color: couleurTexte,
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _EnteteJourDelegate oldDelegate) {
+    return oldDelegate.libelle != libelle ||
+        oldDelegate.couleurFond != couleurFond ||
+        oldDelegate.couleurTexte != couleurTexte;
   }
 }
 

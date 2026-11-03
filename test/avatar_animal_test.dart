@@ -46,9 +46,7 @@ void main() {
     testWidgets('affiche l\'icône personne sans avatar', (tester) async {
       await tester.pumpWidget(
         const MaterialApp(
-          home: Scaffold(
-            body: AvatarAnimalWidget(taille: 90, avatarId: null),
-          ),
+          home: Scaffold(body: AvatarAnimalWidget(taille: 90, avatarId: null)),
         ),
       );
       expect(find.byIcon(Icons.person), findsOneWidget);
@@ -57,34 +55,11 @@ void main() {
     testWidgets('affiche l\'icône personne pour un id inconnu', (tester) async {
       await tester.pumpWidget(
         const MaterialApp(
-          home: Scaffold(
-            body: AvatarAnimalWidget(taille: 90, avatarId: 'x'),
-          ),
+          home: Scaffold(body: AvatarAnimalWidget(taille: 90, avatarId: 'x')),
         ),
       );
       expect(find.byIcon(Icons.person), findsOneWidget);
     });
 
-    testWidgets('affiche les écus du grade fourni', (tester) async {
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(
-            body: AvatarAnimalWidget(taille: 90, avatarId: 'lion', niveau: 3),
-          ),
-        ),
-      );
-      expect(find.byIcon(Icons.shield_rounded), findsNWidgets(3));
-    });
-
-    testWidgets('affiche le faucon au dernier grade', (tester) async {
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(
-            body: AvatarAnimalWidget(taille: 90, avatarId: 'lion', niveau: 8),
-          ),
-        ),
-      );
-      expect(find.text('🦅'), findsOneWidget);
-    });
   });
 }

@@ -132,7 +132,6 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
               AvatarAnimalWidget(
                 taille: 90,
                 avatarId: avatarChoisi,
-                userId: SupabaseService().userId,
               ),
 
               const SizedBox(height: 12),

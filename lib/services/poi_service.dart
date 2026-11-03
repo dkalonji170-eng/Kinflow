@@ -61,6 +61,16 @@ class CircuitBreakerPois {
     return true;
   }
 
+  /// Temps restant avant la fermeture automatique du disjoncteur : permet à
+  /// la carte de reprogrammer un chargement pour la fin du délai au lieu de
+  /// laisser les badges disparus jusqu'au prochain geste de l'utilisateur.
+  static Duration get tempsRestant {
+    final fin = _ouvertJusquau;
+    if (fin == null) return Duration.zero;
+    final reste = fin.difference(DateTime.now());
+    return reste.isNegative ? Duration.zero : reste;
+  }
+
   static void enregistrerSucces() {
     _echecsConsecutifs = 0;
     _cooldownMultiplier = 1;
@@ -98,12 +108,13 @@ List<Poi> parserPois(dynamic json) {
     }
     if (lat == null || lon == null) continue;
 
-    final type = (tags['amenity'] ??
-            tags['shop'] ??
-            tags['tourism'] ??
-            tags['leisure'] ??
-            tags['office'])
-        .toString();
+    final type =
+        (tags['amenity'] ??
+                tags['shop'] ??
+                tags['tourism'] ??
+                tags['leisure'] ??
+                tags['office'])
+            .toString();
     if (type.isEmpty) continue;
 
     final nom = (tags['name'] ?? '').toString();
@@ -285,7 +296,8 @@ class PoiService {
     // Requête limitée à la zone visible (plus petite marge) : Overpass
     // résout un petit bbox en une fraction de seconde avec un impact très
     // réduit sur ses quotas, contrairement à un balayage de toute la ville.
-    final query = '''
+    final query =
+        '''
 [out:json][timeout:25];
 (
   nwr["amenity"~"^(restaurant|cafe|bar|pub|school|college|university|hospital|clinic|pharmacy|bank|marketplace|market|place_of_worship|church|mosque|fuel|police|fire_station|post_office|library|cinema|theatre|parking|taxi)\$"](${bounds.south},${bounds.west},${bounds.north},${bounds.east});
@@ -307,8 +319,9 @@ out center tags;
     // Bascule sur un miroir Overpass différent à chaque tentative pour ne
     // pas marteler un serveur déjà limité en débit (429/504).
     for (var tentative = 0; tentative < maxTentatives; tentative++) {
-      final endpoint = endpointsPoisOverpass[
-          (_indexMiroirPois + tentative) % endpointsPoisOverpass.length];
+      final endpoint =
+          endpointsPoisOverpass[(_indexMiroirPois + tentative) %
+              endpointsPoisOverpass.length];
       if (CircuitBreakerPois.ouvert) {
         throw Exception('Overpass POI: disjoncteur ouvert pendant la boucle');
       }
@@ -316,11 +329,13 @@ out center tags;
         // File d'attente globale : une seule requête en vol dans toute l'app,
         // les POIs partent en série avec les routes et la recherche.
         final reponse = await OverpassGate.executer(
-          () => http.post(
-            Uri.parse(endpoint),
-            headers: {'User-Agent': 'KinFlow-App/1.0 (projet kinflow)'},
-            body: {'data': query},
-          ).timeout(const Duration(seconds: 25)),
+          () => http
+              .post(
+                Uri.parse(endpoint),
+                headers: {'User-Agent': 'KinFlow-App/1.0 (projet kinflow)'},
+                body: {'data': query},
+              )
+              .timeout(const Duration(seconds: 25)),
         );
 
         if (reponse.statusCode == 200) {
@@ -330,20 +345,19 @@ out center tags;
           return compute(parserPois, json.decode(reponse.body));
         }
 
-        final resoumettre =
-            reponse.statusCode == 429 || reponse.statusCode == 504;
-        if (!resoumettre) {
-          throw Exception('Overpass POI: HTTP ${reponse.statusCode}');
-        }
-
-        CircuitBreakerPois.enregistrerEchec();
+        // Toute réponse autre que 200 (429/504 de surcharge, mais aussi
+        // 500/502/503 quand le miroir est saturé) signifie que CE miroir ne
+        // peut pas servir la requête : on bascule sur le suivant au lieu
+        // d'abandonner tout le chargement. Avant, un simple 502 du premier
+        // miroir suffisait à laisser la carte sans aucun badge de lieu.
         final retryAfter = int.tryParse(reponse.headers['retry-after'] ?? '');
         final delai = retryAfter != null && retryAfter > 0
-            ? Duration(seconds: retryAfter)
-            : _jitterPois(baseBackoff * (1 << tentative));
+            ? Duration(seconds: retryAfter.clamp(1, 10).toInt())
+            : _jitterPois(const Duration(milliseconds: 700) * (1 << tentative));
         Journal.a(
           'CARTE',
-          'Surcharge Overpass POI, nouvelle tentative dans ${delai.inSeconds} s',
+          'Overpass POI indisponible (HTTP ${reponse.statusCode}), '
+              'miroir suivant dans ${delai.inSeconds} s',
           {
             'code_http': reponse.statusCode,
             'tentative': tentative + 1,
@@ -352,8 +366,7 @@ out center tags;
         );
         await Future<void>.delayed(delai);
       } on TimeoutException {
-        CircuitBreakerPois.enregistrerEchec();
-        if (tentative >= maxTentatives - 1) rethrow;
+        if (tentative >= maxTentatives - 1) break;
         final delai = _jitterPois(baseBackoff * (1 << tentative));
         Journal.a(
           'CARTE',
@@ -362,13 +375,15 @@ out center tags;
         );
         await Future<void>.delayed(delai);
       } on http.ClientException {
-        CircuitBreakerPois.enregistrerEchec();
-        if (tentative >= maxTentatives - 1) rethrow;
+        if (tentative >= maxTentatives - 1) break;
         final delai = _jitterPois(baseBackoff * (1 << tentative));
         await Future<void>.delayed(delai);
       }
     }
 
+    // Un SEUL échec compté pour toute la passe (et non un par miroir) :
+    // sinon un unique chargement raté suffisait à ouvrir le disjoncteur.
+    CircuitBreakerPois.enregistrerEchec();
     throw Exception('Overpass POI: échec après $maxTentatives tentatives');
   }
 }

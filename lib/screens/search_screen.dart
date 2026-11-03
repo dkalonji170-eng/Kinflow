@@ -19,14 +19,9 @@ List<SearchResult> _dansLaVille(List<SearchResult> resultats) => [
 ];
 
 class SearchScreen extends StatefulWidget {
-  /// Appelé quand l'utilisateur demande à poser son domicile directement sur
-  /// la carte (« Ma maison » sans domicile enregistré, ou action « Placer sur
-  /// la carte ») : l'écran de recherche se referme et la carte passe en mode
-  /// pose d'une icône maison.
-  final VoidCallback? onDemanderPoserMaison;
-
-  /// Même mécanique pour le lieu de travail (« Mon travail ») : la carte
-  /// passe en mode pose d'une icône mallette.
+  /// Appelé quand l'utilisateur demande à poser son lieu de travail
+  /// directement sur la carte (« Mon travail ») : l'écran de recherche se
+  /// referme et la carte passe en mode pose d'une icône mallette.
   final VoidCallback? onDemanderPoserTravail;
 
   /// Position GPS courante de l'utilisateur (point bleu), servie de référence
@@ -37,7 +32,6 @@ class SearchScreen extends StatefulWidget {
 
   const SearchScreen({
     super.key,
-    this.onDemanderPoserMaison,
     this.onDemanderPoserTravail,
     this.procheLatitude,
     this.procheLongitude,
@@ -48,7 +42,7 @@ class SearchScreen extends StatefulWidget {
 }
 
 class _SearchScreenState extends State<SearchScreen> {
-  /// Nombre de recherches récentes mémorisées et affichées sous « Ma maison ».
+  /// Nombre de recherches récentes mémorisées.
   static const int _nombreRecentes = 5;
 
   final SearchService _service = SearchService();
@@ -66,11 +60,8 @@ class _SearchScreenState extends State<SearchScreen> {
   /// Kinshasa : ils sont écartés et un petit message l'explique en bas.
   bool _horsZone = false;
 
-  /// Lieu de domicile enregistré (clé `lieu_maison`), affiché au-dessus des
-  /// recherches récentes. `null` tant que l'utilisateur n'a pas choisi.
-  SearchResult? _maison;
-
-  /// Lieu de travail enregistré (clé `lieu_travail`), même présentation.
+  /// Lieu de travail enregistré (clé `lieu_travail`), affiché au-dessus des
+  /// recherches récentes.
   SearchResult? _travail;
 
   @override
@@ -78,7 +69,6 @@ class _SearchScreenState extends State<SearchScreen> {
     super.initState();
     _controller.addListener(_surSaisie);
     _chargerRecentes();
-    _chargerMaison();
     _chargerTravail();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _focus.requestFocus();
@@ -127,50 +117,6 @@ class _SearchScreenState extends State<SearchScreen> {
     }
   }
 
-  Future<void> _chargerMaison() async {
-    final prefs = await SharedPreferences.getInstance();
-    final brut = prefs.getString('lieu_maison');
-    if (brut == null || !mounted) return;
-    try {
-      final e = json.decode(brut) as Map;
-      final lat = (e['lat'] as num?)?.toDouble();
-      final lon = (e['lon'] as num?)?.toDouble();
-      if (lat == null || lon == null) return;
-      setState(() {
-        _maison = SearchResult(
-          nom: (e['nom'] ?? '').toString(),
-          sousTitre: (e['sousTitre'] ?? '').toString(),
-          latitude: lat,
-          longitude: lon,
-        );
-      });
-    } catch (_) {
-      // maison illisible : ignorée
-    }
-  }
-
-  Future<void> _persisterMaison() async {
-    final maison = _maison;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      if (maison == null) {
-        await prefs.remove('lieu_maison');
-        return;
-      }
-      await prefs.setString(
-        'lieu_maison',
-        json.encode({
-          'nom': maison.nom,
-          'sousTitre': maison.sousTitre,
-          'lat': maison.latitude,
-          'lon': maison.longitude,
-        }),
-      );
-    } catch (_) {
-      // persistance impossible : ignoré
-    }
-  }
-
   Future<void> _chargerTravail() async {
     final prefs = await SharedPreferences.getInstance();
     final brut = prefs.getString('lieu_travail');
@@ -215,23 +161,15 @@ class _SearchScreenState extends State<SearchScreen> {
     }
   }
 
-  /// Toucher la carte « Ma maison » : si elle est enregistrée, elle devient
-  /// directement la destination choisie. Sinon, on bascule sur la carte en
-  /// mode « poser ma maison » : l'icône maison suit le centre de l'écran, la
-  /// carte peut pivoter pour viser le domicile, et on la pose d'un appui.
-  void _choisirMaison() {
-    final maison = _maison;
-    if (maison != null) {
-      Journal.i('RECHERCHE', 'Maison choisie comme destination', {
-        'nom': maison.nom,
-      });
-      Navigator.pop(context, maison);
-      return;
-    }
-    // Pas encore de domicile : on referme la recherche et on laisse l'icône
-    // maison se glisser sur la carte, à poser par l'utilisateur.
-    widget.onDemanderPoserMaison?.call();
+  /// Referme la recherche PUIS demande la pose sur la carte. L'ordre est
+  /// important : demander la pose avant la fermeture faisait entrer la carte
+  /// en mode « pose » alors qu'elle était encore recouverte par la recherche
+  /// (rendu de la carte dupliqué/fantôme pendant la transition).
+  void _fermerEtDemanderPose(VoidCallback? demande) {
+    final callback = demande;
     Navigator.pop(context);
+    if (callback == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) => callback());
   }
 
   /// Toucher la carte « Mon travail » : si le lieu est enregistré, il devient
@@ -247,37 +185,7 @@ class _SearchScreenState extends State<SearchScreen> {
       Navigator.pop(context, travail);
       return;
     }
-    widget.onDemanderPoserTravail?.call();
-    Navigator.pop(context);
-  }
-
-  /// Ouvre la fenêtre de recherche pour enregistrer (ou remplacer) le lieu
-  /// de domicile. Si [retournerSelection] est vrai, le lieu choisi est aussi
-  /// renvoyé comme destination ; sinon on reste dans l'écran de recherche.
-  Future<void> _ouvrirChoixMaison({required bool retournerSelection}) async {
-    final lieu = await showModalBottomSheet<SearchResult>(
-      context: context,
-      isScrollControlled: true,
-      builder: (_) => _ChoixLieuSheet(
-        titre: 'Enregistrer comme maison',
-        icone: Icons.home,
-        procheLatitude: widget.procheLatitude,
-        procheLongitude: widget.procheLongitude,
-      ),
-    );
-    if (lieu == null) return;
-    if (!mounted) return;
-    setState(() => _maison = lieu);
-    await _persisterMaison();
-    if (!mounted) return;
-    Journal.i('RECHERCHE', 'Maison enregistrée', {'nom': lieu.nom});
-    if (retournerSelection) {
-      Navigator.pop(context, lieu);
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Maison enregistrée.')),
-      );
-    }
+    _fermerEtDemanderPose(widget.onDemanderPoserTravail);
   }
 
   /// Ouvre la fenêtre de recherche pour enregistrer (ou remplacer) le lieu
@@ -356,36 +264,42 @@ class _SearchScreenState extends State<SearchScreen> {
     _debounce = Timer(const Duration(milliseconds: 250), () {
       Journal.i('RECHERCHE', 'Saisie envoyée aux géocodeurs', {'terme': texte});
       _rechercheSub?.cancel();
-      _rechercheSub = _service.rechercherLieu(
-        texte,
-        procheLat: widget.procheLatitude,
-        procheLon: widget.procheLongitude,
-      ).listen((resultats) {
-        if (!mounted) return;
-        // Résultat périmé : l'utilisateur a modifié la saisie depuis.
-        if (_controller.text.trim() != texte) return;
-        final dansLaVille = _dansLaVille(resultats);
-        setState(() {
-          _resultats = dansLaVille;
-          // Des lieux ont été trouvés, mais tous hors de Kinshasa : l'app ne
-          // référence que la ville, on le dit explicitement en bas d'écran.
-          _horsZone = resultats.isNotEmpty && dansLaVille.isEmpty;
-          // Première liste reçue : on arrête le grand spinner, les lots
-          // suivants (Overpass) se fusionnent à l'affichage.
-          _rechercheEnCours = false;
-        });
-      }, onError: (_) {
-        if (!mounted) return;
-        setState(() => _rechercheEnCours = false);
-      }, onDone: () {
-        // Recherche terminée sans aucun résultat : on coupe le spinner pour
-        // afficher la ligne « Aucun lieu trouvé. ».
-        if (!mounted) return;
-        if (_controller.text.trim() != texte) return;
-        if (_rechercheEnCours) {
-          setState(() => _rechercheEnCours = false);
-        }
-      });
+      _rechercheSub = _service
+          .rechercherLieu(
+            texte,
+            procheLat: widget.procheLatitude,
+            procheLon: widget.procheLongitude,
+          )
+          .listen(
+            (resultats) {
+              if (!mounted) return;
+              // Résultat périmé : l'utilisateur a modifié la saisie depuis.
+              if (_controller.text.trim() != texte) return;
+              final dansLaVille = _dansLaVille(resultats);
+              setState(() {
+                _resultats = dansLaVille;
+                // Des lieux ont été trouvés, mais tous hors de Kinshasa : l'app ne
+                // référence que la ville, on le dit explicitement en bas d'écran.
+                _horsZone = resultats.isNotEmpty && dansLaVille.isEmpty;
+                // Première liste reçue : on arrête le grand spinner, les lots
+                // suivants (Overpass) se fusionnent à l'affichage.
+                _rechercheEnCours = false;
+              });
+            },
+            onError: (_) {
+              if (!mounted) return;
+              setState(() => _rechercheEnCours = false);
+            },
+            onDone: () {
+              // Recherche terminée sans aucun résultat : on coupe le spinner pour
+              // afficher la ligne « Aucun lieu trouvé. ».
+              if (!mounted) return;
+              if (_controller.text.trim() != texte) return;
+              if (_rechercheEnCours) {
+                setState(() => _rechercheEnCours = false);
+              }
+            },
+          );
     });
   }
 
@@ -398,7 +312,8 @@ class _SearchScreenState extends State<SearchScreen> {
     });
 
     _recentes.removeWhere(
-      (r) => r.latitude == resultat.latitude && r.longitude == resultat.longitude,
+      (r) =>
+          r.latitude == resultat.latitude && r.longitude == resultat.longitude,
     );
     _recentes.insert(0, resultat);
     if (_recentes.length > _nombreRecentes) {
@@ -433,9 +348,9 @@ class _SearchScreenState extends State<SearchScreen> {
   SearchResult? _parserCoordonnees(String texte) {
     final partie = texte.trim();
     // Accepte le format « -4.321679, 15.311559 ».
-    final correspondances =
-        RegExp(r'^([-+]?\d{1,3}(?:\.\d+)?)\s*[,;\s]\s*([-+]?\d{1,3}(?:\.\d+)?)$')
-            .firstMatch(partie);
+    final correspondances = RegExp(
+      r'^([-+]?\d{1,3}(?:\.\d+)?)\s*[,;\s]\s*([-+]?\d{1,3}(?:\.\d+)?)$',
+    ).firstMatch(partie);
     if (correspondances == null) return null;
 
     final lat = double.tryParse(correspondances.group(1)!);
@@ -453,7 +368,10 @@ class _SearchScreenState extends State<SearchScreen> {
   }
 
   void _remplir(String texte) {
-    Journal.i('RECHERCHE', 'Suggestion de catégorie choisie', {'libelle': texte});    _controller.text = texte;
+    Journal.i('RECHERCHE', 'Suggestion de catégorie choisie', {
+      'libelle': texte,
+    });
+    _controller.text = texte;
     _controller.selection = TextSelection.collapsed(offset: texte.length);
     _focus.requestFocus();
   }
@@ -504,55 +422,6 @@ class _SearchScreenState extends State<SearchScreen> {
     );
   }
 
-  Widget _tileMaison() {
-    final maison = _maison;
-    final couleur = Theme.of(context).colorScheme;
-    return ListTile(
-      leading: Icon(Icons.home, color: couleur.primary),
-      title: Text(maison?.nom ?? 'Ma maison'),
-      subtitle: maison == null
-          ? const Text('Posez-la directement sur la carte')
-          : (maison.sousTitre.isEmpty
-              ? null
-              : Text(
-                  maison.sousTitre,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                )),
-      trailing: maison == null
-          ? null
-          : PopupMenuButton<String>(
-              tooltip: 'Options de la maison',
-              onSelected: (valeur) {
-                if (valeur == 'carte') {
-                  // Reposer le domicile sur la carte : on referme la
-                  // recherche et le mode « poser ma maison » prend le relais.
-                  widget.onDemanderPoserMaison?.call();
-                  Navigator.pop(context);
-                } else if (valeur == 'changer') {
-                  _ouvrirChoixMaison(retournerSelection: false);
-                } else if (valeur == 'supprimer') {
-                  setState(() => _maison = null);
-                  _persisterMaison().then((_) {
-                    if (!mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Maison supprimée.')),
-                    );
-                    widget.onDemanderPoserMaison?.call();
-                    Navigator.pop(context);
-                  });
-                }
-              },
-              itemBuilder: (_) => const [
-                PopupMenuItem(value: 'carte', child: Text('Placer sur la carte')),
-                PopupMenuItem(value: 'changer', child: Text('Chercher par nom')),
-                PopupMenuItem(value: 'supprimer', child: Text('Supprimer')),
-              ],
-            ),
-      onTap: _choisirMaison,
-    );
-  }
-
   Widget _tileTravail() {
     final travail = _travail;
     final couleur = Theme.of(context).colorScheme;
@@ -562,12 +431,12 @@ class _SearchScreenState extends State<SearchScreen> {
       subtitle: travail == null
           ? const Text('Posez-le directement sur la carte')
           : (travail.sousTitre.isEmpty
-              ? null
-              : Text(
-                  travail.sousTitre,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                )),
+                ? null
+                : Text(
+                    travail.sousTitre,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  )),
       trailing: travail == null
           ? null
           : PopupMenuButton<String>(
@@ -576,8 +445,7 @@ class _SearchScreenState extends State<SearchScreen> {
                 if (valeur == 'carte') {
                   // Reposer le lieu de travail sur la carte : on referme la
                   // recherche et le mode « poser un lieu » prend le relais.
-                  widget.onDemanderPoserTravail?.call();
-                  Navigator.pop(context);
+                  _fermerEtDemanderPose(widget.onDemanderPoserTravail);
                 } else if (valeur == 'changer') {
                   _ouvrirChoixTravail(retournerSelection: false);
                 } else if (valeur == 'supprimer') {
@@ -589,14 +457,19 @@ class _SearchScreenState extends State<SearchScreen> {
                         content: Text('Lieu de travail supprimé.'),
                       ),
                     );
-                    widget.onDemanderPoserTravail?.call();
-                    Navigator.pop(context);
+                    _fermerEtDemanderPose(widget.onDemanderPoserTravail);
                   });
                 }
               },
               itemBuilder: (_) => const [
-                PopupMenuItem(value: 'carte', child: Text('Placer sur la carte')),
-                PopupMenuItem(value: 'changer', child: Text('Chercher par nom')),
+                PopupMenuItem(
+                  value: 'carte',
+                  child: Text('Placer sur la carte'),
+                ),
+                PopupMenuItem(
+                  value: 'changer',
+                  child: Text('Chercher par nom'),
+                ),
                 PopupMenuItem(value: 'supprimer', child: Text('Supprimer')),
               ],
             ),
@@ -609,7 +482,6 @@ class _SearchScreenState extends State<SearchScreen> {
 
     return ListView(
       children: [
-        _tileMaison(),
         _tileTravail(),
         const Divider(height: 8),
         if (_recentes.isNotEmpty) ...[
@@ -694,10 +566,12 @@ class _SearchScreenState extends State<SearchScreen> {
     }
 
     if (_rechercheEnCours && _resultats.isEmpty) {
-      enfants.add(const Padding(
-        padding: EdgeInsets.symmetric(vertical: 24),
-        child: Center(child: CircularProgressIndicator()),
-      ));
+      enfants.add(
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 24),
+          child: Center(child: CircularProgressIndicator()),
+        ),
+      );
     } else {
       for (final r in _resultats) {
         enfants.add(
@@ -715,16 +589,16 @@ class _SearchScreenState extends State<SearchScreen> {
           ),
         );
       }
-      if (_resultats.isEmpty &&
-          _suggestionsCategories.isEmpty &&
-          !_horsZone) {
+      if (_resultats.isEmpty && _suggestionsCategories.isEmpty && !_horsZone) {
         enfants.add(
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 24),
             child: Center(
               child: Text(
                 'Aucun lieu trouvé à Kinshasa.',
-                style: TextStyle(color: couleur.onSurface.withValues(alpha: 0.6)),
+                style: TextStyle(
+                  color: couleur.onSurface.withValues(alpha: 0.6),
+                ),
               ),
             ),
           ),
@@ -737,11 +611,10 @@ class _SearchScreenState extends State<SearchScreen> {
 }
 
 /// Fenêtre de recherche utilisée pour enregistrer un lieu personnel par nom
-/// (domicile ou lieu de travail) : même moteur que l'écran principal
+/// (par exemple le lieu de travail) : même moteur que l'écran principal
 /// (suggestions + géocodeur), mais le résultat est renvoyé au parent qui le
-/// persiste sous la clé `lieu_maison` ou `lieu_travail`. [titre] et [icone]
-/// s'adaptent au lieu choisi pour ne pas annoncer « maison » lors de
-/// l'enregistrement du lieu de travail.
+/// persiste sous la clé `lieu_travail`. [titre] et [icone] s'adaptent au lieu
+/// choisi.
 class _ChoixLieuSheet extends StatefulWidget {
   const _ChoixLieuSheet({
     required this.titre,
@@ -750,7 +623,7 @@ class _ChoixLieuSheet extends StatefulWidget {
     this.procheLongitude,
   });
 
-  /// Libellé d'en-tête, ex. « Enregistrer comme maison ».
+  /// Libellé d'en-tête, ex. « Enregistrer comme lieu de travail ».
   final String titre;
 
   /// Icône d'en-tête, alignée sur le badge du lieu sur la carte.
@@ -820,29 +693,35 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
     });
     _debounce = Timer(const Duration(milliseconds: 250), () {
       _rechercheSub?.cancel();
-      _rechercheSub = _service.rechercherLieu(
-        texte,
-        procheLat: widget.procheLatitude,
-        procheLon: widget.procheLongitude,
-      ).listen((resultats) {
-        if (!mounted) return;
-        if (_controller.text.trim() != texte) return;
-        final dansLaVille = _dansLaVille(resultats);
-        setState(() {
-          _resultats = dansLaVille;
-          _horsZone = resultats.isNotEmpty && dansLaVille.isEmpty;
-          _rechercheEnCours = false;
-        });
-      }, onError: (_) {
-        if (!mounted) return;
-        setState(() => _rechercheEnCours = false);
-      }, onDone: () {
-        if (!mounted) return;
-        if (_controller.text.trim() != texte) return;
-        if (_rechercheEnCours) {
-          setState(() => _rechercheEnCours = false);
-        }
-      });
+      _rechercheSub = _service
+          .rechercherLieu(
+            texte,
+            procheLat: widget.procheLatitude,
+            procheLon: widget.procheLongitude,
+          )
+          .listen(
+            (resultats) {
+              if (!mounted) return;
+              if (_controller.text.trim() != texte) return;
+              final dansLaVille = _dansLaVille(resultats);
+              setState(() {
+                _resultats = dansLaVille;
+                _horsZone = resultats.isNotEmpty && dansLaVille.isEmpty;
+                _rechercheEnCours = false;
+              });
+            },
+            onError: (_) {
+              if (!mounted) return;
+              setState(() => _rechercheEnCours = false);
+            },
+            onDone: () {
+              if (!mounted) return;
+              if (_controller.text.trim() != texte) return;
+              if (_rechercheEnCours) {
+                setState(() => _rechercheEnCours = false);
+              }
+            },
+          );
     });
   }
 
@@ -850,7 +729,9 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
   Widget build(BuildContext context) {
     final couleur = Theme.of(context).colorScheme;
     return Padding(
-      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
       child: SizedBox(
         height: MediaQuery.of(context).size.height * 0.8,
         child: Column(
@@ -861,9 +742,13 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
                 children: [
                   Icon(widget.icone, color: couleur.primary),
                   const SizedBox(width: 8),
-                  Text(
-                    widget.titre,
-                    style: Theme.of(context).textTheme.titleMedium,
+                  Expanded(
+                    child: Text(
+                      widget.titre,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
                   ),
                 ],
               ),
@@ -886,9 +771,7 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
               ),
             ),
             const SizedBox(height: 8),
-            Expanded(
-              child: ListView(children: _enfants(couleur)),
-            ),
+            Expanded(child: ListView(children: _enfants(couleur))),
             if (_horsZone) const _BandeauHorsZone(),
           ],
         ),
@@ -920,8 +803,7 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
             title: Text(s),
             onTap: () {
               _controller.text = s;
-              _controller.selection =
-                  TextSelection.collapsed(offset: s.length);
+              _controller.selection = TextSelection.collapsed(offset: s.length);
             },
           ),
         );
@@ -930,10 +812,12 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
     }
 
     if (_rechercheEnCours && _resultats.isEmpty) {
-      enfants.add(const Padding(
-        padding: EdgeInsets.symmetric(vertical: 24),
-        child: Center(child: CircularProgressIndicator()),
-      ));
+      enfants.add(
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 24),
+          child: Center(child: CircularProgressIndicator()),
+        ),
+      );
     } else {
       for (final r in _resultats) {
         enfants.add(
@@ -951,16 +835,16 @@ class _ChoixLieuSheetState extends State<_ChoixLieuSheet> {
           ),
         );
       }
-      if (_resultats.isEmpty &&
-          _suggestionsCategories.isEmpty &&
-          !_horsZone) {
+      if (_resultats.isEmpty && _suggestionsCategories.isEmpty && !_horsZone) {
         enfants.add(
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 24),
             child: Center(
               child: Text(
                 'Aucun lieu trouvé à Kinshasa.',
-                style: TextStyle(color: couleur.onSurface.withValues(alpha: 0.6)),
+                style: TextStyle(
+                  color: couleur.onSurface.withValues(alpha: 0.6),
+                ),
               ),
             ),
           ),

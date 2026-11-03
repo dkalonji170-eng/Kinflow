@@ -1,12 +1,11 @@
 import 'package:flutter/material.dart';
 
-import '../services/rang_service.dart';
+import '../services/supabase_service.dart';
+import 'actions_ami.dart';
 import 'avatar_animal.dart';
-import 'grade_rang.dart';
-import 'rang_signalements_badge.dart';
 
-/// Ouvre la fiche d'un ami en grand : son avatar (avec le grade dans le rond)
-/// et le détail de son rang. Utilisé quand on touche l'icône d'un ami.
+/// Ouvre la fiche d'un ami en grand : son avatar et les actions possibles
+/// (signaler, bloquer). Utilisé quand on touche l'icône d'un ami.
 Future<void> ouvrirProfilAmi(
   BuildContext context, {
   required String userId,
@@ -37,31 +36,55 @@ class _ProfilAmiDialog extends StatefulWidget {
 }
 
 class _ProfilAmiDialogState extends State<_ProfilAmiDialog> {
-  Map<String, dynamic>? _rang;
-  bool _chargement = true;
+  bool _bloque = false;
+  bool _traitement = false;
 
   @override
   void initState() {
     super.initState();
-    _rang = RangService.instance.rang(widget.userId);
-    _chargement = _rang == null;
-    if (_chargement) _charger();
+    _chargerBlocage();
   }
 
-  Future<void> _charger() async {
-    final rang = await RangService.instance.chargerRang(widget.userId);
+  Future<void> _chargerBlocage() async {
+    final bloque = await SupabaseService().estBloque(widget.userId);
+    if (!mounted) return;
+    setState(() => _bloque = bloque);
+  }
+
+  Future<void> _bloquer() async {
+    setState(() => _traitement = true);
+    final ok = await bloquerUtilisateur(
+      context,
+      userId: widget.userId,
+      nom: widget.nom,
+    );
     if (!mounted) return;
     setState(() {
-      _rang = rang;
-      _chargement = false;
+      _traitement = false;
+      if (ok) _bloque = true;
     });
+  }
+
+  Future<void> _debloquer() async {
+    setState(() => _traitement = true);
+    final ok = await debloquerUtilisateur(context, userId: widget.userId);
+    if (!mounted) return;
+    setState(() {
+      _traitement = false;
+      if (ok) _bloque = false;
+    });
+  }
+
+  Future<void> _signaler() async {
+    setState(() => _traitement = true);
+    await signalerUtilisateur(context, userId: widget.userId);
+    if (!mounted) return;
+    setState(() => _traitement = false);
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final niveau = RangService.instance.niveau(widget.userId);
-    final rang = _rang;
 
     return Dialog(
       insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 40),
@@ -81,11 +104,7 @@ class _ProfilAmiDialogState extends State<_ProfilAmiDialog> {
                   icon: const Icon(Icons.close),
                 ),
               ),
-              AvatarAnimalWidget(
-                taille: 140,
-                avatarId: widget.avatarId,
-                userId: widget.userId,
-              ),
+              AvatarAnimalWidget(taille: 140, avatarId: widget.avatarId),
               const SizedBox(height: 14),
               Text(
                 widget.nom,
@@ -96,46 +115,46 @@ class _ProfilAmiDialogState extends State<_ProfilAmiDialog> {
                   fontWeight: FontWeight.w800,
                 ),
               ),
-              const SizedBox(height: 12),
-              if (_chargement)
+              const SizedBox(height: 18),
+              const Divider(height: 1),
+              const SizedBox(height: 6),
+              if (_traitement)
                 const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 18),
+                  padding: EdgeInsets.symmetric(vertical: 12),
                   child: SizedBox(
                     width: 22,
                     height: 22,
                     child: CircularProgressIndicator(strokeWidth: 2.5),
                   ),
                 )
-              else if (rang != null)
-                _detailsRang(rang)
               else
-                Text(
-                  niveau == null
-                      ? 'Grade indisponible'
-                      : 'Grade : ${GradeRang.noms[niveau - 1]}',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: theme.colorScheme.onSurfaceVariant,
-                    fontSize: 13,
-                  ),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    TextButton.icon(
+                      onPressed: _signaler,
+                      icon: const Icon(Icons.flag_outlined, size: 19),
+                      label: const Text('Signaler'),
+                    ),
+                    TextButton.icon(
+                      onPressed: _bloque ? _debloquer : _bloquer,
+                      style: TextButton.styleFrom(
+                        foregroundColor: _bloque
+                            ? theme.colorScheme.primary
+                            : theme.colorScheme.error,
+                      ),
+                      icon: Icon(
+                        _bloque ? Icons.lock_open : Icons.block,
+                        size: 19,
+                      ),
+                      label: Text(_bloque ? 'Débloquer' : 'Bloquer'),
+                    ),
+                  ],
                 ),
             ],
           ),
         ),
       ),
-    );
-  }
-
-  Widget _detailsRang(Map<String, dynamic> rang) {
-    final niveau = (rang['niveau'] as num?)?.toInt() ?? 1;
-    final nom = rang['rang_nom'] as String? ??
-        GradeRang.noms[niveau.clamp(1, GradeRang.noms.length) - 1];
-    final couleur = rang['rang_couleur'] as String? ?? '#9E9E9E';
-
-    return RangSignalementsBadge(
-      rangNom: nom,
-      rangCouleur: couleur,
-      niveau: niveau,
     );
   }
 }

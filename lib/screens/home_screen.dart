@@ -37,7 +37,9 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     _actualiserBadge();
     _chargerAvatar();
-    PositionPartageService.instance.start();
+    // Reprend le partage seulement si l'utilisateur l'avait explicitement
+    // activé et que son consentement n'a pas expiré.
+    unawaited(PositionPartageService.instance.reprendreSiActif());
     _minuteur = Timer.periodic(
       _rafraichissementBadge,
       (_) => _actualiserBadge(),
@@ -90,7 +92,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final nonLus = resultats[1] as Map<String, int>? ?? const {};
     final demandes = resultats[2] as List<Map<String, dynamic>>? ?? const [];
 
-    final total = nouvellesInfos +
+    final total =
+        nouvellesInfos +
         nonLus.values.fold<int>(0, (s, v) => s + v) +
         demandes.length;
 
@@ -162,7 +165,6 @@ class _HomeScreenState extends State<HomeScreen> {
               icon: AvatarAnimalWidget(
                 taille: 34,
                 avatarId: _avatar.isEmpty ? null : _avatar,
-                userId: SupabaseService().userId,
               ),
               tooltip: 'Profil',
             ),

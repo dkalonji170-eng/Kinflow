@@ -2,10 +2,9 @@ import 'package:latlong2/latlong.dart';
 
 /// Dernière position connue d'un(e) ami(e), telle qu'affichée sur la carte.
 /// Construite à partir d'une ligne renvoyée par la fonction Supabase
-/// `mes_amis` : la position est présente dès que le partage est actif, même
-/// si le téléphone de l'ami(e) est éteint ou l'appli fermée ([majA] date
-/// alors la dernière position enregistrée). [depuisJson] retourne null quand
-/// le partage est inactif ou qu'aucune position n'a jamais été enregistrée.
+/// `mes_amis` : la position est présente dès que le partage est actif.
+/// [depuisJson] retourne null quand le partage est inactif ou qu'aucune
+/// position n'a jamais été enregistrée.
 class AmiPosition {
   const AmiPosition({
     required this.id,
@@ -13,7 +12,6 @@ class AmiPosition {
     required this.position,
     this.avatar,
     this.cap,
-    this.majA,
   });
 
   /// Identité (uuid) de l'ami(e), pour le retirer si besoin.
@@ -30,23 +28,18 @@ class AmiPosition {
   /// Cap de déplacement en degrés (0 = Nord), si connu.
   final double? cap;
 
-  /// Date de la dernière mise à jour de la position.
-  final DateTime? majA;
-
   /// Construit une position depuis une ligne `mes_amis`. Retourne null quand
   /// aucun partage (ou aucune position enregistrée) n'est disponible.
   static AmiPosition? depuisJson(Map<String, dynamic> json) {
     final latitude = _doubleOuNull(json['latitude']);
     final longitude = _doubleOuNull(json['longitude']);
     if (latitude == null || longitude == null) return null;
-    final brut = json['maj_a'];
     return AmiPosition(
       id: json['ami_id']?.toString() ?? '',
       nom: _nomComplet(json),
       avatar: json['avatar'] as String?,
       position: LatLng(latitude, longitude),
       cap: _doubleOuNull(json['cap']),
-      majA: brut == null ? null : DateTime.tryParse(brut.toString()),
     );
   }
 

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'home_screen.dart';
+import 'compte_screen.dart';
 
 class CodeScreen extends StatelessWidget {
   final String code;
@@ -73,6 +74,17 @@ class CodeScreen extends StatelessWidget {
                 },
                 child: const Text('Continuer'),
               ),
+            ),
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const CompteScreen()),
+                );
+              },
+              icon: const Icon(Icons.save_outlined),
+              label: const Text('Sauvegarder mon compte (recommandé)'),
             ),
           ],
         ),

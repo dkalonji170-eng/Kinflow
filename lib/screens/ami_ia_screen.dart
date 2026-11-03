@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:latlong2/latlong.dart';
 
-import '../models/ami_position.dart';
 import '../models/search_result.dart';
 import '../services/ia_service.dart';
 import '../theme/kinflow_theme.dart';
@@ -50,7 +49,8 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
       _bulles.add(
         _Bulle(
           deIA: true,
-          texte: 'Salut ! 👋 Je suis Kinflow, ton ami(e) dans KinFlow. '
+          texte:
+              'Salut ! 👋 Je suis Kinflow, ton ami(e) dans KinFlow. '
               'Demande-moi de localiser un ami, de tracer un itinéraire, '
               'de chercher un lieu, ou on peut juste discuter. 😊',
         ),
@@ -105,11 +105,7 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
       if (!mounted) return;
       setState(() {
         _bulles.add(
-          _Bulle(
-            deIA: true,
-            texte: reponse.texte,
-            actions: etiquettes,
-          ),
+          _Bulle(deIA: true, texte: reponse.texte, actions: etiquettes),
         );
       });
       _descendreEnBas();
@@ -126,8 +122,7 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
 
   /// Exécute une liste d'actions. Retourne les réponses à renvoyer à l'IA
   /// (format functionResponse) et les étiquettes à afficher à l'écran.
-  Future<
-      (List<Map<String, dynamic>>, List<String>)> _executerActions(
+  Future<(List<Map<String, dynamic>>, List<String>)> _executerActions(
     List<ActionIA> actions,
   ) async {
     final resultats = <Map<String, dynamic>>[];
@@ -178,19 +173,27 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
     final ami = await _ia.localiserAmi(nom);
     if (!mounted) {
       return (
-        {'nom': 'localiser_ami', 'reponse': {'succes': false}},
+        {
+          'nom': 'localiser_ami',
+          'reponse': {'succes': false},
+        },
         '⛔ Localisation annulée',
       );
     }
     if (ami == null) {
       return (
-        {'nom': 'localiser_ami', 'reponse': {'succes': false, 'ami': nom}},
+        {
+          'nom': 'localiser_ami',
+          'reponse': {'succes': false, 'ami': nom},
+        },
         '🔍 Ami(e) « $nom » introuvable',
       );
     }
     await Navigator.push(
       context,
-      MaterialPageRoute(builder: (context) => TrafficScreen(amiALocaliser: ami)),
+      MaterialPageRoute(
+        builder: (context) => TrafficScreen(amiALocaliser: ami),
+      ),
     );
     return (
       {
@@ -209,7 +212,10 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
     final resultats = await _ia.rechercherLieu(destination);
     if (!mounted) {
       return (
-        {'nom': 'itineraire_vers', 'reponse': {'succes': false}},
+        {
+          'nom': 'itineraire_vers',
+          'reponse': {'succes': false},
+        },
         '⛔ Itinéraire annulé',
       );
     }
@@ -249,18 +255,23 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
     final resultats = await _ia.rechercherLieu(terme);
     if (!mounted) {
       return (
-        {'nom': 'rechercher_lieu', 'reponse': {'succes': false}},
+        {
+          'nom': 'rechercher_lieu',
+          'reponse': {'succes': false},
+        },
         '⛔ Recherche annulée',
       );
     }
     if (resultats.isEmpty) {
       return (
-        {'nom': 'rechercher_lieu', 'reponse': {'succes': false, 'terme': terme}},
+        {
+          'nom': 'rechercher_lieu',
+          'reponse': {'succes': false, 'terme': terme},
+        },
         '🔍 Rien trouvé pour « $terme »',
       );
     }
     _afficherResultatsLieux(terme, resultats);
-    final noms = resultats.map((r) => r.nom).take(3).join(', ');
     return (
       {
         'nom': 'rechercher_lieu',
@@ -269,11 +280,13 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
           'terme': terme,
           'resultats': resultats
               .take(5)
-              .map((r) => {
-                    'nom': r.nom,
-                    'latitude': r.latitude,
-                    'longitude': r.longitude,
-                  })
+              .map(
+                (r) => {
+                  'nom': r.nom,
+                  'latitude': r.latitude,
+                  'longitude': r.longitude,
+                },
+              )
               .toList(),
         },
       },
@@ -290,32 +303,35 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
     final code = await _ia.envoyerMessageAmi(nom, message);
     if (!mounted) {
       return (
-        {'nom': 'envoyer_message_ami', 'reponse': {'succes': false}},
+        {
+          'nom': 'envoyer_message_ami',
+          'reponse': {'succes': false},
+        },
         '⛔ Envoi annulé',
       );
     }
     return switch (code) {
       'ok' => (
-          {
-            'nom': 'envoyer_message_ami',
-            'reponse': {'succes': true, 'ami': nom},
-          },
-          '✉️ Message envoyé à $nom',
-        ),
+        {
+          'nom': 'envoyer_message_ami',
+          'reponse': {'succes': true, 'ami': nom},
+        },
+        '✉️ Message envoyé à $nom',
+      ),
       'ami_introuvable' => (
-          {
-            'nom': 'envoyer_message_ami',
-            'reponse': {'succes': false, 'ami': nom},
-          },
-          '🔍 Ami(e) « $nom » introuvable',
-        ),
+        {
+          'nom': 'envoyer_message_ami',
+          'reponse': {'succes': false, 'ami': nom},
+        },
+        '🔍 Ami(e) « $nom » introuvable',
+      ),
       _ => (
-          {
-            'nom': 'envoyer_message_ami',
-            'reponse': {'succes': false, 'erreur': code},
-          },
-          '⚠️ Envoi à $nom impossible (réseau)',
-        ),
+        {
+          'nom': 'envoyer_message_ami',
+          'reponse': {'succes': false, 'erreur': code},
+        },
+        '⚠️ Envoi à $nom impossible (réseau)',
+      ),
     };
   }
 
@@ -353,8 +369,7 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
                   context,
                   MaterialPageRoute(
                     builder: (context) => TrafficScreen(
-                      arriveeInitiale:
-                          LatLng(lieu.latitude, lieu.longitude),
+                      arriveeInitiale: LatLng(lieu.latitude, lieu.longitude),
                       arriveeNomInitial: lieu.nom,
                     ),
                   ),
@@ -491,13 +506,17 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
         constraints: const BoxConstraints(maxWidth: 320),
         margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
         child: Column(
-          crossAxisAlignment: moi ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+          crossAxisAlignment: moi
+              ? CrossAxisAlignment.end
+              : CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
             if (bulle.texte.isNotEmpty)
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: moi
                       ? KinColors.primary
@@ -514,9 +533,7 @@ class _AmiIaScreenState extends State<AmiIaScreen> {
                   style: TextStyle(
                     fontSize: 15,
                     height: 1.35,
-                    color: moi
-                        ? Colors.white
-                        : theme.colorScheme.onSurface,
+                    color: moi ? Colors.white : theme.colorScheme.onSurface,
                   ),
                 ),
               ),

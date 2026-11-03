@@ -80,8 +80,10 @@ class _ReportProblemScreenState extends State<ReportProblemScreen>
             final na = (a['nb_likes'] as num?)?.toInt() ?? 0;
             final nb = (b['nb_likes'] as num?)?.toInt() ?? 0;
             if (na != nb) return nb.compareTo(na);
-            final da = DateTime.tryParse(a['cree_a']?.toString() ?? '') ?? DateTime(0);
-            final db = DateTime.tryParse(b['cree_a']?.toString() ?? '') ?? DateTime(0);
+            final da =
+                DateTime.tryParse(a['cree_a']?.toString() ?? '') ?? DateTime(0);
+            final db =
+                DateTime.tryParse(b['cree_a']?.toString() ?? '') ?? DateTime(0);
             return db.compareTo(da);
           });
         }
@@ -125,7 +127,9 @@ class _ReportProblemScreenState extends State<ReportProblemScreen>
 
     if (ok == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Envoi impossible. Vérifie ta connexion.")),
+        const SnackBar(
+          content: Text("Envoi impossible. Vérifie ta connexion."),
+        ),
       );
       return;
     }
@@ -172,7 +176,10 @@ class _ReportProblemScreenState extends State<ReportProblemScreen>
         child: Column(
           children: [
             DropdownButtonFormField<String>(
-              value: problemeChoisi,
+              // `initialValue` remplace `value` (déprécié). La clé force la
+              // reconstruction quand le formulaire est remis à zéro après envoi.
+              key: ValueKey(problemeChoisi),
+              initialValue: problemeChoisi,
               decoration: const InputDecoration(
                 labelText: "Type de problème",
                 border: OutlineInputBorder(),
@@ -213,7 +220,9 @@ class _ReportProblemScreenState extends State<ReportProblemScreen>
               style: ElevatedButton.styleFrom(
                 foregroundColor: Theme.of(context).colorScheme.onSurface,
               ),
-              onPressed: (autorise && !_envoiEnCours) ? envoyerSignalement : null,
+              onPressed: (autorise && !_envoiEnCours)
+                  ? envoyerSignalement
+                  : null,
               child: _envoiEnCours
                   ? const SizedBox(
                       width: 18,
@@ -278,7 +287,10 @@ class _ReportProblemScreenState extends State<ReportProblemScreen>
                   Row(
                     children: [
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
                         decoration: BoxDecoration(
                           color: Theme.of(context).colorScheme.primaryContainer,
                           borderRadius: BorderRadius.circular(8),
@@ -287,7 +299,9 @@ class _ReportProblemScreenState extends State<ReportProblemScreen>
                           s['type']?.toString() ?? '',
                           style: TextStyle(
                             fontWeight: FontWeight.w600,
-                            color: Theme.of(context).colorScheme.onPrimaryContainer,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onPrimaryContainer,
                           ),
                         ),
                       ),
@@ -313,16 +327,23 @@ class _ReportProblemScreenState extends State<ReportProblemScreen>
                         onTap: enCours ? null : () => _toggleLike(s),
                         borderRadius: BorderRadius.circular(20),
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 4,
+                          ),
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               Icon(
-                                jAiLike ? Icons.thumb_up : Icons.thumb_up_outlined,
+                                jAiLike
+                                    ? Icons.thumb_up
+                                    : Icons.thumb_up_outlined,
                                 size: 18,
                                 color: jAiLike
                                     ? Theme.of(context).colorScheme.primary
-                                    : Theme.of(context).colorScheme.onSurfaceVariant,
+                                    : Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
                               ),
                               const SizedBox(width: 4),
                               Text(
@@ -331,7 +352,9 @@ class _ReportProblemScreenState extends State<ReportProblemScreen>
                                   fontWeight: FontWeight.w600,
                                   color: jAiLike
                                       ? Theme.of(context).colorScheme.primary
-                                      : Theme.of(context).colorScheme.onSurfaceVariant,
+                                      : Theme.of(
+                                          context,
+                                        ).colorScheme.onSurfaceVariant,
                                 ),
                               ),
                             ],
@@ -365,10 +388,7 @@ class _ReportProblemScreenState extends State<ReportProblemScreen>
       ),
       body: TabBarView(
         controller: _tabController,
-        children: [
-          _ongletSignaler(),
-          _ongletListe(),
-        ],
+        children: [_ongletSignaler(), _ongletListe()],
       ),
     );
   }

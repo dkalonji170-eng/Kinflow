@@ -16,7 +16,6 @@ class TrafficStateSheet extends StatelessWidget {
     super.key,
     required this.onChoix,
     this.dernierEtat,
-    this.carteGrade,
     this.rappelCompte,
   });
 
@@ -26,10 +25,6 @@ class TrafficStateSheet extends StatelessWidget {
 
   /// État actuellement signalé, affiché en sous-titre si présent.
   final String? dernierEtat;
-
-  /// Carte de grade du compte, affichée au-dessus des choix : le signalement
-  /// est un geste personnel, la progression doit se voir à cet endroit précis.
-  final Widget? carteGrade;
 
   /// Phrase de rattachement au compte (« Signaler avec ton compte… »).
   final String? rappelCompte;
@@ -86,10 +81,6 @@ class TrafficStateSheet extends StatelessWidget {
                         : KinColors.texteSecondaireClair,
                   ),
                 ),
-                if (carteGrade != null) ...[
-                  const SizedBox(height: 14),
-                  carteGrade!,
-                ],
                 const SizedBox(height: 16),
                 _choixEtat(
                   context,
@@ -118,9 +109,8 @@ class TrafficStateSheet extends StatelessWidget {
                 const SizedBox(height: 4),
                 Text(
                   rappelCompte ??
-                      'Ton choix est envoyé depuis ton compte : il fait '
-                          'progresser ton grade et met la carte à jour pour '
-                          'les autres conducteurs.',
+                      'Ton choix est envoyé depuis ton compte et met la carte '
+                          'à jour pour les autres conducteurs.',
                   style: TextStyle(
                     fontSize: 11.5,
                     height: 1.35,
