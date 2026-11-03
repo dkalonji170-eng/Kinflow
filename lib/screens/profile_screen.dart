@@ -483,108 +483,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
         ),
       ],
     );
-    return Scaffold(
-      appBar: AppBar(title: const Text("Mon profil"), centerTitle: true),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 20, 16, 28),
-        children: [
-          Center(
-            child: AvatarAnimalWidget(
-              taille: 108,
-              avatarId: avatar,
-              // Un halo lumineux pour que l'avatar ressorte sur le fond.
-              brillance: true,
-            ),
-          ),
-          const SizedBox(height: 12),
-          Center(
-            child: Text(
-              "$nom $prenom",
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
-            ),
-          ),
-          const SizedBox(height: 20),
-
-          // 1) Code du compte — privé.
-          _section(
-            icone: Icons.key,
-            titre: 'Code du compte',
-            contenu: [
-              _codeAffichable(
-                valeur: code,
-                messageCopie: 'Code de compte copié',
-                vide: 'Code indisponible pour le moment.',
-              ),
-              const SizedBox(height: 8),
-              _texteSecondaire('Ne le partage pas : il sert à te reconnecter.'),
-            ],
-          ),
-
-          // 2) Code ami — public.
-          _section(
-            icone: Icons.person_add_alt_1,
-            titre: 'Code ami',
-            contenu: [
-              if (_chargementCodeAmi)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 6),
-                  child: SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                )
-              else
-                _codeAffichable(
-                  valeur: _codeAmi,
-                  messageCopie: 'Code ami copié',
-                  vide: 'Code ami indisponible pour le moment.',
-                ),
-              const SizedBox(height: 8),
-              _texteSecondaire(
-                'Partage-le pour qu\'on t\'ajoute dans les amis(es).',
-              ),
-            ],
-          ),
-
-          // 3) Sexe et coordonnées.
-          const SizedBox(height: 4),
-          Card(
-            margin: EdgeInsets.zero,
-            child: ListTile(
-              leading: Icon(Icons.badge_outlined, color: colorScheme.primary),
-              title: Text("Sexe : $sexe"),
-              subtitle: Text(
-                "Date de naissance : $date\n"
-                "Téléphone : $telephone\n"
-                "Email : $email",
-              ),
-            ),
-          ),
-          const SizedBox(height: 20),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              foregroundColor: colorScheme.onSurface,
-            ),
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => const EditProfileScreen(),
-                ),
-              ).then((value) {
-                chargerProfil();
-                _chargerCodeAmi();
-              });
-            },
-            icon: const Icon(Icons.edit),
-            label: const Text("Modifier mon profil"),
-          ),
-        ],
-      ),
-    );
-
     final page = Scaffold(
       appBar: widget.integre
           ? AppBar(
@@ -599,7 +497,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
       body: contenu,
     );
 
-    if (widget.integre) return page;
     return page;
   }
 }

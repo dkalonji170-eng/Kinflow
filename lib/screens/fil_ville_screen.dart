@@ -107,11 +107,11 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// recharger à chaque aller-retour sur l'onglet.
   bool _amisChargees = false;
   List<Map<String, dynamic>> _infosSuivis = [];
-  bool _chargementSuivis = true;
+  bool _chargementInfosSuivis = true;
 
   // --- Espaces informateurs : « Ma page » / « Suivis » ---------------------
   /// false = « Ma page », true = « Suivis ».
-  bool _vueSuivis = false;
+  bool _afficherSuivis = false;
   bool _chargementSuivis = false;
   bool _suivisCharges = false;
   List<Map<String, dynamic>> _suivis = const [];
@@ -209,7 +209,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     if (!mounted) return;
     setState(() {
       _infosSuivis = infos;
-      _chargementSuivis = false;
+      _chargementInfosSuivis = false;
     });
   }
 
@@ -506,7 +506,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   }
 
   Widget _vueSuivis() {
-    if (_chargementSuivis) {
+    if (_chargementInfosSuivis) {
       return const Center(child: CircularProgressIndicator());
     }
     final theme = Theme.of(context);
@@ -684,19 +684,19 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                 icon: Icon(Icons.bookmark_border, size: 18),
               ),
             ],
-            selected: {_vueSuivis},
+            selected: {_afficherSuivis},
             showSelectedIcon: false,
             onSelectionChanged: (choix) => _changerVue(choix.first),
           ),
         ),
-        Expanded(child: _vueSuivis ? _listeSuivis() : _maPage()),
+        Expanded(child: _afficherSuivis ? _listeSuivis() : _maPage()),
       ],
     );
   }
 
   void _changerVue(bool suivis) {
-    if (_vueSuivis == suivis) return;
-    setState(() => _vueSuivis = suivis);
+    if (_afficherSuivis == suivis) return;
+    setState(() => _afficherSuivis = suivis);
     if (suivis && !_suivisCharges) _chargerSuivis();
   }
 
@@ -1255,6 +1255,32 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                 ],
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _boutonCode(
+    ThemeData theme,
+    IconData icone,
+    String etiquette,
+    VoidCallback onPressed, {
+    required bool actif,
+  }) {
+    return Expanded(
+      child: OutlinedButton.icon(
+        onPressed: actif ? onPressed : null,
+        icon: Icon(icone, size: 18),
+        label: Text(etiquette, overflow: TextOverflow.ellipsis),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: theme.colorScheme.onPrimaryContainer,
+          disabledForegroundColor: theme.colorScheme.onPrimaryContainer
+              .withValues(alpha: 0.45),
+          side: BorderSide(
+            color: actif
+                ? theme.colorScheme.primary
+                : theme.colorScheme.outlineVariant,
           ),
         ),
       ),
