@@ -16,6 +16,7 @@ import '../utils/temps_relatif.dart';
 import '../widgets/avatar_animal.dart';
 import '../widgets/social_ui.dart';
 import 'chat_ami_screen.dart';
+import 'profile_screen.dart';
 import 'scan_qr_ami_screen.dart';
 
 /// Le fil de la ville : la suite d'informations publiées par KinFlow.
@@ -57,6 +58,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   bool _chargement = true;
   Timer? _minuteur;
   final ScrollController _defilementInfos = ScrollController();
+  final Map<String, int> _tentativesImages = {};
 
   /// Information à mettre en évidence (retour depuis un tag) et clés de
   /// défilement par information.
@@ -90,6 +92,8 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// Vrai dès que la liste a été chargée une première fois : évite de
   /// recharger à chaque aller-retour sur l'onglet.
   bool _amisChargees = false;
+  List<Map<String, dynamic>> _infosSuivis = [];
+  bool _chargementSuivis = true;
 
   @override
   void initState() {
@@ -108,6 +112,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     // Charge aussi les amis(es) dès l'ouverture : le point rouge de l'onglet
     // « Amis(es) » doit être visible même avant d'ouvrir cet onglet.
     _chargerAmis(silencieux: true);
+    _chargerInfosSuivis();
     _minuteur = Timer.periodic(_rafraichissementAuto, (_) => _chargerFil());
   }
 
@@ -170,6 +175,15 @@ class _FilVilleScreenState extends State<FilVilleScreen>
       _premiereCharge = false;
       _marquerToutVu();
     }
+  }
+
+  Future<void> _chargerInfosSuivis() async {
+    final infos = await SupabaseService().mesInfosRecues();
+    if (!mounted) return;
+    setState(() {
+      _infosSuivis = infos;
+      _chargementSuivis = false;
+    });
   }
 
   /// Affiche tout de suite le fil depuis le cache local, avant le réseau.
@@ -456,6 +470,99 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// Vue « Amis(es) » : ma carte ami, les demandes, les positions partagées et
   /// la liste des amis(es) avec recherche.
   Widget _vueAmis() {
+    return DefaultTabController(
+      length: 3,
+      child: Column(
+        children: [
+          Material(
+            color: Theme.of(context).colorScheme.surface,
+            child: const TabBar(
+              tabs: [
+                Tab(text: 'Messages'),
+                Tab(text: 'Suivis'),
+                Tab(text: 'Ma page'),
+              ],
+            ),
+          ),
+          Expanded(
+            child: TabBarView(
+              children: [
+                _contenuAmis(),
+                _vueSuivis(),
+                const ProfileScreen(integre: true),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _vueSuivis() {
+    if (_chargementSuivis) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final theme = Theme.of(context);
+    if (_infosSuivis.isEmpty) {
+      return RefreshIndicator(
+        onRefresh: _chargerInfosSuivis,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+          children: [
+            _carteMonCode(theme),
+            const SizedBox(height: 24),
+            const SizedBox(height: 96),
+            const EspaceVideSocial(
+              icone: Icons.rss_feed_outlined,
+              titre: 'Aucune information suivie',
+              message: 'Les informations partagées par tes amis apparaîtront ici.',
+            ),
+          ],
+        ),
+      );
+    }
+    return RefreshIndicator(
+      onRefresh: _chargerInfosSuivis,
+      child: ListView.separated(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+        itemCount: _infosSuivis.length + 1,
+        separatorBuilder: (_, _) => const SizedBox(height: 10),
+        itemBuilder: (_, index) {
+          if (index == 0) return _carteMonCode(theme);
+          index--;
+          final info = _infosSuivis[index];
+          final prenom = info['prenom'] as String? ?? '';
+          final nom = info['nom'] as String? ?? '';
+          final contenu = info['contenu'] as String? ?? '';
+          final information = InformationVille.depuisJson({
+            'id': info['information_id'] ?? info['id'],
+            'contenu': contenu,
+            'source_url': info['source_url'],
+            'image_url': info['image_url'],
+            'cree_a': info['cree_a'],
+          });
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Text(
+                  'Publié par ${[prenom, nom].where((v) => v.isNotEmpty).join(' ')}',
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+              ),
+              const SizedBox(height: 8),
+              _carteInformation(information),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _contenuAmis() {
     if (_chargementAmis) return _squeletteAmis();
     final theme = Theme.of(context);
     final filtres = _amisFiltres;
@@ -481,7 +588,6 @@ class _FilVilleScreenState extends State<FilVilleScreen>
             ],
             const SizedBox(height: 10),
           ],
-          _carteMonCode(theme),
           if (_amis.isNotEmpty) ...[
             const SizedBox(height: 16),
             _barreRechercheAmis(theme),
@@ -552,7 +658,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
               const Icon(Icons.qr_code_2, color: Colors.white, size: 20),
               const SizedBox(width: 8),
               const Text(
-                'Mon code ami',
+                'Mon espace',
                 style: TextStyle(
                   color: Colors.white,
                   fontWeight: FontWeight.w800,
@@ -584,7 +690,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
           ),
           const SizedBox(height: 4),
           Text(
-            'Fais scanner ce code ou partage-le pour qu\'on t\'ajoute.',
+            'Ouvre ton espace ou copie son lien pour inviter tes amis.',
             style: TextStyle(
               color: Colors.white.withValues(alpha: 0.85),
               fontSize: 12,
@@ -593,10 +699,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
           const SizedBox(height: 14),
           Row(
             children: [
-              _boutonCode(theme, Icons.qr_code_2, 'Afficher', _afficherQrAmi,
-                  actif: pret),
-              const SizedBox(width: 8),
-              _boutonCode(theme, Icons.copy, 'Copier', _copierCodeAmi,
+              _boutonCode(theme, Icons.copy, 'Copier le lien', _copierLienAmi,
                   actif: pret),
               const SizedBox(width: 8),
               _boutonCode(theme, Icons.ios_share, 'Partager', _partagerCodeAmi,
@@ -832,6 +935,18 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Code ami copié.')),
+    );
+  }
+
+  String get _lienMonEspace =>
+      'https://kinflow.netlify.app/?ami=${Uri.encodeComponent(_monCodeAmi)}';
+
+  Future<void> _copierLienAmi() async {
+    if (_monCodeAmi.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: _lienMonEspace));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Lien de mon espace copié.')),
     );
   }
 
@@ -2175,12 +2290,25 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// Image d'une information (article d'origine), affichée au-dessus du texte.
   Widget _imageInformation(String url) {
     final theme = Theme.of(context);
+    final uri = Uri.tryParse(url);
+    final referer =
+        uri == null ? null : '${uri.scheme}://${uri.host}/';
+    final normale = url.startsWith('http://')
+        ? url.replaceFirst('http://', 'https://')
+        : url;
     return ClipRRect(
       borderRadius: BorderRadius.circular(12),
       child: AspectRatio(
         aspectRatio: 16 / 9,
         child: Image.network(
-          url,
+          key: ValueKey('$normale-${_tentativesImages[normale] ?? 0}'),
+          normale,
+          headers: {
+            'User-Agent':
+                'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36',
+            if (referer != null) 'Referer': referer,
+          },
           fit: BoxFit.cover,
           loadingBuilder: (context, child, progression) {
             if (progression == null) return child;
@@ -2197,9 +2325,23 @@ class _FilVilleScreenState extends State<FilVilleScreen>
           },
           errorBuilder: (_, _, _) => ColoredBox(
             color: theme.colorScheme.surfaceContainerHighest,
-            child: Icon(
-              Icons.image_not_supported_outlined,
-              color: theme.colorScheme.onSurfaceVariant,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.image_not_supported_outlined,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(height: 8),
+                TextButton.icon(
+                  onPressed: () => setState(() {
+                    _tentativesImages[normale] =
+                        (_tentativesImages[normale] ?? 0) + 1;
+                  }),
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: const Text('Recharger la photo'),
+                ),
+              ],
             ),
           ),
         ),

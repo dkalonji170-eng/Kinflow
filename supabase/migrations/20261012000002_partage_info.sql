@@ -94,6 +94,12 @@ as $$
     'avatar', p.avatar,
     'contenu', pa.contenu,
     'source_url', pa.source_url,
+    'image_url', case when pa.information_id is not null then (
+      select i.image_url
+      from public.informations i
+      where i.id = pa.information_id
+    ) else null end,
+    'information_id', pa.information_id,
     'cree_a', pa.cree_a,
     'lu', pa.lu
   )

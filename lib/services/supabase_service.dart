@@ -1471,6 +1471,28 @@ class SupabaseService {
     }
   }
 
+  Future<Map<String, int>> compterNotificationsPages() async {
+    await ready;
+    final client = _client;
+    if (client == null) return const {'publication': 0, 'reponse': 0};
+    try {
+      final resultat =
+          await client.rpc('compter_notifications_pages').timeout(_timeout);
+      if (resultat is! List || resultat.isEmpty || resultat.first is! Map) {
+        return const {'publication': 0, 'reponse': 0};
+      }
+      final ligne = Map<String, dynamic>.from(resultat.first as Map);
+      return {
+        'publication': (ligne['publications'] as num?)?.toInt() ?? 0,
+        'reponse':
+            (ligne['reponses_commentaires'] as num?)?.toInt() ?? 0,
+      };
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur compterNotificationsPages: $e');
+      return const {'publication': 0, 'reponse': 0};
+    }
+  }
+
   /// Dernier message échangé avec chaque ami(e) (fenêtre 7 jours) : clé =
   /// ami_id, valeur = {contenu, moi, cree_a}. Sert d'aperçu sous le nom.
   Future<Map<String, Map<String, dynamic>>> apercusMessagesAmis() async {

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/supabase_service.dart';
 import '../services/position_partage_service.dart';
@@ -88,10 +89,21 @@ class _HomeScreenState extends State<HomeScreen> {
     final nouvellesInfos = resultats[0] as int? ?? 0;
     final nonLus = resultats[1] as Map<String, int>? ?? const {};
     final demandes = resultats[2] as List<Map<String, dynamic>>? ?? const [];
+    final prefs = await SharedPreferences.getInstance();
+    final notificationsPages = await service.compterNotificationsPages();
+    final publicationsPage = prefs.getBool('notif_publications_pages') == false
+        ? 0
+        : notificationsPages['publication'] ?? 0;
+    final reponsesCommentaires =
+        prefs.getBool('notif_reponses_commentaires') == false
+            ? 0
+            : notificationsPages['reponse'] ?? 0;
 
     final total = nouvellesInfos +
         nonLus.values.fold<int>(0, (s, v) => s + v) +
-        demandes.length;
+        demandes.length +
+        publicationsPage +
+        reponsesCommentaires;
 
     if (!mounted) return;
     setState(() => _nouvelles = total);
