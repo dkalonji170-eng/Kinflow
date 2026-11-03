@@ -6,6 +6,7 @@ import 'package:material_design_icons_flutter/material_design_icons_flutter.dart
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../config/partage_config.dart';
 import '../models/ami_position.dart';
 import '../models/information_ville.dart';
 import '../services/diagnostics_service.dart';
@@ -18,6 +19,8 @@ import '../widgets/profil_ami_dialog.dart';
 import '../widgets/social_ui.dart';
 import 'blocked_users_screen.dart';
 import 'chat_ami_screen.dart';
+import 'espace_informateur_screen.dart';
+import 'mon_espace_screen.dart';
 import 'partage_position_screen.dart';
 import 'scan_qr_ami_screen.dart';
 
@@ -100,11 +103,18 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// recharger à chaque aller-retour sur l'onglet.
   bool _amisChargees = false;
 
+  // --- Espaces informateurs : « Ma page » / « Suivis » ---------------------
+  /// false = « Ma page », true = « Suivis ».
+  bool _vueSuivis = false;
+  bool _chargementSuivis = false;
+  bool _suivisCharges = false;
+  List<Map<String, dynamic>> _suivis = const [];
+
   @override
   void initState() {
     super.initState();
     Journal.i('SOCIAL', 'Écran Social ouvert');
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
     _tabController.addListener(_surChangementOnglet);
     _lireDernierVu();
     _chargerPrenom();
@@ -134,11 +144,16 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   /// liste — jamais pendant l'animation de glissement.
   void _surChangementOnglet() {
     if (_tabController.indexIsChanging) return;
-    Journal.i(
-      'SOCIAL',
-      'Onglet ${_tabController.index == 1 ? 'Amis(es)' : 'Information'} ouvert',
-    );
+    final libelle = switch (_tabController.index) {
+      1 => 'Amis(es)',
+      2 => 'Informateurs',
+      _ => 'Information',
+    };
+    Journal.i('SOCIAL', 'Onglet $libelle ouvert');
     if (_tabController.index == 1) _chargerAmis(silencieux: _amisChargees);
+    if (_tabController.index == 2 && _suivisCharges) {
+      _chargerSuivis(silencieux: true);
+    }
   }
 
   Future<void> _chargerFil() async {
@@ -520,6 +535,393 @@ class _FilVilleScreenState extends State<FilVilleScreen>
             for (final ami in filtres) _carteAmi(ami),
         ],
       ),
+    );
+  }
+
+  /// Vue « Informateurs » : deux volets — « Ma page » et « Suivis ».
+  ///
+  /// Aucun annuaire, aucune découverte : on n'arrive chez quelqu'un que si on
+  /// possède son lien, et on ne le retrouve dans « Suivis » que si on a
+  /// appuyé sur « Suivre ».
+  Widget _vueInformateurs() {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
+          child: SegmentedButton<bool>(
+            segments: const [
+              ButtonSegment(
+                value: false,
+                label: Text('Ma page'),
+                icon: Icon(Icons.person_outline, size: 18),
+              ),
+              ButtonSegment(
+                value: true,
+                label: Text('Suivis'),
+                icon: Icon(Icons.bookmark_border, size: 18),
+              ),
+            ],
+            selected: {_vueSuivis},
+            showSelectedIcon: false,
+            onSelectionChanged: (choix) => _changerVue(choix.first),
+          ),
+        ),
+        Expanded(child: _vueSuivis ? _listeSuivis() : _maPage()),
+      ],
+    );
+  }
+
+  void _changerVue(bool suivis) {
+    if (_vueSuivis == suivis) return;
+    setState(() => _vueSuivis = suivis);
+    if (suivis && !_suivisCharges) _chargerSuivis();
+  }
+
+  /// Volet « Ma page » : mon espace et l'ouverture d'un espace par lien.
+  Widget _maPage() {
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
+      children: [
+        _carteEspace(
+          icone: Icons.record_voice_over,
+          titre: 'Mon espace informateur',
+          message:
+              'Publie tes reportages et partage ton lien. Seules les '
+              'personnes qui ont ce lien peuvent te lire.',
+          action: 'Ouvrir ma page',
+          onAction: () async {
+            await Navigator.push<void>(
+              context,
+              MaterialPageRoute(builder: (_) => const MonEspaceScreen()),
+            );
+          },
+        ),
+        const SizedBox(height: 14),
+        _carteEspace(
+          icone: Icons.link,
+          titre: 'Ouvrir un espace',
+          message:
+              'Colle le lien (ou le code) qu\'un ami t\'a envoyé pour lire '
+              'son espace.',
+          action: 'Coller un lien',
+          onAction: _ouvrirParLien,
+        ),
+        const SizedBox(height: 18),
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: Theme.of(
+              context,
+            ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                Icons.bookmark_added_outlined,
+                size: 20,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Quand tu ouvres une page, appuie sur « Suivre » pour la '
+                  'retrouver dans l\'onglet Suivis.',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodySmall?.copyWith(height: 1.4),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _chargerSuivis({bool silencieux = false}) async {
+    if (!silencieux && mounted) {
+      setState(() => _chargementSuivis = true);
+    }
+    final suivis = await SupabaseService().mesAbonnements();
+    if (!mounted) return;
+    setState(() {
+      _suivis = suivis;
+      _chargementSuivis = false;
+      _suivisCharges = true;
+    });
+  }
+
+  /// Volet « Suivis » : toutes les pages que j'ai accepté de suivre.
+  Widget _listeSuivis() {
+    final theme = Theme.of(context);
+    if (_chargementSuivis) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    return RefreshIndicator(
+      onRefresh: () => _chargerSuivis(silencieux: true),
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
+        children: [
+          if (_suivis.isEmpty)
+            EspaceVideSocial(
+              icone: Icons.bookmark_border,
+              titre: 'Aucun espace suivi',
+              message:
+                  'Ouvre une page avec son lien, puis appuie sur « Suivre » '
+                  'pour la retrouver ici.',
+            )
+          else ...[
+            Text(
+              _suivis.length == 1
+                  ? '1 espace suivi'
+                  : '${_suivis.length} espaces suivis',
+              style: theme.textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            const SizedBox(height: 10),
+            for (final suivi in _suivis) _carteSuivi(suivi),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _carteSuivi(Map<String, dynamic> suivi) {
+    final theme = Theme.of(context);
+    final jeton = (suivi['jeton'] ?? '').toString().trim();
+    final pseudo = (suivi['pseudo'] ?? '').toString().trim();
+    final bio = (suivi['bio'] ?? '').toString().trim();
+    final avatar = (suivi['avatar'] as String?)?.trim();
+    final nbPublications = (suivi['nb_publications'] as num?)?.toInt() ?? 0;
+    final nbAbonnes = (suivi['nb_abonnes'] as num?)?.toInt() ?? 0;
+    final dernier = DateTime.tryParse(
+      (suivi['dernier_reportage'] ?? '').toString(),
+    )?.toLocal();
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: theme.colorScheme.outlineVariant.withValues(alpha: 0.6),
+        ),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(18),
+        onTap: jeton.isEmpty ? null : () => _ouvrirEspaceSuivi(jeton),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 12, 6, 12),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              AvatarAnimalWidget(taille: 46, avatarId: avatar),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      pseudo.isEmpty ? 'Informateur KinFlow' : pseudo,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    if (bio.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        bio,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          height: 1.35,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 6),
+                    Text(
+                      '$nbPublications reportage${nbPublications > 1 ? 's' : ''}'
+                      ' · $nbAbonnes abonné${nbAbonnes > 1 ? 's' : ''}'
+                      '${dernier == null ? '' : ' · ${dateCourteSuivi(dernier)}'}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontSize: 11.5,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              PopupMenuButton<String>(
+                tooltip: 'Options',
+                onSelected: (valeur) {
+                  if (valeur == 'retirer') _nePlusSuivre(jeton);
+                },
+                itemBuilder: (context) => const [
+                  PopupMenuItem(
+                    value: 'retirer',
+                    child: ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(Icons.bookmark_remove_outlined),
+                      title: Text('Ne plus suivre'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _ouvrirEspaceSuivi(String jeton) async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(builder: (_) => EspaceInformateurScreen(jeton: jeton)),
+    );
+    if (!mounted) return;
+    await _chargerSuivis(silencieux: true);
+  }
+
+  Future<void> _nePlusSuivre(String jeton) async {
+    if (jeton.isEmpty) return;
+    final ok = await SupabaseService().basculerSuiviEspace(jeton, false);
+    if (!mounted) return;
+    if (ok == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Action impossible. Réessaie.')),
+      );
+      return;
+    }
+    await _chargerSuivis(silencieux: true);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Espace retiré de tes suivis.')),
+    );
+  }
+
+  /// Date courte pour la carte d'un espace suivi.
+  String dateCourteSuivi(DateTime d) {
+    final difference = DateTime.now().difference(d);
+    if (difference.inMinutes < 60) return 'à l\'instant';
+    if (difference.inHours < 24) return 'aujourd\'hui';
+    if (difference.inDays < 7) return 'il y a ${difference.inDays} j';
+    final jour = d.day.toString().padLeft(2, '0');
+    final mois = d.month.toString().padLeft(2, '0');
+    return '$jour/$mois/${d.year}';
+  }
+
+  Widget _carteEspace({
+    required IconData icone,
+    required String titre,
+    required String message,
+    required String action,
+    required VoidCallback onAction,
+  }) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: theme.colorScheme.outlineVariant.withValues(alpha: 0.6),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(9),
+                decoration: BoxDecoration(
+                  color: KinColors.primary.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(icone, color: KinColors.primary, size: 20),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  titre,
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            message,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+              height: 1.4,
+            ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton(onPressed: onAction, child: Text(action)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _ouvrirParLien() async {
+    final controleur = TextEditingController();
+    final texte = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Ouvrir un espace'),
+        content: TextField(
+          controller: controleur,
+          autofocus: true,
+          maxLines: 2,
+          decoration: const InputDecoration(
+            labelText: 'Lien ou code',
+            hintText: 'https://kinflow.cd/e/… ou 16 caractères',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controleur.text.trim()),
+            child: const Text('Ouvrir'),
+          ),
+        ],
+      ),
+    );
+    if (texte == null || texte.isEmpty) return;
+    final jeton = PartageConfig.extraireJeton(texte);
+    if (jeton.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Ce lien ne contient pas de code valide.'),
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(builder: (_) => EspaceInformateurScreen(jeton: jeton)),
     );
   }
 
@@ -1582,6 +1984,11 @@ class _FilVilleScreenState extends State<FilVilleScreen>
                 texte: 'Amis(es)',
                 aUnPoint: _aDesMessagesNonLus || _demandes.isNotEmpty,
               ),
+              _onglet(
+                icone: Icons.record_voice_over,
+                texte: 'Informateurs',
+                aUnPoint: false,
+              ),
             ],
           ),
         ],
@@ -1602,7 +2009,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
           Expanded(
             child: TabBarView(
               controller: _tabController,
-              children: [_vueInformation(), _vueAmis()],
+              children: [_vueInformation(), _vueAmis(), _vueInformateurs()],
             ),
           ),
         ],

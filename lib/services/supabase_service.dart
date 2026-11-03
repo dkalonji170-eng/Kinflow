@@ -8,6 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../config/supabase_config.dart';
 import '../models/information_ville.dart';
+import '../models/commentaire.dart';
+import '../models/publication.dart';
 import 'crash_reporter.dart';
 import 'diagnostics_service.dart';
 
@@ -2405,5 +2407,547 @@ class SupabaseService {
     }
     await effacerCompteLieLocal();
     await effacerCachesHorsLigne();
+  }
+
+  // ===========================================================================
+  // Espaces informateurs (phase A)
+  // ===========================================================================
+  //
+  // Un espace est privé : il n'est accessible que par son lien (jeton). Ces
+  // méthodes ne lisent jamais la table `publications` en direct : tout passe
+  // par des RPC SECURITY DEFINER, pour que la règle « lien ou abonnement »
+  // reste au même endroit.
+
+  /// URLs signées déjà obtenues, avec leur expiration (évite de re-signer à
+  /// chaque reconstruction d'écran).
+  final Map<String, (String, DateTime)> _cachePhotosPublications = {};
+
+  /// Mon espace : jeton, bio et compteurs. Null si non connecté.
+  Future<Map<String, dynamic>?> monEspace() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final ligne = await client
+          .rpc('mon_espace')
+          .maybeSingle()
+          .timeout(_timeout);
+      return ligne == null ? null : Map<String, dynamic>.from(ligne);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur monEspace: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// 'proprietaire', 'membres' ou 'tous'.
+  Future<bool> modifierOuverturePublication(String mode) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('modifier_ouverture_publication', params: {'p_mode': mode})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur modifierOuverturePublication: $_derniereErreur',
+      );
+      return false;
+    }
+  }
+
+  Future<bool> modifierBioEspace(String bio) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('modifier_bio_espace', params: {'p_bio': bio})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur modifierBioEspace: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Révoque l'ancien lien et en renvoie un nouveau. Null en cas d'échec.
+  Future<String?> regenererJetonEspace() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('regenerer_jeton_espace')
+          .timeout(_timeout);
+      return resultat?.toString();
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur regenererJetonEspace: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<List<Publication>> mesPublications({int limite = 50}) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client
+          .rpc('mes_publications', params: {'p_limite': limite})
+          .timeout(_timeout);
+      return _lirePublications(resultat);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur mesPublications: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  /// Publie un reportage et renvoie son identifiant. Null en cas d'échec
+  /// (le détail lisible est dans [derniereErreur]).
+  Future<String?> publierPublication({
+    required String jeton,
+    required String titre,
+    required String contenu,
+    String type = 'info',
+    String? lieu,
+    List<String> photos = const [],
+    bool anonyme = false,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'publier_publication',
+            params: {
+              'p_jeton': jeton.trim(),
+              'p_titre': titre,
+              'p_contenu': contenu,
+              'p_photos': photos,
+              'p_type': type,
+              'p_lieu': lieu,
+              'p_anonyme': anonyme,
+            },
+          )
+          .timeout(_timeout);
+      return resultat?.toString();
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur publierPublication: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<bool> supprimerPublication(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('supprimer_publication', params: {'p_id': id})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur supprimerPublication: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Téléverse une photo de reportage dans le bucket privé
+  /// `publications_photos` et renvoie son chemin.
+  Future<String?> televerserPhotoPublication({
+    required List<int> octets,
+    required String extension,
+    required String dossier,
+    int index = 0,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final uid = client.auth.currentUser?.id;
+      if (uid == null) return null;
+      final ext = extension.toLowerCase().replaceAll('.', '');
+      final contentType = switch (ext) {
+        'png' => 'image/png',
+        'webp' => 'image/webp',
+        'gif' => 'image/gif',
+        'heic' => 'image/heic',
+        _ => 'image/jpeg',
+      };
+      final proprietaire = dossier.trim().isEmpty ? uid : dossier.trim();
+      final chemin =
+          '$proprietaire/pub_${DateTime.now().microsecondsSinceEpoch}_$index.'
+          '${ext.isEmpty ? 'jpg' : ext}';
+      await client.storage
+          .from('publications_photos')
+          .uploadBinary(
+            chemin,
+            Uint8List.fromList(octets),
+            fileOptions: FileOptions(contentType: contentType, upsert: false),
+          )
+          .timeout(const Duration(seconds: 60));
+      return chemin;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur televerserPhotoPublication: $_derniereErreur',
+      );
+      return null;
+    }
+  }
+
+  /// URL signée (1 h) d'une photo de reportage, mise en cache.
+  Future<String?> urlPhotoPublication(String chemin) async {
+    if (chemin.trim().isEmpty) return null;
+    final cache = _cachePhotosPublications[chemin];
+    if (cache != null && cache.$2.isAfter(DateTime.now())) return cache.$1;
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final url = await client.storage
+          .from('publications_photos')
+          .createSignedUrl(chemin, 3600)
+          .timeout(_timeout);
+      _cachePhotosPublications[chemin] = (
+        url,
+        DateTime.now().add(const Duration(minutes: 50)),
+      );
+      return url;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur urlPhotoPublication: $e');
+      return null;
+    }
+  }
+
+  /// L'espace correspondant à un jeton (null si le lien est invalide).
+  Future<Map<String, dynamic>?> espaceParJeton(String jeton) async {
+    final propre = jeton.trim();
+    if (propre.isEmpty) return null;
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final ligne = await client
+          .rpc('espace_par_jeton', params: {'p_jeton': propre})
+          .maybeSingle()
+          .timeout(_timeout);
+      return ligne == null ? null : Map<String, dynamic>.from(ligne);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur espaceParJeton: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// Marque l'espace comme suivi (ouvrir un lien vaut abonnement). C'est ce
+  /// qui autorise la lecture des photos privées du bucket.
+  Future<bool> suivreEspace(String jeton) async {
+    final propre = jeton.trim();
+    if (propre.isEmpty) return false;
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('suivre_espace', params: {'p_jeton': propre})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur suivreEspace: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Suivre explicitement un espace (ou ne plus le suivre). L'accès en
+  /// lecture reste acquis tant que le lien est valide.
+  Future<bool?> basculerSuiviEspace(String jeton, bool suivre) async {
+    final propre = jeton.trim();
+    if (propre.isEmpty) return null;
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'basculer_suivi_espace',
+            params: {'p_jeton': propre, 'p_suivre': suivre},
+          )
+          .timeout(_timeout);
+      return resultat == true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur basculerSuiviEspace: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// Les espaces que je suis : liste de l'onglet « Suivis ».
+  Future<List<Map<String, dynamic>>> mesAbonnements() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client.rpc('mes_abonnements').timeout(_timeout);
+      if (resultat is! List) return const [];
+      return resultat
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList(growable: false);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur mesAbonnements: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  Future<List<Publication>> publicationsEspace(
+    String jeton, {
+    int limite = 50,
+  }) async {
+    final propre = jeton.trim();
+    if (propre.isEmpty) return const [];
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client
+          .rpc(
+            'publications_espace',
+            params: {'p_jeton': propre, 'p_limite': limite},
+          )
+          .timeout(_timeout);
+      return _lirePublications(resultat);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur publicationsEspace: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  /// Équipe de mon espace : les personnes autorisées à publier.
+  Future<List<Map<String, dynamic>>> mesMembresEspace() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client.rpc('mes_membres_espace').timeout(_timeout);
+      if (resultat is! List) return const [];
+      return resultat
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList(growable: false);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur mesMembresEspace: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  Future<Map<String, dynamic>?> trouverUtilisateurParCode(String code) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('trouver_utilisateur_par_code', params: {'p_code': code.trim()})
+          .timeout(_timeout);
+      final ligne = resultat is List && resultat.isNotEmpty
+          ? resultat.first
+          : null;
+      return ligne is Map ? Map<String, dynamic>.from(ligne) : null;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur trouverUtilisateurParCode: $_derniereErreur',
+      );
+      return null;
+    }
+  }
+
+  Future<bool> ajouterMembreEspace(String code) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('ajouter_membre_espace', params: {'p_code': code.trim()})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur ajouterMembreEspace: $_derniereErreur');
+      return false;
+    }
+  }
+
+  Future<bool> retirerMembreEspace(String membre) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('retirer_membre_espace', params: {'p_membre': membre})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur retirerMembreEspace: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Ajoute ou retire mon like. Renvoie le nouvel état (true = liké).
+  Future<bool?> likerPublication(String publication) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('liker_publication', params: {'p_publication': publication})
+          .timeout(_timeout);
+      return resultat == true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur likerPublication: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<List<Commentaire>> commentairesPublication(String publication) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client
+          .rpc(
+            'commentaires_publication',
+            params: {'p_publication': publication},
+          )
+          .timeout(_timeout);
+      return _lireCommentaires(resultat);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur commentairesPublication: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  Future<String?> commenterPublication({
+    required String publication,
+    required String contenu,
+    String? parent,
+    bool anonyme = false,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'commenter_publication',
+            params: {
+              'p_publication': publication,
+              'p_contenu': contenu,
+              'p_parent': parent,
+              'p_anonyme': anonyme,
+            },
+          )
+          .timeout(_timeout);
+      return resultat?.toString();
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur commenterPublication: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<bool> supprimerCommentaire(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('supprimer_commentaire', params: {'p_id': id})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur supprimerCommentaire: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Pose / retire mon emoji sur un commentaire. Renvoie l'emoji conservé,
+  /// ou null si la réaction a été retirée.
+  Future<String?> reagirCommentaire(String commentaire, String emoji) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'reagir_commentaire',
+            params: {'p_commentaire': commentaire, 'p_emoji': emoji},
+          )
+          .timeout(_timeout);
+      final texte = resultat?.toString().trim() ?? '';
+      return texte.isEmpty ? null : texte;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur reagirCommentaire: $_derniereErreur');
+      return null;
+    }
+  }
+
+  List<Commentaire> _lireCommentaires(dynamic resultat) {
+    if (resultat is! List) return const [];
+    return resultat
+        .whereType<Map>()
+        .map((e) => Commentaire.depuisJson(Map<String, dynamic>.from(e)))
+        .where((c) => c.id.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  List<Publication> _lirePublications(dynamic resultat) {
+    if (resultat is! List) return const [];
+    return resultat
+        .whereType<Map>()
+        .map((e) => Publication.depuisJson(Map<String, dynamic>.from(e)))
+        .where((p) => p.id.isNotEmpty)
+        .toList(growable: false);
   }
 }
