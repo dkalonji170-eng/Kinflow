@@ -57,3 +57,4 @@ android/build/
 
 # Rapports compilés (éviter de versionner les documents générés)
 *.docx
+ollama.tar.zst
