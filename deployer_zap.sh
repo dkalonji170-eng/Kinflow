@@ -11,7 +11,13 @@ set -e
 cd "$(dirname "$0")"
 
 echo "▶ Compilation finale du site web..."
-flutter build web
+# Clé MapTiler optionnelle : MAPTILER_KEY=ta_cle ./deployer_zap.sh
+DEFINES_MAPTILER=()
+if [ -n "${MAPTILER_KEY:-}" ]; then
+  DEFINES_MAPTILER=(--dart-define=MAPTILER_KEY="$MAPTILER_KEY")
+  echo "  ✓ Clé MapTiler transmise à la compilation"
+fi
+flutter build web "${DEFINES_MAPTILER[@]}"
 
 echo "▶ Création de kinflow-web.zip..."
 ZIP="kinflow-web.zip"

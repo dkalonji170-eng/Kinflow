@@ -24,6 +24,11 @@ class _CircuitBreakerOverpass {
   static const _cooldownBase = Duration(seconds: 30);
   static var _cooldownMultiplier = 1;
 
+  /// Vrai quand une ouverture a déjà été consignée : une panne de serveur
+  /// produit plusieurs échecs d'affilée, on ne veut pas répéter le même
+  /// « disjoncteur ouvert » à chaque fois (le journal devenait illisible).
+  static bool _dejaSignale = false;
+
   static bool get ouvert {
     if (_ouvertJusquau == null) return false;
     if (DateTime.now().isAfter(_ouvertJusquau!)) {
@@ -36,19 +41,22 @@ class _CircuitBreakerOverpass {
   static void enregistrerSucces() {
     _echecsConsecutifs = 0;
     _cooldownMultiplier = 1;
+    _dejaSignale = false;
   }
 
   static void enregistrerEchec() {
     _echecsConsecutifs++;
-    if (_echecsConsecutifs >= _seuilEchecs) {
-      final cooldown = _cooldownBase * _cooldownMultiplier;
-      _ouvertJusquau = DateTime.now().add(cooldown);
-      _cooldownMultiplier = (_cooldownMultiplier * 2).clamp(1, 8);
-      Journal.a('CARTE',
-          'Disjoncteur Overpass ouvert, pause de ${cooldown.inSeconds} s', {
-        'echecs_consecutifs': _echecsConsecutifs,
-      });
-    }
+    if (_echecsConsecutifs < _seuilEchecs) return;
+    final cooldown = _cooldownBase * _cooldownMultiplier;
+    _ouvertJusquau = DateTime.now().add(cooldown);
+    _cooldownMultiplier = (_cooldownMultiplier * 2).clamp(1, 8);
+    if (_dejaSignale) return;
+    _dejaSignale = true;
+    Journal.a(
+      'CARTE',
+      'Disjoncteur Overpass ouvert, pause de ${cooldown.inSeconds} s',
+      {'echecs_consecutifs': _echecsConsecutifs},
+    );
   }
 }
 
@@ -70,17 +78,35 @@ class OverpassGate {
   /// Espacement minimum entre deux départs de requêtes Overpass.
   static const Duration _intervalle = Duration(milliseconds: 2000);
 
+  /// Queue d'exécution : chaque appel attend la fin du précédent. Le verrou
+  /// reste tenu pendant toute la requête (pas seulement au départ), donc deux
+  /// requêtes Overpass ne peuvent plus être en vol en même temps.
+  static Future<void> _verrou = Future<void>.value();
+
   /// Prochain créneau autorisé pour un départ de requête.
   static DateTime _prochainCreneau = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// Attend le prochain créneau puis réserve le suivant : les requêtes
-  /// concurrentes se rangent en file et partent en série, jamais en rafale.
-  static Future<void> attendreCreneau() async {
-    final maintenant = DateTime.now();
-    if (_prochainCreneau.isAfter(maintenant)) {
-      await Future<void>.delayed(_prochainCreneau.difference(maintenant));
+  /// Exécute [action] en exclusivité : une seule requête Overpass à la fois
+  /// dans toute l'app, et au moins [_intervalle] entre deux départs.
+  ///
+  /// Sans cette sérialisation complète, un timeout de 15 s laissait les
+  /// requêtes suivantes partir en parallèle et transformer une lenteur serveur
+  /// en rafale de 429/502/timeouts.
+  static Future<T> executer<T>(Future<T> Function() action) async {
+    final precedent = _verrou;
+    final fin = Completer<void>();
+    _verrou = fin.future;
+    try {
+      await precedent;
+      final maintenant = DateTime.now();
+      if (_prochainCreneau.isAfter(maintenant)) {
+        await Future<void>.delayed(_prochainCreneau.difference(maintenant));
+      }
+      _prochainCreneau = DateTime.now().add(_intervalle);
+      return await action();
+    } finally {
+      fin.complete();
     }
-    _prochainCreneau = DateTime.now().add(_intervalle);
   }
 }
 
@@ -204,13 +230,16 @@ class RoadService {
 
     final segments = await _telecharger(regex, etendu);
     Journal.i(
-        detailsComplets ? 'ROUTES' : 'CARTE',
-        'Réseau routier téléchargé depuis Overpass', {
-      'segments': segments.length,
-      'details_complets': detailsComplets,
-    });
-    final entree =
-        _EntreeCache(segments, DateTime.now(), etendu, detailsComplets);
+      detailsComplets ? 'ROUTES' : 'CARTE',
+      'Réseau routier téléchargé depuis Overpass',
+      {'segments': segments.length, 'details_complets': detailsComplets},
+    );
+    final entree = _EntreeCache(
+      segments,
+      DateTime.now(),
+      etendu,
+      detailsComplets,
+    );
     _mettreEnCache(entree);
     unawaited(_ecrirePersistant(entree));
     return segments;
@@ -225,7 +254,10 @@ class RoadService {
   /// et pour sauter directement au graphe embarqué quand il est ouvert.
   static bool get disjoncteurOuvert => _CircuitBreakerOverpass.ouvert;
 
-  Future<List<RoadSegment>> _telecharger(String regex, LatLngBounds bounds) async {
+  Future<List<RoadSegment>> _telecharger(
+    String regex,
+    LatLngBounds bounds,
+  ) async {
     if (_CircuitBreakerOverpass.ouvert) {
       throw Exception('Overpass: disjoncteur ouvert, pause de secours');
     }
@@ -248,21 +280,22 @@ out geom;
       if (_CircuitBreakerOverpass.ouvert) {
         throw Exception('Overpass: disjoncteur ouvert, pause de secours');
       }
-      final endpoint = _endpoints[(_indexMiroir + tentative) % _endpoints.length];
-      // File d'attente globale Overpass : même un réseau sain ne doit jamais
-      // envoyer plus d'une requête toutes les 2 s.
-      await OverpassGate.attendreCreneau();
+      final endpoint =
+          _endpoints[(_indexMiroir + tentative) % _endpoints.length];
       try {
-        final reponse = await http
-            .post(
-              Uri.parse(endpoint),
-              headers: {'User-Agent': 'KinFlow-App/1.0 (projet kinflow)'},
-              body: {'data': query},
-            )
-            // Le serveur se donne lui-même [timeout:25]; 15 s côté client
-            // suffisent largement et évitent de longues files de gels quand
-            // les miroirs sont saturés (30 s auparavant).
-            .timeout(const Duration(seconds: 15));
+        // File d'attente globale Overpass : une seule requête en vol dans
+        // toute l'app, avec au moins 2 s entre deux départs.
+        final reponse = await OverpassGate.executer(
+          () => http.post(
+            Uri.parse(endpoint),
+            headers: {'User-Agent': 'KinFlow-App/1.0 (projet kinflow)'},
+            body: {'data': query},
+          )
+              // Le serveur se donne lui-même [timeout:25]; 15 s côté client
+              // suffisent largement et évitent de longues files de gels quand
+              // les miroirs sont saturés (30 s auparavant).
+              .timeout(const Duration(seconds: 15)),
+        );
 
         if (reponse.statusCode == 200) {
           _indexMiroir = (_indexMiroir + tentative + 1) % _endpoints.length;
@@ -270,33 +303,40 @@ out geom;
           return compute(_decoderEtParser, reponse.body);
         }
 
-        final resoumettre = reponse.statusCode == 429 ||
-            reponse.statusCode == 504;
+        final code = reponse.statusCode;
+        // 429 et les 5xx (500/502/503/504…) sont des défaillances serveur :
+        // le miroir suivant a souvent la réponse. Avant, un 502 sortait
+        // immédiatement en ERREUR au lieu d'être retenté sur un autre miroir.
+        final resoumettre = code == 429 || code >= 500;
         if (!resoumettre) {
-          throw Exception('Overpass: HTTP ${reponse.statusCode}');
+          throw Exception('Overpass: HTTP $code');
         }
 
         _CircuitBreakerOverpass.enregistrerEchec();
-        final retryAfter = int.tryParse(
-          reponse.headers['retry-after'] ?? '',
-        );
+        if (tentative >= _maxTentatives - 1) {
+          throw Exception('Overpass: HTTP $code');
+        }
+        final retryAfter = int.tryParse(reponse.headers['retry-after'] ?? '');
         final delai = retryAfter != null && retryAfter > 0
             ? Duration(seconds: retryAfter)
             : _ajouterJitter(_baseBackoff * (1 << tentative));
-        Journal.a('CARTE', 'Surcharge Overpass, nouvelle tentative dans ${delai.inSeconds} s', {
-          'code_http': reponse.statusCode,
-          'tentative': tentative + 1,
-          'miroir': endpoint,
-        });
+        Journal.a(
+          'CARTE',
+          code == 429
+              ? 'Surcharge Overpass, nouvelle tentative dans ${delai.inSeconds} s'
+              : 'Serveur Overpass indisponible ($code), nouvel essai dans ${delai.inSeconds} s',
+          {'code_http': code, 'tentative': tentative + 1, 'miroir': endpoint},
+        );
         await Future<void>.delayed(delai);
       } on TimeoutException {
         _CircuitBreakerOverpass.enregistrerEchec();
         if (tentative >= _maxTentatives - 1) rethrow;
         final delai = _ajouterJitter(_baseBackoff * (1 << tentative));
-        Journal.a('CARTE', 'Délai dépassé Overpass, nouvelle tentative dans ${delai.inSeconds} s', {
-          'tentative': tentative + 1,
-          'miroir': endpoint,
-        });
+        Journal.a(
+          'CARTE',
+          'Délai dépassé Overpass, nouvelle tentative dans ${delai.inSeconds} s',
+          {'tentative': tentative + 1, 'miroir': endpoint},
+        );
         await Future<void>.delayed(delai);
       } on http.ClientException {
         _CircuitBreakerOverpass.enregistrerEchec();
@@ -376,9 +416,7 @@ out geom;
       final prefs = await SharedPreferences.getInstance();
       final cle = _clePour(entree.bounds, entree.detailsComplets);
       final j = json.encode({
-        'segments': [
-          for (final s in entree.segments) _segmentVersJson(s),
-        ],
+        'segments': [for (final s in entree.segments) _segmentVersJson(s)],
         'fetchedAt': entree.fetchedAt.toIso8601String(),
         'bounds': {
           'north': entree.bounds.north,
@@ -448,7 +486,8 @@ out geom;
   /// Décodage JSON + parsing exécutés ENTIÈREMENT dans l'isolat : le gros
   /// payload Overpass (plusieurs Mo pour un couloir dense) ne bloque plus
   /// jamais le thread UI, cause de gel au premier calcul d'itinéraire.
-  static List<RoadSegment> _decoderEtParser(String brut) => _parser(json.decode(brut));
+  static List<RoadSegment> _decoderEtParser(String brut) =>
+      _parser(json.decode(brut));
 
   static List<RoadSegment> _parser(dynamic json) {
     final resultats = <RoadSegment>[];
@@ -464,18 +503,19 @@ out geom;
 
       final points = <LatLng>[];
       for (final g in geometry) {
-        points.add(LatLng(
-          (g['lat'] as num).toDouble(),
-          (g['lon'] as num).toDouble(),
-        ));
+        points.add(
+          LatLng((g['lat'] as num).toDouble(), (g['lon'] as num).toDouble()),
+        );
       }
 
-      resultats.add(RoadSegment(
-        id: (e['id'] as num).toInt(),
-        nom: tags['name'] as String? ?? '',
-        classe: tags['highway'] as String? ?? '',
-        points: points,
-      ));
+      resultats.add(
+        RoadSegment(
+          id: (e['id'] as num).toInt(),
+          nom: tags['name'] as String? ?? '',
+          classe: tags['highway'] as String? ?? '',
+          points: points,
+        ),
+      );
     }
 
     return resultats;
@@ -488,10 +528,7 @@ out geom;
         (b.south * f).floorToDouble() / f,
         (b.west * f).floorToDouble() / f,
       ),
-      LatLng(
-        (b.north * f).ceilToDouble() / f,
-        (b.east * f).ceilToDouble() / f,
-      ),
+      LatLng((b.north * f).ceilToDouble() / f, (b.east * f).ceilToDouble() / f),
     );
   }
 }

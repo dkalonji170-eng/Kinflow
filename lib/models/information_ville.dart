@@ -68,7 +68,7 @@ class InformationVille {
       epinglee: json['epinglee'] == true,
       creeA:
           DateTime.tryParse((json['cree_a'] as String?) ?? '')?.toLocal() ??
-              DateTime.now(),
+          DateTime.now(),
     );
   }
 
@@ -95,22 +95,59 @@ class InformationVille {
   /// Sérialise l'information pour le cache local (mêmes clés que celles lues
   /// par [InformationVille.depuisJson]).
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'contenu': contenu,
-        'source_url': sourceUrl,
-        'image_url': imageUrl,
-        'latitude': latitude,
-        'longitude': longitude,
-        'nb_verts': nbVerts,
-        'nb_rouges': nbRouges,
-        'ma_reaction': maReaction,
-        'emojis': [
-          for (final (e, c) in emojis) {'e': e, 'c': c},
-        ],
-        'mes_emojis': mesEmojis.toList(),
-        'epinglee': epinglee,
-        'cree_a': creeA.toUtc().toIso8601String(),
-      };
+    'id': id,
+    'contenu': contenu,
+    'source_url': sourceUrl,
+    'image_url': imageUrl,
+    'latitude': latitude,
+    'longitude': longitude,
+    'nb_verts': nbVerts,
+    'nb_rouges': nbRouges,
+    'ma_reaction': maReaction,
+    'emojis': [
+      for (final (e, c) in emojis) {'e': e, 'c': c},
+    ],
+    'mes_emojis': mesEmojis.toList(),
+    'epinglee': epinglee,
+    'cree_a': creeA.toUtc().toIso8601String(),
+  };
+
+  /// Copie de l'information en changeant seulement les champs utiles.
+  ///
+  /// [effacerReaction] permet de remettre [maReaction] à null (retrait d'une
+  /// réaction) : un simple paramètre nullable ne pourrait pas distinguer
+  /// « ne pas toucher » de « remettre à null ».
+  InformationVille copyWith({
+    String? contenu,
+    String? sourceUrl,
+    String? imageUrl,
+    double? latitude,
+    double? longitude,
+    int? nbVerts,
+    int? nbRouges,
+    String? maReaction,
+    bool effacerReaction = false,
+    List<(String, int)>? emojis,
+    Set<String>? mesEmojis,
+    bool? epinglee,
+    DateTime? creeA,
+  }) {
+    return InformationVille(
+      id: id,
+      contenu: contenu ?? this.contenu,
+      sourceUrl: sourceUrl ?? this.sourceUrl,
+      imageUrl: imageUrl ?? this.imageUrl,
+      latitude: latitude ?? this.latitude,
+      longitude: longitude ?? this.longitude,
+      nbVerts: nbVerts ?? this.nbVerts,
+      nbRouges: nbRouges ?? this.nbRouges,
+      maReaction: effacerReaction ? null : (maReaction ?? this.maReaction),
+      emojis: emojis ?? this.emojis,
+      mesEmojis: mesEmojis ?? this.mesEmojis,
+      epinglee: epinglee ?? this.epinglee,
+      creeA: creeA ?? this.creeA,
+    );
+  }
 
   bool get etreConfirme => maReaction == 'VERT';
   bool get etreSignale => maReaction == 'ROUGE';
@@ -149,10 +186,7 @@ class InformationVille {
 
   /// Retire une occurrence d'[emoji] du compteur : supprime la ligne quand
   /// elle tombe à 0 (plus personne n'a posé cet émoji).
-  static void _decrementerEmoji(
-    List<(String, int)> emojis,
-    String emoji,
-  ) {
+  static void _decrementerEmoji(List<(String, int)> emojis, String emoji) {
     final idx = emojis.indexWhere((x) => x.$1 == emoji);
     if (idx == -1) return;
     final (e, c) = emojis[idx];
@@ -164,10 +198,7 @@ class InformationVille {
   }
 
   /// Ajoute une occurrence d'[emoji] au compteur (crée la ligne si absente).
-  static void _incrementerEmoji(
-    List<(String, int)> emojis,
-    String emoji,
-  ) {
+  static void _incrementerEmoji(List<(String, int)> emojis, String emoji) {
     final idx = emojis.indexWhere((x) => x.$1 == emoji);
     if (idx != -1) {
       final (e, c) = emojis[idx];

@@ -46,9 +46,7 @@ void main() {
     testWidgets('affiche l\'icône personne sans avatar', (tester) async {
       await tester.pumpWidget(
         const MaterialApp(
-          home: Scaffold(
-            body: AvatarAnimalWidget(taille: 90, avatarId: null),
-          ),
+          home: Scaffold(body: AvatarAnimalWidget(taille: 90, avatarId: null)),
         ),
       );
       expect(find.byIcon(Icons.person), findsOneWidget);
@@ -57,12 +55,11 @@ void main() {
     testWidgets('affiche l\'icône personne pour un id inconnu', (tester) async {
       await tester.pumpWidget(
         const MaterialApp(
-          home: Scaffold(
-            body: AvatarAnimalWidget(taille: 90, avatarId: 'x'),
-          ),
+          home: Scaffold(body: AvatarAnimalWidget(taille: 90, avatarId: 'x')),
         ),
       );
       expect(find.byIcon(Icons.person), findsOneWidget);
     });
+
   });
 }

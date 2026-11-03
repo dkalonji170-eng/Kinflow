@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/services.dart';
 
 import '../services/supabase_service.dart';
 import '../services/position_partage_service.dart';
@@ -37,7 +38,9 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     _actualiserBadge();
     _chargerAvatar();
-    PositionPartageService.instance.start();
+    // Reprend le partage seulement si l'utilisateur l'avait explicitement
+    // activé et que son consentement n'a pas expiré.
+    unawaited(PositionPartageService.instance.reprendreSiActif());
     _minuteur = Timer.periodic(
       _rafraichissementBadge,
       (_) => _actualiserBadge(),
@@ -99,7 +102,8 @@ class _HomeScreenState extends State<HomeScreen> {
             ? 0
             : notificationsPages['reponse'] ?? 0;
 
-    final total = nouvellesInfos +
+    final total =
+        nouvellesInfos +
         nonLus.values.fold<int>(0, (s, v) => s + v) +
         demandes.length +
         publicationsPage +
@@ -118,130 +122,162 @@ class _HomeScreenState extends State<HomeScreen> {
     _actualiserBadge();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.surface,
-      appBar: AppBar(
-        leading: IconButton(
-          onPressed: () {
-            Navigator.push(
-              context,
-              MaterialPageRoute(builder: (context) => const SettingsScreen()),
-            );
-          },
-          icon: const Icon(Icons.settings),
-          tooltip: 'Réglages',
-        ),
-        title: const LogoKinflow(hauteur: 54),
-        centerTitle: true,
+  /// Demande confirmation avant de fermer l'application (bouton retour).
+  /// L'utilisateur peut annuler pour rester sur l'accueil.
+  Future<void> _confirmerQuitter() async {
+    final quitter = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Quitter KinFlow ?'),
+        content: const Text("Voulez-vous vraiment fermer l'application ?"),
         actions: [
-          IconButton(
-            onPressed: _ouvrirProfil,
-            iconSize: 34,
-            icon: AvatarAnimalWidget(
-              taille: 34,
-              avatarId: _avatar.isEmpty ? null : _avatar,
-            ),
-            tooltip: 'Profil',
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Quitter'),
           ),
         ],
       ),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 32),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.location_on, size: 90, color: Colors.blue),
-              const SizedBox(height: 20),
-              Text(
-                "Bienvenue sur KinFlow",
-                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                  fontWeight: FontWeight.bold,
-                  color: Theme.of(context).colorScheme.onSurface,
-                ),
+    );
+    if (quitter == true) {
+      await SystemNavigator.pop();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) async {
+        if (didPop) return;
+        await _confirmerQuitter();
+      },
+      child: Scaffold(
+        backgroundColor: Theme.of(context).colorScheme.surface,
+        appBar: AppBar(
+          leading: IconButton(
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const SettingsScreen()),
+              );
+            },
+            icon: const Icon(Icons.settings),
+            tooltip: 'Réglages',
+          ),
+          title: const LogoKinflow(hauteur: 54),
+          centerTitle: true,
+          actions: [
+            IconButton(
+              onPressed: _ouvrirProfil,
+              iconSize: 34,
+              icon: AvatarAnimalWidget(
+                taille: 34,
+                avatarId: _avatar.isEmpty ? null : _avatar,
               ),
-              const SizedBox(height: 10),
-              Text(
-                "La circulation intelligente de Kinshasa",
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const SizedBox(height: 40),
-              FilledButton(
-                style: FilledButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 32,
-                    vertical: 16,
-                  ),
-                  backgroundColor: Colors.blue,
-                  foregroundColor: Colors.white,
-                  textStyle: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
+              tooltip: 'Profil',
+            ),
+          ],
+        ),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 32),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.location_on, size: 90, color: Colors.blue),
+                const SizedBox(height: 20),
+                Text(
+                  "Bienvenue sur KinFlow",
+                  style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                    color: Theme.of(context).colorScheme.onSurface,
                   ),
                 ),
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => const TrafficScreen(),
+                const SizedBox(height: 10),
+                Text(
+                  "La circulation intelligente de Kinshasa",
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 40),
+                FilledButton(
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 32,
+                      vertical: 16,
                     ),
-                  );
-                },
-                child: const Text("Voir le trafic"),
-              ),
-              const SizedBox(height: 12),
-              Stack(
-                clipBehavior: Clip.none,
-                children: [
-                  FilledButton(
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 32,
-                        vertical: 16,
-                      ),
-                      backgroundColor: Colors.green,
-                      foregroundColor: Colors.white,
-                      textStyle: const TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                      ),
+                    backgroundColor: Colors.blue,
+                    foregroundColor: Colors.white,
+                    textStyle: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
                     ),
-                    onPressed: _ouvrirSocial,
-                    child: const Text("Social"),
                   ),
-                  if (_nouvelles > 0)
-                    Positioned(
-                      right: -8,
-                      top: -8,
-                      child: Container(
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => const TrafficScreen(),
+                      ),
+                    );
+                  },
+                  child: const Text("Voir le trafic"),
+                ),
+                const SizedBox(height: 12),
+                Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    FilledButton(
+                      style: FilledButton.styleFrom(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 7,
-                          vertical: 3,
+                          horizontal: 32,
+                          vertical: 16,
                         ),
-                        constraints: const BoxConstraints(minWidth: 20),
-                        decoration: const BoxDecoration(
-                          color: Colors.red,
-                          borderRadius: BorderRadius.all(Radius.circular(12)),
+                        backgroundColor: Colors.green,
+                        foregroundColor: Colors.white,
+                        textStyle: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
                         ),
-                        child: Text(
-                          _nouvelles > 99 ? '99+' : '$_nouvelles',
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 9,
-                            fontWeight: FontWeight.w700,
+                      ),
+                      onPressed: _ouvrirSocial,
+                      child: const Text("Social"),
+                    ),
+                    if (_nouvelles > 0)
+                      Positioned(
+                        right: -8,
+                        top: -8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 7,
+                            vertical: 3,
+                          ),
+                          constraints: const BoxConstraints(minWidth: 20),
+                          decoration: const BoxDecoration(
+                            color: Colors.red,
+                            borderRadius: BorderRadius.all(Radius.circular(12)),
+                          ),
+                          child: Text(
+                            _nouvelles > 99 ? '99+' : '$_nouvelles',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 9,
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                ],
-              ),
-            ],
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
       ),

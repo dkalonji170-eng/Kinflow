@@ -32,6 +32,8 @@ dependencies:
   mobile_scanner: ^7.4.2
   record: ^6.2.1
   audioplayers: ^6.7.1
+  image_picker: ^1.2.3
+  share_plus: ^13.3.1
 dev_dependencies:
   flutter_test:
     sdk: flutter

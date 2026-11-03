@@ -6,10 +6,12 @@ list(APPEND FLUTTER_PLUGIN_LIST
   app_links
   audioplayers_windows
   connectivity_plus
+  file_selector_windows
   flutter_tts
   geolocator_windows
   objectbox_flutter_libs
   record_windows
+  share_plus
   url_launcher_windows
 )
 

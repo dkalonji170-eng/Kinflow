@@ -8,6 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../config/supabase_config.dart';
 import '../models/information_ville.dart';
+import '../models/commentaire.dart';
+import '../models/publication.dart';
 import 'crash_reporter.dart';
 import 'diagnostics_service.dart';
 
@@ -82,7 +84,9 @@ class SupabaseService {
       // ce cas elle est utilisable et on ne considère pas l'init comme échouée.
       if (!_instancePrete) {
         _initError = e;
-        Journal.e('SUPABASE', 'Échec de connexion au serveur', {'erreur': '$e'});
+        Journal.e('SUPABASE', 'Échec de connexion au serveur', {
+          'erreur': '$e',
+        });
         debugPrint('[KinFlow] Erreur Supabase: $e');
         reportCrash('Supabase', e, st);
         if (!completer.isCompleted) completer.complete();
@@ -131,8 +135,9 @@ class SupabaseService {
         debugPrint(
           '[KinFlow] Erreur connexion anonyme (essai ${tentative + 1}): $e',
         );
-        Journal.e('SUPABASE', 'Identité anonyme refusée par le serveur',
-            {'erreur': '$e'});
+        Journal.e('SUPABASE', 'Identité anonyme refusée par le serveur', {
+          'erreur': '$e',
+        });
         reportCrash('AuthAnonyme', e, st);
         if (tentative == 0) {
           await Future<void>.delayed(const Duration(seconds: 2));
@@ -168,16 +173,19 @@ class SupabaseService {
         return false;
       }
       await _avecReessai(
-        () => client.from('profiles').upsert({
-          'id': id,
-          'nom': nom,
-          'prenom': prenom,
-          'sexe': sexe,
-          'date': date,
-          'telephone': telephone,
-          'email': email,
-          'avatar': avatar,
-        }).timeout(_timeout),
+        () => client
+            .from('profiles')
+            .upsert({
+              'id': id,
+              'nom': nom,
+              'prenom': prenom,
+              'sexe': sexe,
+              'date': date,
+              'telephone': telephone,
+              'email': email,
+              'avatar': avatar,
+            })
+            .timeout(_timeout),
       );
       Journal.s('PROFIL', 'Profil enregistré sur le serveur', {'nom': nom});
       try {
@@ -202,8 +210,9 @@ class SupabaseService {
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur saveProfile: $_derniereErreur');
-      Journal.e('PROFIL', 'Enregistrement du profil refusé',
-          {'erreur': _derniereErreur});
+      Journal.e('PROFIL', 'Enregistrement du profil refusé', {
+        'erreur': _derniereErreur,
+      });
       return false;
     }
   }
@@ -218,6 +227,24 @@ class SupabaseService {
       final auth = e as AuthException;
       return auth.message;
     } catch (_) {}
+    if (e is StorageException) {
+      final texte = '${e.message} ${e.error ?? ''}'.toLowerCase();
+      if (texte.contains('bucket not found') ||
+          texte.contains('nosuchbucket')) {
+        return 'Stockage des médias non configuré sur le serveur '
+            '(bucket manquant).';
+      }
+      if (texte.contains('row-level security') ||
+          texte.contains('accessdenied') ||
+          texte.contains('unauthorized')) {
+        return 'Envoi refusé par le stockage. Vérifie que tu es bien '
+            'connecté, puis réessaie.';
+      }
+      if (texte.contains('too large') || texte.contains('payload')) {
+        return 'Cette photo est trop lourde pour le serveur.';
+      }
+      return e.message;
+    }
     if (e is TimeoutException) {
       return 'Le serveur met trop de temps à répondre. Vérifie ta connexion internet puis réessaie.';
     }
@@ -299,8 +326,9 @@ class SupabaseService {
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur saveTheme: $_derniereErreur');
-      Journal.a('REGLAGES', 'Thème non enregistré sur le serveur',
-          {'erreur': _derniereErreur});
+      Journal.a('REGLAGES', 'Thème non enregistré sur le serveur', {
+        'erreur': _derniereErreur,
+      });
       return false;
     }
   }
@@ -331,28 +359,37 @@ class SupabaseService {
       if (code == null) return null;
 
       await _avecReessai(
-        () => client.from('profiles').upsert({
-          'id': id,
-          'nom': nom,
-          'prenom': prenom,
-          'sexe': sexe,
-          'date': date,
-          'telephone': telephone,
-          'email': email,
-          'avatar': avatar,
-          'code': code,
-        }).timeout(_timeout),
+        () => client
+            .from('profiles')
+            .upsert({
+              'id': id,
+              'nom': nom,
+              'prenom': prenom,
+              'sexe': sexe,
+              'date': date,
+              'telephone': telephone,
+              'email': email,
+              'avatar': avatar,
+              'code': code,
+            })
+            .timeout(_timeout),
       );
       Journal.s('PROFIL', 'Nouveau compte créé', {'code_attribue': code});
       try {
-        await marquerCompteLie(nom: nom, prenom: prenom, avatar: avatar, code: code);
+        await marquerCompteLie(
+          nom: nom,
+          prenom: prenom,
+          avatar: avatar,
+          code: code,
+        );
       } catch (_) {}
       return code;
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur enregistrement: $_derniereErreur');
-      Journal.e('PROFIL', 'Création du compte refusée',
-          {'erreur': _derniereErreur});
+      Journal.e('PROFIL', 'Création du compte refusée', {
+        'erreur': _derniereErreur,
+      });
       return null;
     }
   }
@@ -386,10 +423,36 @@ class SupabaseService {
       // sous l'identité anonyme actuelle sans dépendre des politiques RLS.
       final result = await _avecReessai(
         () => client
-            .rpc('adopter_profil',
-                params: {'code_saisi': code, 'nom_saisi': nomNettoye})
+            .rpc(
+              'adopter_profil',
+              params: {'code_saisi': code, 'nom_saisi': nomNettoye},
+            )
             .timeout(_timeout),
       );
+
+      if (result is Map) {
+        final map = result.cast<String, dynamic>();
+        if (map['erreur'] == 'trop_de_tentatives') {
+          _derniereErreur =
+              'Trop de tentatives. Réessayez dans quelques minutes.';
+          Journal.a('CONNEXION', 'Adoption bloquée par rate limiting', {
+            'retry_after_secondes': map['retry_after_secondes'],
+          });
+          return null;
+        }
+        Journal.s('CONNEXION', 'Connexion réussie', {'nom': nomNettoye});
+        final profilMap = map;
+        try {
+          await marquerCompteLie(
+            nom: (profilMap['nom'] as String? ?? nomNettoye).trim(),
+            prenom: (profilMap['prenom'] as String? ?? '').trim(),
+            avatar: (profilMap['avatar'] as String? ?? ''),
+            code: (profilMap['code'] as String? ?? code).trim(),
+          );
+        } catch (_) {}
+        return profilMap;
+      }
+
       if (result == null) {
         _derniereErreur = 'Nom ou code incorrect.';
         Journal.a('CONNEXION', 'Connexion refusée : nom ou code incorrect', {
@@ -397,24 +460,18 @@ class SupabaseService {
         });
         return null;
       }
-      Journal.s('CONNEXION', 'Connexion réussie', {
+
+      _derniereErreur = 'Nom ou code incorrect.';
+      Journal.a('CONNEXION', 'Connexion refusée : nom ou code incorrect', {
         'nom': nomNettoye,
       });
-      final profilMap = (result as Map).cast<String, dynamic>();
-      try {
-        await marquerCompteLie(
-          nom: (profilMap['nom'] as String? ?? nomNettoye).trim(),
-          prenom: (profilMap['prenom'] as String? ?? '').trim(),
-          avatar: (profilMap['avatar'] as String? ?? ''),
-          code: (profilMap['code'] as String? ?? code).trim(),
-        );
-      } catch (_) {}
-      return profilMap;
+      return null;
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur connexion par code: $_derniereErreur');
-      Journal.e('CONNEXION', 'Erreur pendant la connexion',
-          {'erreur': _derniereErreur});
+      Journal.e('CONNEXION', 'Erreur pendant la connexion', {
+        'erreur': _derniereErreur,
+      });
       return null;
     }
   }
@@ -479,12 +536,15 @@ class SupabaseService {
         return false;
       }
       final ok = await client
-          .rpc('signaler_etat', params: {
-            'p_etat': etat,
-            'p_latitude': latitude,
-            'p_longitude': longitude,
-            'p_cap': cap,
-          })
+          .rpc(
+            'signaler_etat',
+            params: {
+              'p_etat': etat,
+              'p_latitude': latitude,
+              'p_longitude': longitude,
+              'p_cap': cap,
+            },
+          )
           .timeout(_timeout);
       if (ok != true) {
         Journal.a('SUPABASE', 'Le serveur a refusé le signalement');
@@ -493,8 +553,9 @@ class SupabaseService {
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur signalerEtat: $_derniereErreur');
-      Journal.e('SIGNALEMENT', 'Envoi du signalement échoué',
-          {'erreur': _derniereErreur});
+      Journal.e('SIGNALEMENT', 'Envoi du signalement échoué', {
+        'erreur': _derniereErreur,
+      });
       return false;
     }
   }
@@ -504,7 +565,9 @@ class SupabaseService {
     final client = _client;
     if (client == null) return const [];
     try {
-      final resultat = await client.rpc('signalements_recents').timeout(_timeout);
+      final resultat = await client
+          .rpc('signalements_recents')
+          .timeout(_timeout);
       if (resultat is! List) return const [];
       return [
         for (final e in resultat)
@@ -512,8 +575,9 @@ class SupabaseService {
       ];
     } catch (e) {
       debugPrint('[KinFlow] Erreur chargerSignalementsRecents: $e');
-      Journal.a('CARTE', 'Signalements récents indisponibles',
-          {'erreur': '$e'});
+      Journal.a('CARTE', 'Signalements récents indisponibles', {
+        'erreur': '$e',
+      });
       return const [];
     }
   }
@@ -538,10 +602,18 @@ class SupabaseService {
     }
   }
 
+  /// Valeur renvoyée quand une réaction a bien été retirée.
+  ///
+  /// La fonction SQL renvoie `null` à la fois pour un retrait réussi et pour
+  /// une erreur, ce qui empêchait l'interface d'annuler un retrait optimiste
+  /// quand le réseau échouait. On utilise donc un sentinelle côté client :
+  /// `null` = échec, [reactionAucune] = retrait confirmé.
+  static const String reactionAucune = 'AUCUNE';
+
   /// Réagit à une information ('VERT' ou 'ROUGE'). Retaper la même couleur
   /// retire la réaction ; taper l'autre couleur la remplace.
-  /// Retourne le nouvel état ('VERT' ou 'ROUGE'), ou null si la réaction a
-  /// été retirée — ou bien en cas d'échec (serveur/réseau).
+  /// Retourne le nouvel état ('VERT' ou 'ROUGE'), [reactionAucune] si la
+  /// réaction a été retirée, ou null en cas d'échec (serveur/réseau).
   Future<String?> reagirInformation(String informationId, String sens) async {
     try {
       await ready;
@@ -549,18 +621,19 @@ class SupabaseService {
       final client = _client;
       if (client == null) return null;
       final resultat = await client
-          .rpc('reagir_information', params: {
-            'p_id': informationId,
-            'p_sens': sens,
-          })
+          .rpc(
+            'reagir_information',
+            params: {'p_id': informationId, 'p_sens': sens},
+          )
           .timeout(_timeout);
-      final sensResultat = resultat is String ? resultat : null;
-      if (sensResultat == null) {
-        Journal.a('FIL', 'Réaction retirée ou absente',
-            {'information': informationId});
+      final sensResultat = resultat is String ? resultat : reactionAucune;
+      if (sensResultat == reactionAucune) {
+        Journal.s('FIL', 'Réaction retirée', {'information': informationId});
       } else {
-        Journal.s('FIL', 'Réaction enregistrée',
-            {'information': informationId, 'sens': sensResultat});
+        Journal.s('FIL', 'Réaction enregistrée', {
+          'information': informationId,
+          'sens': sensResultat,
+        });
       }
       return sensResultat;
     } catch (e) {
@@ -581,16 +654,21 @@ class SupabaseService {
       final client = _client;
       if (client == null) return null;
       final resultat = await client
-          .rpc('reagir_emoji', params: {
-            'p_id': informationId,
-            'p_emoji': emoji,
-          })
+          .rpc(
+            'reagir_emoji',
+            params: {'p_id': informationId, 'p_emoji': emoji},
+          )
           .timeout(_timeout);
-      if (resultat is bool) {
-        Journal.s('FIL', 'Émoji enregistré',
-            {'information': informationId, 'emoji': emoji});
-        return resultat;
+      if (resultat == true) {
+        Journal.s('FIL', 'Émoji enregistré', {
+          'information': informationId,
+          'emoji': emoji,
+        });
+        return true;
       }
+      // `false` = emoji refusé (info inconnue, session absente…). On le traite
+      // comme un échec pour que l'interface annule la bascule optimiste.
+      _derniereErreur = 'émoji refusé par le serveur';
       return null;
     } catch (e) {
       _derniereErreur = _detailErreur(e);
@@ -676,7 +754,81 @@ class SupabaseService {
       await prefs.remove(cleCompteAvatar);
       await prefs.remove(cleCompteCode);
       await prefs.remove(cleCacheProfil);
+      // On garde les surnoms d'amis sur l'appareil (comme un contact du
+      // téléphone) : ils doivent survivre à une déconnexion / reconnexion du
+      // même compte. Un surnom n'est appliqué qu'à un(e) ami(e) réel(le) de
+      // la liste du compte, donc rien ne fuite d'un compte à l'autre.
     } catch (_) {}
+  }
+
+  // --- Surnoms locaux des amis ----------------------------------------------
+
+  /// Un surnom personnalisé par ami(e), conservé sur cet appareil (comme le
+  /// nom d'un contact dans le téléphone). Le serveur n'en garde aucune trace :
+  /// seul l'affichage local est modifié.
+  static const String _prefixeSurnomAmi = 'surnom_ami_';
+
+  /// Enregistre le surnom local d'un ami(e). Un surnom vide l'efface et
+  /// rétablit le nom d'origine.
+  Future<void> definirSurnomAmi(String amiId, String surnom) async {
+    if (amiId.isEmpty) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cle = '$_prefixeSurnomAmi$amiId';
+      final propre = surnom.trim();
+      if (propre.isEmpty) {
+        await prefs.remove(cle);
+      } else {
+        await prefs.setString(cle, propre);
+      }
+    } catch (_) {}
+  }
+
+  /// Surnom local d'un ami(e), ou null s'il n'y en a pas.
+  Future<String?> surnomAmi(String amiId) async {
+    if (amiId.isEmpty) return null;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final valeur = prefs.getString('$_prefixeSurnomAmi$amiId');
+      return (valeur == null || valeur.isEmpty) ? null : valeur;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Tous les surnoms enregistrés sur cet appareil (ami_id → surnom).
+  Future<Map<String, String>> chargerSurnomsAmis() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final resultat = <String, String>{};
+      for (final cle in prefs.getKeys()) {
+        if (!cle.startsWith(_prefixeSurnomAmi)) continue;
+        final valeur = prefs.getString(cle);
+        if (valeur != null && valeur.isNotEmpty) {
+          resultat[cle.substring(_prefixeSurnomAmi.length)] = valeur;
+        }
+      }
+      return resultat;
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// Renvoie une copie de [amis] où chaque ami(e) renommé(e) affiche son
+  /// surnom : le prénom devient le surnom et le nom est vidé pour éviter
+  /// « Surnom AncienNom ». La liste d'origine (pour le cache) reste intacte.
+  List<Map<String, dynamic>> appliquerSurnomsAmis(
+    List<Map<String, dynamic>> amis,
+    Map<String, String> surnoms,
+  ) {
+    if (surnoms.isEmpty) return amis;
+    return [
+      for (final ami in amis)
+        if (surnoms[ami['ami_id']] != null)
+          {...ami, 'prenom': surnoms[ami['ami_id']], 'nom': ''}
+        else
+          ami,
+    ];
   }
 
   // --- Cache du profil ------------------------------------------------------
@@ -914,9 +1066,10 @@ class SupabaseService {
       final client = _client;
       if (client == null) return 0;
       final resultat = await client
-          .rpc('compter_infos_recentes', params: {
-            'p_depuis': depuis?.toUtc().toIso8601String(),
-          })
+          .rpc(
+            'compter_infos_recentes',
+            params: {'p_depuis': depuis?.toUtc().toIso8601String()},
+          )
           .timeout(_timeout);
       return (resultat as num?)?.toInt() ?? 0;
     } catch (e) {
@@ -989,15 +1142,14 @@ class SupabaseService {
           .rpc('envoyer_demande_ami', params: {'p_code': _normaliserCode(code)})
           .timeout(_timeout);
       final codeResultat = resultat is String ? resultat : null;
-      Journal.a('AMIS', 'Demande d\'ami envoyée', {
-        'resultat': codeResultat,
-      });
+      Journal.a('AMIS', 'Demande d\'ami envoyée', {'resultat': codeResultat});
       return codeResultat;
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur envoyerDemandeAmi: $_derniereErreur');
-      Journal.e('AMIS', 'Envoi de la demande échoué',
-          {'erreur': _derniereErreur});
+      Journal.e('AMIS', 'Envoi de la demande échoué', {
+        'erreur': _derniereErreur,
+      });
       return null;
     }
   }
@@ -1028,7 +1180,8 @@ class SupabaseService {
       _echecsDemandesConsecutifs++;
       final attente = _calculerBackoff(_echecsDemandesConsecutifs);
       _prochainEssaiDemandes = DateTime.now().add(attente);
-      if (_echecsDemandesConsecutifs == 1 || _echecsDemandesConsecutifs % 6 == 0) {
+      if (_echecsDemandesConsecutifs == 1 ||
+          _echecsDemandesConsecutifs % 6 == 0) {
         Journal.a('AMIS', 'Demandes d\'amis indisponibles', {
           'erreur': '$e',
           'echecs_consecutifs': _echecsDemandesConsecutifs,
@@ -1036,7 +1189,8 @@ class SupabaseService {
         });
       }
       debugPrint(
-          '[KinFlow] Erreur mesDemandesAmis (#$_echecsDemandesConsecutifs): $e');
+        '[KinFlow] Erreur mesDemandesAmis (#$_echecsDemandesConsecutifs): $e',
+      );
       return const [];
     }
   }
@@ -1050,10 +1204,10 @@ class SupabaseService {
       final client = _client;
       if (client == null) return false;
       final resultat = await client
-          .rpc('repondre_demande_ami', params: {
-            'p_id': id,
-            'p_accepter': accepter,
-          })
+          .rpc(
+            'repondre_demande_ami',
+            params: {'p_id': id, 'p_accepter': accepter},
+          )
           .timeout(_timeout);
       final ok = resultat == true;
       if (ok) {
@@ -1063,8 +1217,9 @@ class SupabaseService {
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur repondreDemandeAmi: $_derniereErreur');
-      Journal.e('AMIS', 'Réponse à la demande échouée',
-          {'erreur': _derniereErreur});
+      Journal.e('AMIS', 'Réponse à la demande échouée', {
+        'erreur': _derniereErreur,
+      });
       return false;
     }
   }
@@ -1130,12 +1285,15 @@ class SupabaseService {
       final client = _client;
       if (client == null) return null;
       final resultat = await client
-          .rpc('envoyer_info_ami', params: {
-            'p_ami_id': amiId,
-            'p_contenu': contenu,
-            'p_source_url': sourceUrl,
-            'p_information_id': informationId,
-          })
+          .rpc(
+            'envoyer_info_ami',
+            params: {
+              'p_ami_id': amiId,
+              'p_contenu': contenu,
+              'p_source_url': sourceUrl,
+              'p_information_id': informationId,
+            },
+          )
           .timeout(_timeout);
       return resultat is String ? resultat : null;
     } catch (e) {
@@ -1185,11 +1343,21 @@ class SupabaseService {
 
   /// Envoie un message privé à un ami(e) (durée de vie : 7 jours). Retourne
   /// 'envoye' ou un code d'erreur ('pas_ami', 'contenu_vide', ...).
+  ///
+  /// [audioFormes] : forme d'onde du vocal (0..100, une valeur par barre),
+  /// stockée avec le message pour être redessinée chez le destinataire.
+  ///
+  /// [repondreA] : identifiant du message auquel celui-ci répond. On enregistre
+  /// la RÉFÉRENCE (pas une copie du texte) : l'aperçu est reconstruit à
+  /// l'affichage, et le message cité peut donc être modifié sans la casser.
   Future<String?> envoyerMessageAmi({
     required String amiId,
     required String contenu,
     String? audioChemin,
     int? audioDureeMs,
+    List<int>? audioFormes,
+    String? imageChemin,
+    String? repondreA,
   }) async {
     try {
       await ready;
@@ -1197,18 +1365,106 @@ class SupabaseService {
       final client = _client;
       if (client == null) return null;
       final resultat = await client
-          .rpc('envoyer_message_ami', params: {
-            'p_ami_id': amiId,
-            'p_contenu': contenu,
-            if (audioChemin != null && audioChemin.isNotEmpty)
-              'p_audio_chemin': audioChemin,
-            'p_audio_duree_ms': ?audioDureeMs,
-          })
+          .rpc(
+            'envoyer_message_ami',
+            params: {
+              'p_ami_id': amiId,
+              'p_contenu': contenu,
+              if (audioChemin != null && audioChemin.isNotEmpty)
+                'p_audio_chemin': audioChemin,
+              'p_audio_duree_ms': ?audioDureeMs,
+              if (audioFormes != null && audioFormes.isNotEmpty)
+                'p_audio_formes': audioFormes,
+              if (imageChemin != null && imageChemin.isNotEmpty)
+                'p_image_chemin': imageChemin,
+              if (repondreA != null && repondreA.isNotEmpty)
+                'p_reply_to_message_id': repondreA,
+            },
+          )
           .timeout(_timeout);
       return resultat is String ? resultat : null;
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur envoyerMessageAmi: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// Modifie le texte d'un message déjà envoyé (appui long → « Modifier »).
+  /// Seul l'expéditeur peut le faire, et seulement pour un message texte.
+  /// Retourne 'modifie' ou un code d'erreur ('pas_autorise',
+  /// 'vocal_non_modifiable', ...).
+  Future<String?> modifierMessageAmi({
+    required String messageId,
+    required String contenu,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'modifier_message',
+            params: {'p_message_id': messageId, 'p_contenu': contenu},
+          )
+          .timeout(_timeout);
+      return resultat is String ? resultat : null;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur modifierMessageAmi: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// Supprime un message (appui long → « Supprimer »). Pour l'expéditeur c'est
+  /// définitif des deux côtés (l'audio du vocal et la photo sont retirés du
+  /// bucket) ; pour le destinataire le message n'est masqué que de son propre
+  /// fil.
+  /// Retourne 'supprime' ou un code d'erreur ('pas_autorise', ...).
+  /// [audioChemin] / [imageChemin] : chemins dans les buckets, retirés du
+  /// Storage après une suppression réussie (droits garantis par la politique
+  /// de suppression, contrairement à la tentative SQL du RPC).
+  Future<String?> supprimerMessageAmi(
+    String messageId, {
+    String? audioChemin,
+    String? imageChemin,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('supprimer_message', params: {'p_message_id': messageId})
+          .timeout(_timeout);
+      if (resultat == 'supprime') {
+        if (audioChemin != null && audioChemin.isNotEmpty) {
+          try {
+            await client.storage
+                .from('messages_vocaux')
+                .remove([audioChemin])
+                .timeout(_timeout);
+          } catch (e) {
+            // Fichier orphelin : le message est déjà supprimé, on ne bloque pas.
+            debugPrint('[KinFlow] Audio vocal non supprimé du bucket: $e');
+          }
+        }
+        if (imageChemin != null && imageChemin.isNotEmpty) {
+          try {
+            await client.storage
+                .from('messages_images')
+                .remove([imageChemin])
+                .timeout(_timeout);
+          } catch (e) {
+            debugPrint('[KinFlow] Photo non supprimée du bucket: $e');
+          }
+        }
+      }
+      return resultat is String ? resultat : null;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur supprimerMessageAmi: $_derniereErreur');
       return null;
     }
   }
@@ -1227,14 +1483,21 @@ class SupabaseService {
       if (uid == null) return null;
       final chemin =
           '$uid/$amiId/vocal_${DateTime.now().microsecondsSinceEpoch}.$extension';
-      await client.storage.from('messages_vocaux').uploadBinary(
+      await client.storage
+          .from('messages_vocaux')
+          .uploadBinary(
             chemin,
             Uint8List.fromList(octets),
-            fileOptions: const FileOptions(contentType: 'audio/mp4', upsert: false),
-          ).timeout(const Duration(seconds: 60));
+            fileOptions: const FileOptions(
+              contentType: 'audio/mp4',
+              upsert: false,
+            ),
+          )
+          .timeout(const Duration(seconds: 60));
       return chemin;
     } catch (e) {
-      debugPrint('[KinFlow] Erreur televerserVocal: $e');
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur televerserVocal: $_derniereErreur');
       return null;
     }
   }
@@ -1256,6 +1519,69 @@ class SupabaseService {
     }
   }
 
+  // --- Photos des messages privés -------------------------------------------
+
+  /// Téléverse une photo dans le bucket privé `messages_images` et retourne son
+  /// chemin (dossier 1 = moi, dossier 2 = l'ami(e), comme les vocaux). Null en
+  /// cas d'échec (hors ligne, droits, quota…).
+  Future<String?> televerserImage({
+    required String amiId,
+    required List<int> octets,
+    required String extension,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final uid = client.auth.currentUser?.id;
+      if (uid == null) return null;
+      final ext = extension.toLowerCase().replaceAll('.', '');
+      final contentType = switch (ext) {
+        'png' => 'image/png',
+        'webp' => 'image/webp',
+        'gif' => 'image/gif',
+        'heic' => 'image/heic',
+        _ => 'image/jpeg',
+      };
+      final chemin =
+          '$uid/$amiId/image_${DateTime.now().microsecondsSinceEpoch}.'
+          '${ext.isEmpty ? 'jpg' : ext}';
+      await client.storage
+          .from('messages_images')
+          .uploadBinary(
+            chemin,
+            Uint8List.fromList(octets),
+            fileOptions: FileOptions(contentType: contentType, upsert: false),
+          )
+          .timeout(const Duration(seconds: 60));
+      return chemin;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur televerserImage: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// URL signée (1 h) d'une photo de message. Null si le fichier n'est pas
+  /// accessible (supprimé, droits, hors ligne).
+  Future<String?> urlImageSignee(String chemin) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final url = await client.storage
+          .from('messages_images')
+          .createSignedUrl(chemin, 3600)
+          .timeout(_timeout);
+      return url;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur urlImageSignee: $e');
+      return null;
+    }
+  }
+
   /// Tague un(e) ami(e) sur une information : crée un message système dans la
   /// discussion qui pointe vers l'information. Retourne 'envoye' ou un code
   /// d'erreur ('pas_ami', 'info_introuvable', ...).
@@ -1269,10 +1595,10 @@ class SupabaseService {
       final client = _client;
       if (client == null) return null;
       final resultat = await client
-          .rpc('taguer_information', params: {
-            'p_ami_id': amiId,
-            'p_info_id': infoId,
-          })
+          .rpc(
+            'taguer_information',
+            params: {'p_ami_id': amiId, 'p_info_id': infoId},
+          )
           .timeout(_timeout);
       return resultat is String ? resultat : null;
     } catch (e) {
@@ -1315,10 +1641,10 @@ class SupabaseService {
       final client = _client;
       if (client == null) return false;
       final resultat = await client
-          .rpc('definir_autorisation_loc_simple', params: {
-            'p_ami_id': amiId,
-            'p_autoriser': autoriser,
-          })
+          .rpc(
+            'definir_autorisation_loc_simple',
+            params: {'p_ami_id': amiId, 'p_autoriser': autoriser},
+          )
           .timeout(_timeout);
       final ok = resultat == true;
       if (ok) {
@@ -1329,7 +1655,9 @@ class SupabaseService {
       return ok;
     } catch (e) {
       _derniereErreur = _detailErreur(e);
-      debugPrint('[KinFlow] Erreur definirAutorisationLocSimple: $_derniereErreur');
+      debugPrint(
+        '[KinFlow] Erreur definirAutorisationLocSimple: $_derniereErreur',
+      );
       return false;
     }
   }
@@ -1410,6 +1738,64 @@ class SupabaseService {
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur $fonction: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// Signale un problème (mur collaboratif).
+  Future<String?> signalerProbleme(String type, String description) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'signaler_probleme',
+            params: {'p_type': type, 'p_description': description},
+          )
+          .timeout(_timeout);
+      return resultat?.toString();
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur signalerProbleme: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> listeSignalementsProblemes() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client
+          .rpc('liste_signalements_problemes')
+          .timeout(_timeout);
+      if (resultat is! List) return const [];
+      return [
+        for (final e in resultat)
+          if (e is Map) e.cast<String, dynamic>(),
+      ];
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur listeSignalementsProblemes: $e');
+      return const [];
+    }
+  }
+
+  Future<Map<String, dynamic>?> toggleLikeProbleme(String problemeId) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('toggle_like_probleme', params: {'p_probleme_id': problemeId})
+          .timeout(_timeout);
+      if (resultat is Map) return resultat.cast<String, dynamic>();
+      return null;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur toggleLikeProbleme: $e');
       return null;
     }
   }
@@ -1535,7 +1921,9 @@ class SupabaseService {
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur retirerAmi: $_derniereErreur');
-      Journal.e('AMIS', 'Retrait de l\'ami échoué', {'erreur': _derniereErreur});
+      Journal.e('AMIS', 'Retrait de l\'ami échoué', {
+        'erreur': _derniereErreur,
+      });
       return false;
     }
   }
@@ -1553,11 +1941,14 @@ class SupabaseService {
       final client = _client;
       if (client == null) return false;
       final resultat = await client
-          .rpc('publier_ma_position', params: {
-            'p_latitude': latitude,
-            'p_longitude': longitude,
-            'p_cap': cap,
-          })
+          .rpc(
+            'publier_ma_position',
+            params: {
+              'p_latitude': latitude,
+              'p_longitude': longitude,
+              'p_cap': cap,
+            },
+          )
           .timeout(_timeout);
       return resultat == true;
     } catch (e) {
@@ -1567,35 +1958,36 @@ class SupabaseService {
     }
   }
 
-  /// Garantit que le partage de position est actif. Dans KinFlow, le partage
-  /// est TOUJOURS actif (il n'y a plus d'interrupteur) : on l'active côté
-  /// serveur si ce n'est pas déjà le cas. Retourne true si actif.
-  Future<bool> assurerPartagePosition() async {
-    final actif = await monPartagePosition();
-    if (actif) return true;
-    return definirPartagePosition(true);
-  }
-
   /// Active ou désactive le partage de ma position avec mes amis(es).
-  Future<bool> definirPartagePosition(bool actif) async {
+  ///
+  /// [dureeMinutes] vaut null pour « jusqu'à désactivation ». La désactivation
+  /// efface immédiatement les coordonnées côté serveur.
+  Future<bool> definirPartagePosition(bool actif, {int? dureeMinutes}) async {
     try {
       await ready;
       await ensureSignedIn();
       final client = _client;
       if (client == null) return false;
       final resultat = await client
-          .rpc('definir_partage_position', params: {'p_actif': actif})
+          .rpc(
+            'definir_partage_position',
+            params: {'p_actif': actif, 'p_duree_minutes': dureeMinutes},
+          )
           .timeout(_timeout);
       final ok = resultat == true;
       if (ok) {
-        Journal.s('AMIS', 'Partage de position modifié', {'actif': actif});
+        Journal.s('AMIS', 'Partage de position modifié', {
+          'actif': actif,
+          'duree_minutes': dureeMinutes,
+        });
       }
       return ok;
     } catch (e) {
       _derniereErreur = _detailErreur(e);
       debugPrint('[KinFlow] Erreur definirPartagePosition: $_derniereErreur');
-      Journal.e('AMIS', 'Changement du partage échoué',
-          {'erreur': _derniereErreur});
+      Journal.e('AMIS', 'Changement du partage échoué', {
+        'erreur': _derniereErreur,
+      });
       return false;
     }
   }
@@ -1606,12 +1998,403 @@ class SupabaseService {
     final client = _client;
     if (client == null) return false;
     try {
-      final resultat =
-          await client.rpc('mon_partage_position').timeout(_timeout);
+      final resultat = await client
+          .rpc('mon_partage_position')
+          .timeout(_timeout);
       return resultat == true;
     } catch (e) {
       debugPrint('[KinFlow] Erreur monPartagePosition: $e');
       return false;
+    }
+  }
+
+  /// Détail du consentement de partage : actif + date d'expiration.
+  Future<Map<String, dynamic>> monPartagePositionDetails() async {
+    await ready;
+    final client = _client;
+    if (client == null) return {'actif': false, 'expire_a': null};
+    try {
+      final resultat = await client
+          .rpc('mon_partage_position_details')
+          .timeout(_timeout);
+      if (resultat is Map) return resultat.cast<String, dynamic>();
+      return {'actif': false, 'expire_a': null};
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur monPartagePositionDetails: $e');
+      return {'actif': false, 'expire_a': null};
+    }
+  }
+
+  /// Compte mes signalements routiers
+  Future<int> compterMesSignalements() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return 0;
+      final res = await client
+          .rpc('compter_signalements_utilisateur')
+          .timeout(_timeout);
+      if (res is int) return res;
+      if (res is num) return res.toInt();
+      return 0;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur compterMesSignalements: $e');
+      return 0;
+    }
+  }
+
+  // --- Blocage et signalement d'utilisateurs --------------------------------
+
+  Future<String?> bloquerUtilisateur(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final res = await client
+          .rpc('bloquer_utilisateur', params: {'p_id': id})
+          .timeout(_timeout);
+      return res is String ? res : null;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur bloquerUtilisateur: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<bool> debloquerUtilisateur(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      final res = await client
+          .rpc('debloquer_utilisateur', params: {'p_id': id})
+          .timeout(_timeout);
+      return res == true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur debloquerUtilisateur: $_derniereErreur');
+      return false;
+    }
+  }
+
+  Future<bool> estBloque(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      final res = await client
+          .rpc('est_bloque', params: {'p_id': id})
+          .timeout(_timeout);
+      return res == true;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur estBloque: $e');
+      return false;
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> mesBlocages() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final res = await client.rpc('mes_blocages').timeout(_timeout);
+      if (res is! List) return const [];
+      return [
+        for (final e in res)
+          if (e is Map) e.cast<String, dynamic>(),
+      ];
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur mesBlocages: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  Future<String?> signalerUtilisateur({
+    required String id,
+    required String motif,
+    String description = '',
+    String? messageId,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final res = await client
+          .rpc(
+            'signaler_utilisateur',
+            params: {
+              'p_id': id,
+              'p_motif': motif,
+              'p_description': description,
+              'p_message_id': messageId,
+            },
+          )
+          .timeout(_timeout);
+      return res is String ? res : null;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur signalerUtilisateur: $_derniereErreur');
+      return null;
+    }
+  }
+
+  // --- Compte permanent ------------------------------------------------------
+
+  /// Email du compte permanent, ou null si l'identité est encore anonyme.
+  String? get emailCompte => _client?.auth.currentUser?.email;
+
+  bool get emailCompteConfirme =>
+      _client?.auth.currentUser?.emailConfirmedAt != null;
+
+  bool get possedeComptePermanent => emailCompte != null;
+
+  /// Convertit l'utilisateur anonyme courant en compte email/mot de passe,
+  /// sans changer d'identifiant : profil, amis et messages sont conservés.
+  /// Retourne 'ok', 'confirmation_requise', 'email_invalide',
+  /// 'mot_de_passe_trop_court' ou 'erreur'.
+  Future<String> sauvegarderComptePermanent({
+    required String email,
+    required String motDePasse,
+  }) async {
+    final emailNettoye = email.trim().toLowerCase();
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(emailNettoye)) {
+      _derniereErreur = 'Adresse e-mail invalide.';
+      return 'email_invalide';
+    }
+    if (motDePasse.length < 6) {
+      _derniereErreur = 'Le mot de passe doit contenir au moins 6 caractères.';
+      return 'mot_de_passe_trop_court';
+    }
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) {
+        _derniereErreur = 'Pas de connexion au serveur.';
+        return 'erreur';
+      }
+      final res = await client.auth
+          .updateUser(UserAttributes(email: emailNettoye, password: motDePasse))
+          .timeout(_timeout);
+      final user = res.user;
+      if (user == null) {
+        _derniereErreur = 'Le serveur n\'a pas confirmé la sauvegarde.';
+        return 'erreur';
+      }
+      final id = user.id;
+      try {
+        await client
+            .from('profiles')
+            .update({'email': emailNettoye})
+            .eq('id', id)
+            .timeout(_timeout);
+      } catch (_) {}
+      Journal.s('COMPTE', 'Compte permanent activé');
+      if (user.emailConfirmedAt == null) return 'confirmation_requise';
+      return 'ok';
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur sauvegarderComptePermanent: $_derniereErreur',
+      );
+      Journal.e('COMPTE', 'Sauvegarde du compte échouée', {
+        'erreur': _derniereErreur,
+      });
+      return 'erreur';
+    }
+  }
+
+  /// Connexion par email/mot de passe sur un nouvel appareil.
+  Future<Map<String, dynamic>?> connecterAvecEmail({
+    required String email,
+    required String motDePasse,
+  }) async {
+    try {
+      await ready;
+      final client = _client;
+      if (client == null) {
+        _derniereErreur = 'Pas de connexion au serveur.';
+        return null;
+      }
+      final res = await client.auth
+          .signInWithPassword(
+            email: email.trim().toLowerCase(),
+            password: motDePasse,
+          )
+          .timeout(_timeout);
+      final user = res.user;
+      if (user == null) {
+        _derniereErreur = 'Email ou mot de passe incorrect.';
+        return null;
+      }
+      final profil = await client
+          .from('profiles')
+          .select()
+          .eq('id', user.id)
+          .maybeSingle()
+          .timeout(_timeout);
+      if (profil == null) {
+        _derniereErreur = 'Profil introuvable pour ce compte.';
+        try {
+          await client.auth.signOut().timeout(_timeout);
+        } catch (_) {}
+        return null;
+      }
+      await sauverProfilCache(profil);
+      try {
+        await marquerCompteLie(
+          nom: (profil['nom'] as String? ?? '').trim(),
+          prenom: (profil['prenom'] as String? ?? '').trim(),
+          avatar: (profil['avatar'] as String? ?? ''),
+          code: (profil['code'] as String? ?? ''),
+        );
+      } catch (_) {}
+      Journal.s('CONNEXION', 'Connexion email réussie');
+      return profil;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur connexion email: $_derniereErreur');
+      Journal.e('CONNEXION', 'Connexion email échouée', {
+        'erreur': _derniereErreur,
+      });
+      return null;
+    }
+  }
+
+  // --- Suppression de compte -------------------------------------------------
+
+  /// Supprime définitivement le compte et toutes ses données.
+  /// Retourne 'supprime' ou 'erreur' (détail dans [derniereErreur]).
+  Future<String> supprimerMonCompte() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) {
+        _derniereErreur = 'Pas de connexion au serveur.';
+        return 'erreur';
+      }
+      final res = await client.functions
+          .invoke('supprimer-compte')
+          .timeout(const Duration(seconds: 40));
+      if (res.status != 200) {
+        _derniereErreur =
+            'Suppression impossible (code ${res.status}). Réessayez plus tard.';
+        return 'erreur';
+      }
+      try {
+        await client.auth.signOut().timeout(_timeout);
+      } catch (_) {}
+      await effacerCompteLieLocal();
+      await effacerCachesHorsLigne();
+      Journal.s('COMPTE', 'Compte supprimé définitivement');
+      return 'supprime';
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur supprimerMonCompte: $_derniereErreur');
+      Journal.e('COMPTE', 'Suppression du compte échouée', {
+        'erreur': _derniereErreur,
+      });
+      return 'erreur';
+    }
+  }
+
+  // --- Notifications push ----------------------------------------------------
+
+  Future<bool> enregistrerTokenPush(
+    String token, {
+    String plateforme = 'android',
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      final res = await client
+          .rpc(
+            'enregistrer_token_push',
+            params: {'p_token': token, 'p_plateforme': plateforme},
+          )
+          .timeout(_timeout);
+      return res == true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur enregistrerTokenPush: $_derniereErreur');
+      return false;
+    }
+  }
+
+  Future<bool> supprimerTokenPush(String token) async {
+    try {
+      await ready;
+      final client = _client;
+      if (client == null) return false;
+      final res = await client
+          .rpc('supprimer_token_push', params: {'p_token': token})
+          .timeout(_timeout);
+      return res == true;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur supprimerTokenPush: $e');
+      return false;
+    }
+  }
+
+  Future<Map<String, dynamic>> mesPreferencesNotifications() async {
+    const defaut = {
+      'push_actif': true,
+      'embouteillages': true,
+      'routes_bloquees': true,
+      'messages': true,
+      'demandes_amis': true,
+      'infos': true,
+    };
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return Map<String, dynamic>.from(defaut);
+      final res = await client
+          .rpc('mes_preferences_notifications')
+          .timeout(_timeout);
+      if (res is Map) {
+        return {...defaut, ...res.cast<String, dynamic>()};
+      }
+      return Map<String, dynamic>.from(defaut);
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur mesPreferencesNotifications: $e');
+      return Map<String, dynamic>.from(defaut);
+    }
+  }
+
+  Future<Map<String, dynamic>> definirPreferencesNotifications(
+    Map<String, dynamic> preferences,
+  ) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const {};
+      final res = await client
+          .rpc(
+            'definir_preferences_notifications',
+            params: {'p_preferences': preferences},
+          )
+          .timeout(_timeout);
+      if (res is Map) return res.cast<String, dynamic>();
+      return const {};
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur definirPreferencesNotifications: $_derniereErreur',
+      );
+      return const {};
     }
   }
 
@@ -1622,6 +2405,23 @@ class SupabaseService {
       await effacerCachesHorsLigne();
       return;
     }
+    // Coupe le partage AVANT de perdre la session : sinon les dernières
+    // coordonnées resteraient visibles par les amis après la déconnexion.
+    try {
+      await client
+          .rpc(
+            'definir_partage_position',
+            params: {'p_actif': false, 'p_duree_minutes': null},
+          )
+          .timeout(_timeout);
+    } catch (e) {
+      debugPrint('[KinFlow] Désactivation position au signOut: $e');
+    }
+    try {
+      await client.rpc('supprimer_mes_tokens_push').timeout(_timeout);
+    } catch (e) {
+      debugPrint('[KinFlow] Suppression tokens push au signOut: $e');
+    }
     try {
       await client.auth.signOut().timeout(_timeout);
     } catch (e) {
@@ -1629,5 +2429,547 @@ class SupabaseService {
     }
     await effacerCompteLieLocal();
     await effacerCachesHorsLigne();
+  }
+
+  // ===========================================================================
+  // Espaces informateurs (phase A)
+  // ===========================================================================
+  //
+  // Un espace est privé : il n'est accessible que par son lien (jeton). Ces
+  // méthodes ne lisent jamais la table `publications` en direct : tout passe
+  // par des RPC SECURITY DEFINER, pour que la règle « lien ou abonnement »
+  // reste au même endroit.
+
+  /// URLs signées déjà obtenues, avec leur expiration (évite de re-signer à
+  /// chaque reconstruction d'écran).
+  final Map<String, (String, DateTime)> _cachePhotosPublications = {};
+
+  /// Mon espace : jeton, bio et compteurs. Null si non connecté.
+  Future<Map<String, dynamic>?> monEspace() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final ligne = await client
+          .rpc('mon_espace')
+          .maybeSingle()
+          .timeout(_timeout);
+      return ligne == null ? null : Map<String, dynamic>.from(ligne);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur monEspace: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// 'proprietaire', 'membres' ou 'tous'.
+  Future<bool> modifierOuverturePublication(String mode) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('modifier_ouverture_publication', params: {'p_mode': mode})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur modifierOuverturePublication: $_derniereErreur',
+      );
+      return false;
+    }
+  }
+
+  Future<bool> modifierBioEspace(String bio) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('modifier_bio_espace', params: {'p_bio': bio})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur modifierBioEspace: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Révoque l'ancien lien et en renvoie un nouveau. Null en cas d'échec.
+  Future<String?> regenererJetonEspace() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('regenerer_jeton_espace')
+          .timeout(_timeout);
+      return resultat?.toString();
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur regenererJetonEspace: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<List<Publication>> mesPublications({int limite = 50}) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client
+          .rpc('mes_publications', params: {'p_limite': limite})
+          .timeout(_timeout);
+      return _lirePublications(resultat);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur mesPublications: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  /// Publie un reportage et renvoie son identifiant. Null en cas d'échec
+  /// (le détail lisible est dans [derniereErreur]).
+  Future<String?> publierPublication({
+    required String jeton,
+    required String titre,
+    required String contenu,
+    String type = 'info',
+    String? lieu,
+    List<String> photos = const [],
+    bool anonyme = false,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'publier_publication',
+            params: {
+              'p_jeton': jeton.trim(),
+              'p_titre': titre,
+              'p_contenu': contenu,
+              'p_photos': photos,
+              'p_type': type,
+              'p_lieu': lieu,
+              'p_anonyme': anonyme,
+            },
+          )
+          .timeout(_timeout);
+      return resultat?.toString();
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur publierPublication: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<bool> supprimerPublication(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('supprimer_publication', params: {'p_id': id})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur supprimerPublication: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Téléverse une photo de reportage dans le bucket privé
+  /// `publications_photos` et renvoie son chemin.
+  Future<String?> televerserPhotoPublication({
+    required List<int> octets,
+    required String extension,
+    required String dossier,
+    int index = 0,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final uid = client.auth.currentUser?.id;
+      if (uid == null) return null;
+      final ext = extension.toLowerCase().replaceAll('.', '');
+      final contentType = switch (ext) {
+        'png' => 'image/png',
+        'webp' => 'image/webp',
+        'gif' => 'image/gif',
+        'heic' => 'image/heic',
+        _ => 'image/jpeg',
+      };
+      final proprietaire = dossier.trim().isEmpty ? uid : dossier.trim();
+      final chemin =
+          '$proprietaire/pub_${DateTime.now().microsecondsSinceEpoch}_$index.'
+          '${ext.isEmpty ? 'jpg' : ext}';
+      await client.storage
+          .from('publications_photos')
+          .uploadBinary(
+            chemin,
+            Uint8List.fromList(octets),
+            fileOptions: FileOptions(contentType: contentType, upsert: false),
+          )
+          .timeout(const Duration(seconds: 60));
+      return chemin;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur televerserPhotoPublication: $_derniereErreur',
+      );
+      return null;
+    }
+  }
+
+  /// URL signée (1 h) d'une photo de reportage, mise en cache.
+  Future<String?> urlPhotoPublication(String chemin) async {
+    if (chemin.trim().isEmpty) return null;
+    final cache = _cachePhotosPublications[chemin];
+    if (cache != null && cache.$2.isAfter(DateTime.now())) return cache.$1;
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final url = await client.storage
+          .from('publications_photos')
+          .createSignedUrl(chemin, 3600)
+          .timeout(_timeout);
+      _cachePhotosPublications[chemin] = (
+        url,
+        DateTime.now().add(const Duration(minutes: 50)),
+      );
+      return url;
+    } catch (e) {
+      debugPrint('[KinFlow] Erreur urlPhotoPublication: $e');
+      return null;
+    }
+  }
+
+  /// L'espace correspondant à un jeton (null si le lien est invalide).
+  Future<Map<String, dynamic>?> espaceParJeton(String jeton) async {
+    final propre = jeton.trim();
+    if (propre.isEmpty) return null;
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final ligne = await client
+          .rpc('espace_par_jeton', params: {'p_jeton': propre})
+          .maybeSingle()
+          .timeout(_timeout);
+      return ligne == null ? null : Map<String, dynamic>.from(ligne);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur espaceParJeton: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// Marque l'espace comme suivi (ouvrir un lien vaut abonnement). C'est ce
+  /// qui autorise la lecture des photos privées du bucket.
+  Future<bool> suivreEspace(String jeton) async {
+    final propre = jeton.trim();
+    if (propre.isEmpty) return false;
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('suivre_espace', params: {'p_jeton': propre})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur suivreEspace: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Suivre explicitement un espace (ou ne plus le suivre). L'accès en
+  /// lecture reste acquis tant que le lien est valide.
+  Future<bool?> basculerSuiviEspace(String jeton, bool suivre) async {
+    final propre = jeton.trim();
+    if (propre.isEmpty) return null;
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'basculer_suivi_espace',
+            params: {'p_jeton': propre, 'p_suivre': suivre},
+          )
+          .timeout(_timeout);
+      return resultat == true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur basculerSuiviEspace: $_derniereErreur');
+      return null;
+    }
+  }
+
+  /// Les espaces que je suis : liste de l'onglet « Suivis ».
+  Future<List<Map<String, dynamic>>> mesAbonnements() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client.rpc('mes_abonnements').timeout(_timeout);
+      if (resultat is! List) return const [];
+      return resultat
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList(growable: false);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur mesAbonnements: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  Future<List<Publication>> publicationsEspace(
+    String jeton, {
+    int limite = 50,
+  }) async {
+    final propre = jeton.trim();
+    if (propre.isEmpty) return const [];
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client
+          .rpc(
+            'publications_espace',
+            params: {'p_jeton': propre, 'p_limite': limite},
+          )
+          .timeout(_timeout);
+      return _lirePublications(resultat);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur publicationsEspace: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  /// Équipe de mon espace : les personnes autorisées à publier.
+  Future<List<Map<String, dynamic>>> mesMembresEspace() async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client.rpc('mes_membres_espace').timeout(_timeout);
+      if (resultat is! List) return const [];
+      return resultat
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList(growable: false);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur mesMembresEspace: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  Future<Map<String, dynamic>?> trouverUtilisateurParCode(String code) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('trouver_utilisateur_par_code', params: {'p_code': code.trim()})
+          .timeout(_timeout);
+      final ligne = resultat is List && resultat.isNotEmpty
+          ? resultat.first
+          : null;
+      return ligne is Map ? Map<String, dynamic>.from(ligne) : null;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint(
+        '[KinFlow] Erreur trouverUtilisateurParCode: $_derniereErreur',
+      );
+      return null;
+    }
+  }
+
+  Future<bool> ajouterMembreEspace(String code) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('ajouter_membre_espace', params: {'p_code': code.trim()})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur ajouterMembreEspace: $_derniereErreur');
+      return false;
+    }
+  }
+
+  Future<bool> retirerMembreEspace(String membre) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('retirer_membre_espace', params: {'p_membre': membre})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur retirerMembreEspace: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Ajoute ou retire mon like. Renvoie le nouvel état (true = liké).
+  Future<bool?> likerPublication(String publication) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc('liker_publication', params: {'p_publication': publication})
+          .timeout(_timeout);
+      return resultat == true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur likerPublication: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<List<Commentaire>> commentairesPublication(String publication) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return const [];
+      final resultat = await client
+          .rpc(
+            'commentaires_publication',
+            params: {'p_publication': publication},
+          )
+          .timeout(_timeout);
+      return _lireCommentaires(resultat);
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur commentairesPublication: $_derniereErreur');
+      return const [];
+    }
+  }
+
+  Future<String?> commenterPublication({
+    required String publication,
+    required String contenu,
+    String? parent,
+    bool anonyme = false,
+  }) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'commenter_publication',
+            params: {
+              'p_publication': publication,
+              'p_contenu': contenu,
+              'p_parent': parent,
+              'p_anonyme': anonyme,
+            },
+          )
+          .timeout(_timeout);
+      return resultat?.toString();
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur commenterPublication: $_derniereErreur');
+      return null;
+    }
+  }
+
+  Future<bool> supprimerCommentaire(String id) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return false;
+      await client
+          .rpc('supprimer_commentaire', params: {'p_id': id})
+          .timeout(_timeout);
+      return true;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur supprimerCommentaire: $_derniereErreur');
+      return false;
+    }
+  }
+
+  /// Pose / retire mon emoji sur un commentaire. Renvoie l'emoji conservé,
+  /// ou null si la réaction a été retirée.
+  Future<String?> reagirCommentaire(String commentaire, String emoji) async {
+    try {
+      await ready;
+      await ensureSignedIn();
+      final client = _client;
+      if (client == null) return null;
+      final resultat = await client
+          .rpc(
+            'reagir_commentaire',
+            params: {'p_commentaire': commentaire, 'p_emoji': emoji},
+          )
+          .timeout(_timeout);
+      final texte = resultat?.toString().trim() ?? '';
+      return texte.isEmpty ? null : texte;
+    } catch (e) {
+      _derniereErreur = _detailErreur(e);
+      debugPrint('[KinFlow] Erreur reagirCommentaire: $_derniereErreur');
+      return null;
+    }
+  }
+
+  List<Commentaire> _lireCommentaires(dynamic resultat) {
+    if (resultat is! List) return const [];
+    return resultat
+        .whereType<Map>()
+        .map((e) => Commentaire.depuisJson(Map<String, dynamic>.from(e)))
+        .where((c) => c.id.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  List<Publication> _lirePublications(dynamic resultat) {
+    if (resultat is! List) return const [];
+    return resultat
+        .whereType<Map>()
+        .map((e) => Publication.depuisJson(Map<String, dynamic>.from(e)))
+        .where((p) => p.id.isNotEmpty)
+        .toList(growable: false);
   }
 }

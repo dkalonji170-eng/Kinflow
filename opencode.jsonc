@@ -1,0 +1,28 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "ami-ia",
+
+  // Compacte plus tôt pour garder des requêtes légères (moins de quota brûlé).
+  "compaction": {
+    "auto": true,
+    "keep": { "tokens": 12000 },
+    "buffer": "20%"
+  },
+
+  // Réduit la taille des sorties d'outils réinjectées dans le contexte.
+  "tool_output": {
+    "max_lines": 600,
+    "max_bytes": 24000
+  },
+
+  // Évite de watcher/indexer les gros dossiers de build.
+  "watcher": {
+    "ignore": [
+      "build/**",
+      ".dart_tool/**",
+      "node_modules/**",
+      "*.zip",
+      "ollama.tar.zst"
+    ]
+  }
+}

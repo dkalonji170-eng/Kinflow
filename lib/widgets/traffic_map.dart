@@ -7,7 +7,12 @@ import 'package:flutter_map/flutter_map.dart' hide LatLngTween;
 import 'package:latlong2/latlong.dart' hide Path;
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_map_tile_caching/flutter_map_tile_caching.dart';
-import '../config/carte.dart' show bornesAfrique, zoomMinGlobal;
+import '../config/carte.dart'
+    show
+        CarteConfig,
+        bornesAfrique,
+        vitesseVisualisationMaxMetresParSeconde,
+        zoomMinGlobal;
 import '../main.dart'
     show tileDownloadService, waitForFmtc, initFmtc, fmtcSucceeded;
 import '../models/road_segment.dart';
@@ -17,7 +22,6 @@ import '../theme/kinflow_theme.dart';
 import '../utils/geo.dart'
     show deltaRotation, distanceMetresHaversine, normaliserDegre;
 import '../utils/latlng_tween.dart';
-import '../utils/temps_relatif.dart';
 import '../services/poi_service.dart'
     show
         Poi,
@@ -31,6 +35,7 @@ import '../services/poi_service.dart'
 import '../services/rendu_itineraire.dart'
     show construireRaccordDepart, decouperItineraireParEtat;
 import '../services/road_service.dart';
+import '../services/offline_routes.dart';
 import '../services/diagnostics_service.dart';
 import '../services/data_usage_service.dart';
 import '../services/tile_prefetch_service.dart';
@@ -82,30 +87,32 @@ bool _estNuit() {
   return h >= 0 && h < 6;
 }
 
-/// Mode navigation : raideur du lissage exponentiel caméra (par seconde).
-/// Volontairement VIF (10/s, convergence à ~95 % en 0,3 s) : le point bleu
-/// étant désormais glissé avec la caméra, une raideur élevée donne une suite
-/// immédiate à chaque fix GPS — l'utilisateur sent qu'il avance tout de
-/// suite. L'exponentiel interdit toujours le téléport : la trajectoire reste
-/// continue.
-const double _navFacteurLissage = 10.0;
+/// Mode navigation : raideur du lissage exponentiel du ZOOM et du décalage
+/// écran (par seconde). Le zoom ne bouge que très rarement (geste manuel) :
+/// une raideur élevée le rend simplement vif, sans incidence sur la
+/// fluidité du déplacement.
+///
+/// La POSITION et la ROTATION ne passent plus par un lissage exponentiel :
+/// elles sont animées en durée fixe (voir [_surTickNavigation]). Un
+/// exponentiel sur une cible qui saute à chaque fix GPS produit exactement
+/// l'effet « le point reste sur place puis se précipite » : il parcourt 95 %
+/// de l'écart en 0,3 s puis attend le fix suivant.
+const double _navFacteurLissageZoom = 8.0;
 
-/// Mode navigation : raideur du lissage exponentiel de la ROTATION (par
-/// seconde). Relevée de 1,5 à 3,0 pour un rendu « décidé » : quand un
-/// recadrage (ou l'adaptation continue) décide de pivoter, la carte le fait
-/// vite. Le double seuil 10°/5 m en amont limite déjà le nombre de
-/// recadrages — la raideur ne fait que leur donner de l'allant.
-const double _navFacteurLissageRotation = 3.0;
+/// Mode navigation : durée (ms) de l'animation d'une rotation de carte.
+/// Proportionnelle à l'angle (220 ms + 5 ms/degré, plafonnée à 750 ms) : un
+/// petit ajustement reste vif, un vrai virage à 90° se lit sans à-coup.
+const double _navRotationMsBase = 220;
+const double _navRotationMsParDegre = 5.0;
+const double _navRotationMsMax = 750;
 
-/// Mode navigation : écart angulaire minimal (degrés) entre la rotation
-/// caméra courante et le cap filtré pour reprogrammer une adaptation
-/// continue de l'orientation. Sous ce seuil la carte reste figée : le filtre
-/// circulaire du cap suffit déjà à éliminer le bruit, il ne faut pas en
-/// plus faire « danser » la caméra sur des micro-variations.
-/// Seuil réduit de 8° à 6° avec une raideur de rotation relevée à 3,0 :
-/// réponse « vif mais stable » — la carte réagit à de vraies inflexions de
-/// trajectoire sans osciller en ligne droite (le cap GPS est déjà filtré).
-const double _seuilRotationContinueDegres = 6.0;
+/// Mode navigation : vitesse maximale (m/s) PLAUSIBLE pendant que
+/// l'utilisateur visualise son trajet sur la carte. Voir
+/// [CarteConfig.vitesseVisualisationMaxMetresParSeconde] pour la valeur et le
+/// raisonnement : au-delà, une mesure est traitée comme un saut GPS plutôt
+/// que comme un vrai déplacement.
+const double _navVitesseMaxMetresParSeconde =
+    vitesseVisualisationMaxMetresParSeconde;
 
 /// Mode navigation : part de la hauteur d'écran séparant le centre réel de
 /// la caméra du point utilisateur (placé plus bas, vers le tiers inférieur).
@@ -171,11 +178,11 @@ enum _ModeCarte {
   topo,
 }
 
-const String _urlTuiles = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
-
-// La carte sombre utilise les mêmes tuiles OSM que la carte claire, mais
-// avec une désaturation + assombrissement appliqués en temps réel.
-const String _urlTuilesSombre = _urlTuiles;
+// Fond « clair » / « sombre » : MapTiler quand une clé est configurée (rendu
+// proche de Google Maps), sinon OSM. Voir [CarteConfig].
+// Sans clé, la carte sombre réutilise les tuiles OSM de la carte claire avec
+// une désaturation + assombrissement appliqués en temps réel ; avec MapTiler
+// elle reçoit directement le style `-dark`.
 
 const String _urlTuilesSatellite =
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
@@ -209,9 +216,9 @@ const Map<String, double> _zoomMinParClasse = {
   'service': 15.0,
 };
 
-/// Type de lieu personnel que l'utilisateur pose sur la carte : son
-/// domicile (maison) ou son lieu de travail (mallette).
-enum TypeLieuPose { maison, travail }
+/// Type de lieu personnel que l'utilisateur pose sur la carte : son lieu de
+/// travail (mallette).
+enum TypeLieuPose { travail }
 
 class TrafficMap extends StatefulWidget {
   final MapController mapController;
@@ -253,24 +260,20 @@ class TrafficMap extends StatefulWidget {
   /// géographique actuellement au centre de la carte.
   final ValueChanged<LatLng>? onPoserEpingle;
 
-  /// Demande (depuis la recherche de lieu) d'entrer en mode « poser un lieu
-  /// personnel » : une icône de prévisualisation (maison ou mallette) suit
-  /// le centre de l'écran, la carte se laisse pivoter et déplacer dessous
-  /// pour viser le point, puis l'utilisateur la pose avec « Poser ». `null`
-  /// quand aucune pose n'est demandée.
+  /// Demande (depuis la recherche de lieu) d'entrer en mode « poser le lieu
+  /// de travail » : une icône de prévisualisation (mallette) suit le centre
+  /// de l'écran, la carte se laisse pivoter et déplacer dessous pour viser le
+  /// point, puis l'utilisateur la pose avec « Poser ». `null` quand aucune
+  /// pose n'est demandée.
   final TypeLieuPose? poseLieu;
-
-  /// Point du domicile enregistré : une icône maison reste ancrée sur ce
-  /// lieu, collée à la carte tant que le domicile n'est pas changé.
-  final LatLng? pointMaison;
 
   /// Point du lieu de travail enregistré : une mallette reste ancrée sur ce
   /// lieu, collée à la carte tant que le lieu de travail n'est pas changé.
   final LatLng? pointTravail;
 
-  /// Appelé quand l'utilisateur pose l'icône (maison ou travail) : fournit
-  /// le type posé et la coordonnée géographique au centre de la carte, que
-  /// le parent persiste comme domicile ou lieu de travail.
+  /// Appelé quand l'utilisateur pose l'icône du lieu de travail : fournit le
+  /// type posé et la coordonnée géographique au centre de la carte, que le
+  /// parent persiste comme lieu de travail.
   final void Function(TypeLieuPose type, LatLng point)? onPoserLieu;
 
   /// Appelé quand l'utilisateur annule la pose : le parent ressort du mode
@@ -370,85 +373,44 @@ class TrafficMap extends StatefulWidget {
 
   const TrafficMap({
     super.key,
-
     required this.mapController,
-
     required this.positionActuelle,
-
     required this.lieuRecherche,
-
     this.afficherLignesTrafic = true,
-
     this.suspendreTravailCarte = false,
-
     required this.onMapReady,
-
     this.onMapTap,
-
     this.afficherActions = false,
-
     this.seulementSupprimer = false,
-
     this.onDefinirItineraire,
-
     this.onSupprimer,
-
     this.onVoirDetails,
-
     this.onUserInteract,
-
     this.epingle,
-
     this.onPoserEpingle,
-
     this.poseLieu,
-
-    this.pointMaison,
-
     this.pointTravail,
-
     this.onPoserLieu,
-
     this.onAnnulerPoseLieu,
-
     this.pointActions,
-
     this.actionsSurEpingle = false,
-
     this.actionsSurAmi = false,
-
     this.versionZonesTrafic = 0,
-
     this.onZonesTrafic,
-
     this.itinerairePoints,
-
     this.itineraireSeverites,
-
     this.itineraireDebutRoute = 0,
-
     this.itineraireDebutVisuel = -1,
-
     this.itineraireFinRoute = -1,
-
     this.itineraireSegmentIds,
-
     this.itineraireDepart,
-
     this.pointDestination,
-
     this.pointEtape = const [],
-
     this.amis = const [],
-
     this.libelleActionPrincipale = 'Définir itinéraire',
-
     this.desactiverItineraire = false,
-
     this.modeNavigation = false,
-
     this.capUtilisateur,
-
     this.onNavigationInterrompue,
   });
 
@@ -513,6 +475,10 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   Animation<LatLng>? _positionAnimation;
   LatLng? _displayedPosition;
 
+  /// Horodatage du dernier fix pris en compte en mode libre : permet de caler
+  /// la durée de glissade du point bleu sur l'intervalle réel entre mesures.
+  DateTime? _dernierFixTemps;
+
   /// Position « vivante » du point bleu : pilotée par le ticker navigation
   /// (qui la fait glisser avec la caméra lissée) ou par l'animation du pin.
   /// C'est un NOTIFIER et non un setState : quand le point bouge, seul le
@@ -535,6 +501,47 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   Duration? _navDernierTick;
   double _navRotationCourante = 0;
   double _navZoomCible = 17;
+
+  /// Vrai dès qu'un geste de ZOOM manuel (pincement, molette, double-tap,
+  /// appui long) a eu lieu : le niveau choisi par l'utilisateur est alors
+  /// respecté jusqu'à la fin de la session de suivi, et le zoom adaptatif à
+  /// la vitesse ne l'écrase plus. Réinitialisé au démarrage du suivi.
+  bool _navZoomManuel = false;
+
+  /// Palier de zoom visé (0 = à pied … 3 = voie rapide), conservé entre deux
+  /// mesures pour appliquer une hystérésis : sans cela, le zoom « respire »
+  /// au moindre vacillement de la vitesse autour d'un seuil.
+  int _navZoomPalier = 1;
+
+  /// Zoom de la caméra au DÉBUT du geste en cours : comparé à celui du
+  /// relâchement pour distinguer un zoom manuel d'un simple glissement.
+  double? _navZoomDebutGeste;
+
+  /// Interpolation de POSITION du suivi : le point bleu (et la caméra, qui
+  /// le suit) glisse linéairement d'une mesure GPS à la suivante, sur la
+  /// durée attendue entre deux fixes. C'est ce qui distingue un déplacement
+  /// continu d'un « saut puis attente » : un lissage exponentiel parcourt
+  /// l'essentiel de l'écart en quelques centièmes de seconde, puis reste
+  /// immobile jusqu'au fix suivant.
+  LatLng? _navDeplacementDebut;
+  LatLng? _navDeplacementCible;
+  Duration? _navDeplacementDebutTemps;
+  double _navDeplacementDureeMs = 0;
+
+  /// Animation de ROTATION : même principe, en durée calculée sur l'angle à
+  /// parcourir. Une rotation doit être menée à son terme en un seul geste,
+  /// pas corrigée par petites touches successives.
+  double _navRotationDebut = 0;
+  Duration? _navRotationDebutTemps;
+  double _navRotationDureeMs = 0;
+
+  /// Horodatage de la dernière mesure GPS traitée : sert à estimer
+  /// l'intervalle entre deux fixes, donc la durée idéale des interpolations.
+  DateTime? _horodatageFixPrecedent;
+
+  /// Trois derniers intervalles entre fixes (ms), pour lisser la durée de
+  /// glissade du point bleu (voir [_intervalleLisseMs]).
+  final List<double> _intervallesFixMs = <double>[];
 
   /// Proportion de décalage écran ACTUELLE : part de 0 à chaque démarrage du
   /// suivi puis glisse vers [_navProportionDecalage]. Appliquée d'un bloc,
@@ -561,12 +568,6 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// (le filtre de cap est exponentiel, le nourrir à chaque frame avec la
   /// même valeur fausserait sa dynamique).
   Position? _navDerniereMesure;
-
-  /// Position à laquelle la dernière adaptation CONTINUE de rotation a été
-  /// appliquée : l'adaptation ne doit tourner la carte qu'après un réel
-  /// déplacement ([seuilDistanceMetres]), sinon le cap filtré qui dérive à
-  /// l'arrêt ferait pivoter la carte immobile.
-  LatLng? _navDernierePositionRotationContinue;
 
   /// Pendant la navigation, un geste manuel (glisser, pincer, pivoter,
   /// double-clic de zoom, appui long de dézoom) ne COUPE plus le suivi : il
@@ -612,10 +613,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// posée avec le bouton « Poser ».
   bool _modePoserEpingle = false;
 
-  /// Mode pose d'un lieu personnel (maison ou travail, [TypeLieuPose]) :
-  /// même mécanique que l'épingle, mais avec l'icône du lieu demandé. Entré
-  /// à la demande du parent ([widget.poseLieu]), sorti quand l'utilisateur
-  /// pose ou annule.
+  /// Mode pose du lieu de travail ([TypeLieuPose]) : même mécanique que
+  /// l'épingle, mais avec l'icône du lieu demandé. Entré à la demande du
+  /// parent ([widget.poseLieu]), sorti quand l'utilisateur pose ou annule.
   TypeLieuPose? _poseLieuActif;
 
   /// Opacité des boutons flottants (pose d'épingle, cartes) : pleine après
@@ -646,6 +646,21 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   List<Polyline> _raccordEtape = [];
 
   final Map<String, _SegmentsParZone> _segmentsCache = {};
+
+  /// Chargement des routes en cours : les appels concurrents (panning, timers,
+  /// reprise après calcul) partagent le même Future au lieu de lancer chacun
+  /// sa propre salve de tentatives Overpass en parallèle.
+  Future<void>? _chargementRoutesEnCours;
+
+  /// Vrai si une demande est arrivée pendant un chargement : on relance UNE
+  /// fois à la fin pour couvrir la zone finalement affichée (panning rapide),
+  /// au lieu de perdre la dernière position de la caméra.
+  bool _routesARelancer = false;
+
+  /// Zones dont le repli embarqué est déjà en cours de dessin : évite de
+  /// recalculer et rejournaliser la même zone plusieurs fois d'affilée.
+  final Set<String> _repliEmbarqueEnCours = <String>{};
+
   Timer? _debounceRoutes;
   Timer? _debounceRoutesPrefetch;
   Timer? _rafraichissementSimulation;
@@ -665,6 +680,11 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// exponentiel (5 s, 15 s, 35 s, 75 s… plafonné) pour éviter de marteler
   /// Overpass quand le réseau est mauvais. Réinitialisé dès un succès.
   int _tentativesRoutes = 0;
+
+  /// Vrai quand la pause du disjoncteur a déjà été consignée : sans cela, le
+  /// minuteur de reprise réécrivait la même alerte toutes les 80 s pendant
+  /// toute la panne (44 lignes identiques dans une seule session).
+  bool _suspensionRoutesSignalee = false;
 
   /// Nombre d'échecs consécutifs de chargement des POIs : même repli
   /// exponentiel que les routes (5 s → 15 s → 35 s… plafonné), pour ne pas
@@ -743,9 +763,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       }
     }
 
-    // Demande de pose d'un lieu personnel : on suit le parent pour entrer ou
-    // sortir du mode « poser maison/travail » (l'épingle et la pose de lieu
-    // ne coexistent jamais, une pose en cours est d'abord refermée).
+    // Demande de pose du lieu de travail : on suit le parent pour entrer ou
+    // sortir du mode « poser le travail » (l'épingle et la pose de lieu ne
+    // coexistent jamais, une pose en cours est d'abord refermée).
     if (widget.poseLieu != _poseLieuActif) {
       if (widget.poseLieu != null) {
         _entrerModePoseLieu(widget.poseLieu!);
@@ -863,17 +883,55 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
             ? _positionAnimation!.value
             : oldPos;
 
+        // Durée calée sur l'intervalle réel entre deux fixes : une animation
+        // de 200 ms suivie d'une seconde d'immobilité donne exactement
+        // l'impression que le point « reste sur place puis se précipite ».
+        // En étalant la glissade sur l'intervalle attendu, le déplacement
+        // devient continu. Un saut anormalement long (perte de signal) est
+        // étalé davantage, proportionnellement à la distance, pour ne jamais
+        // téléporter le point à travers la carte.
+        //
+        // L'intervalle est MOYENNÉ (voir [_intervalleLisseMs]) : une fix
+        // livrée en retard ne doit pas ralentir visiblement la glissade.
+        final maintenant = DateTime.now();
+        final precedent = _dernierFixTemps;
+        _dernierFixTemps = maintenant;
+        final intervalleMs = precedent == null
+            ? 1000.0
+            : _intervalleLisseMs(
+                maintenant.difference(precedent).inMilliseconds.toDouble(),
+              );
+        final distance = distanceMetresHaversine(base, newLatLng);
+        final dureeDistanceMs =
+            distance / _navVitesseMaxMetresParSeconde * 1000;
+        // La durée ne descend jamais sous le temps nécessaire pour couvrir la
+        // distance à vitesse raisonnable, et reste bornée à 4 s.
+        //
+        // Elle est volontairement ~15 % plus longue que l'intervalle entre
+        // deux fixes : la mesure suivante arrive donc AVANT la fin de la
+        // glissade et vient retendre l'animation en cours de route. Le point
+        // ne s'immobilise jamais entre deux mesures (le « stop and go » des
+        // applis naïves).
+        final dureeMs = max(
+          intervalleMs * 1.15,
+          dureeDistanceMs,
+        ).clamp(300.0, 4500.0);
+
         nettoyerAnimation();
         _positionAnimController = AnimationController(
           vsync: this,
-          // Réduit de 300 à 200 ms : en mode libre, le point bleu doit
-          // réagir presque instantanément à chaque fix GPS accepté.
-          duration: const Duration(milliseconds: 200),
+          duration: Duration(milliseconds: dureeMs.round()),
         );
         _positionAnimation = LatLngTween(begin: base, end: newLatLng).animate(
           CurvedAnimation(
             parent: _positionAnimController!,
-            curve: Curves.easeOut,
+            // VITESSE CONSTANTE, comme les grandes applis de navigation.
+            // Un easeInOut remettait la vitesse à zéro à chaque fix : le
+            // point ralentissait puis ré-accélérait toutes les secondes,
+            // d'où l'impression de « pompage »/saccade. En linéaire, la
+            // glissade couvre exactement la distance parcourue pendant
+            // l'intervalle, sans à-coup de vitesse aux raccords.
+            curve: Curves.linear,
           ),
         );
         _positionAnimation!.addListener(() {
@@ -970,6 +1028,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     if (_longPressDezoomActif) {
       _longPressDezoomActif = false;
       _navZoomCible = widget.mapController.camera.zoom;
+      // Dézoom volontaire : le niveau choisi ne doit pas être repris par
+      // l'adaptation automatique à la vitesse.
+      _navZoomManuel = true;
       _finGesteManuel();
     }
   }
@@ -994,6 +1055,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     if (_longPressDezoomActif) {
       _longPressDezoomActif = false;
       _navZoomCible = widget.mapController.camera.zoom;
+      _navZoomManuel = true;
       _suiviEnAttenteMouvement = true;
     }
   }
@@ -1213,10 +1275,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     widget.onPoserEpingle?.call(centre);
   }
 
-  /// Entre en mode « poser un lieu personnel » (maison ou travail), demandé
-  /// par le parent après un appui sur « Ma maison » ou « Mon travail » dans
-  /// la recherche de lieu : l'icône colle au centre de l'écran, la carte
-  /// reste libre à pivoter dessous.
+  /// Entre en mode « poser le lieu de travail », demandé par le parent après
+  /// un appui sur « Mon travail » dans la recherche de lieu : l'icône colle
+  /// au centre de l'écran, la carte reste libre à pivoter dessous.
   void _entrerModePoseLieu(TypeLieuPose type) {
     if (!mounted) return;
     setState(() {
@@ -1229,7 +1290,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     _annulerSansTap();
   }
 
-  /// Pose l'icône (maison ou travail) à la coordonnée géographique
+  /// Pose l'icône du lieu de travail à la coordonnée géographique
   /// actuellement au centre de l'écran, puis quitte le mode pose : le parent
   /// persiste le lieu correspondant.
   void _poserLieu() {
@@ -1318,55 +1379,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
                     ),
                   ),
                 ),
-                OptionModeCarte(
-                  icone: Icons.light_mode,
-                  libelle: 'Claire',
-                  selectionne: _modeCarte == _ModeCarte.claire,
-                  sombre: sombre,
-                  onTap: () => _choisirMode(_ModeCarte.claire),
-                ),
-                OptionModeCarte(
-                  icone: Icons.dark_mode,
-                  libelle: 'Sombre',
-                  selectionne: _modeCarte == _ModeCarte.sombre,
-                  sombre: sombre,
-                  onTap: () => _choisirMode(_ModeCarte.sombre),
-                ),
-                OptionModeCarte(
-                  icone: Icons.satellite_alt,
-                  libelle: 'Satellite',
-                  selectionne: _modeCarte == _ModeCarte.satellite,
-                  sombre: sombre,
-                  onTap: () => _choisirMode(_ModeCarte.satellite),
-                ),
-                OptionModeCarte(
-                  icone: Icons.wb_sunny,
-                  libelle: 'Positron',
-                  selectionne: _modeCarte == _ModeCarte.positron,
-                  sombre: sombre,
-                  onTap: () => _choisirMode(_ModeCarte.positron),
-                ),
-                OptionModeCarte(
-                  icone: Icons.nightlight_round,
-                  libelle: 'Dark Matter',
-                  selectionne: _modeCarte == _ModeCarte.darkMatter,
-                  sombre: sombre,
-                  onTap: () => _choisirMode(_ModeCarte.darkMatter),
-                ),
-                OptionModeCarte(
-                  icone: Icons.explore,
-                  libelle: 'Voyager',
-                  selectionne: _modeCarte == _ModeCarte.voyager,
-                  sombre: sombre,
-                  onTap: () => _choisirMode(_ModeCarte.voyager),
-                ),
-                OptionModeCarte(
-                  icone: Icons.terrain,
-                  libelle: 'Topographique',
-                  selectionne: _modeCarte == _ModeCarte.topo,
-                  sombre: sombre,
-                  onTap: () => _choisirMode(_ModeCarte.topo),
-                ),
+                ..._optionsMenuCartes(sombre),
                 const SizedBox(height: 8),
               ],
             ),
@@ -1374,6 +1387,78 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
         ),
       ),
     );
+  }
+
+  /// Options du menu « Cartes », construites à partir des TUILES réellement
+  /// servies.
+  ///
+  /// Deux modes qui pointent vers la même URL de tuiles (c'est le cas de
+  /// « claire » et « sombre » sans clé MapTiler, tous deux en OpenStreetMap)
+  /// ne sont proposés qu'UNE fois : c'étaient les doublons du menu. Le mode
+  /// actuellement affiché est toujours conservé, même s'il fait partie d'un
+  /// doublon, pour que la coche reste visible.
+  List<Widget> _optionsMenuCartes(bool sombre) {
+    // Une URL = une couche de tuiles. Le mode courant gagne sur un doublon
+    // rencontré avant lui.
+    final parUrl = <String, _ModeCarte>{};
+    for (final mode in _ModeCarte.values) {
+      final url = _urlPourMode(mode);
+      if (!parUrl.containsKey(url) || mode == _modeCarte) {
+        parUrl[url] = mode;
+      }
+    }
+    return [
+      for (final mode in _ModeCarte.values)
+        if (parUrl[_urlPourMode(mode)] == mode)
+          OptionModeCarte(
+            icone: _iconeMode(mode),
+            libelle: _libelleMode(mode),
+            selectionne: _modeCarte == mode,
+            sombre: sombre,
+            onTap: () => _choisirMode(mode),
+          ),
+    ];
+  }
+
+  /// Icône du menu, indépendante du fournisseur de tuiles.
+  IconData _iconeMode(_ModeCarte mode) => switch (mode) {
+    _ModeCarte.claire => Icons.light_mode,
+    _ModeCarte.sombre => Icons.dark_mode,
+    _ModeCarte.satellite => Icons.satellite_alt,
+    _ModeCarte.positron => Icons.wb_sunny,
+    _ModeCarte.darkMatter => Icons.nightlight_round,
+    _ModeCarte.voyager => Icons.explore,
+    _ModeCarte.topo => Icons.terrain,
+  };
+
+  /// Nom affiché dans le menu : celui du FOURNISSEUR et du style réellement
+  /// utilisés, et non plus une appellation générique.
+  ///
+  /// Avec une clé MapTiler, c'est le nom du style MapTiler (« MapTiler
+  /// Streets », « MapTiler Satellite »…) ; sans clé, le fournisseur de secours
+  /// (OpenStreetMap, Esri, CARTO, OpenTopoMap). Un même nom ne peut donc plus
+  /// désigner deux fonds différents.
+  String _libelleMode(_ModeCarte mode) {
+    if (CarteConfig.mapTilerActif) {
+      return switch (mode) {
+        _ModeCarte.claire => 'MapTiler Streets',
+        _ModeCarte.sombre => 'MapTiler Streets sombre',
+        _ModeCarte.satellite => 'MapTiler Satellite',
+        _ModeCarte.positron => 'MapTiler Minimal',
+        _ModeCarte.darkMatter => 'MapTiler Minimal sombre',
+        _ModeCarte.voyager => 'MapTiler Bright',
+        _ModeCarte.topo => 'MapTiler Topo',
+      };
+    }
+    return switch (mode) {
+      _ModeCarte.claire => 'OpenStreetMap',
+      _ModeCarte.sombre => 'OpenStreetMap sombre',
+      _ModeCarte.satellite => 'Esri Satellite',
+      _ModeCarte.positron => 'CARTO Positron',
+      _ModeCarte.darkMatter => 'CARTO Dark Matter',
+      _ModeCarte.voyager => 'CARTO Voyager',
+      _ModeCarte.topo => 'OpenTopoMap',
+    };
   }
 
   void _choisirMode(_ModeCarte mode) {
@@ -1481,14 +1566,34 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     // conserve le zoom choisi par l'utilisateur. Le suivi ne doit jamais
     // écraser un zoom choisi librement.
     _navZoomCible = widget.mapController.camera.zoom;
+    // Nouvelle session : le zoom redevient automatique (adapté à la vitesse)
+    // tant que l'utilisateur ne l'a pas réglé lui-même. Le palier de départ
+    // est celui du zoom DÉJÀ affiché : l'adaptation ne fait pas sauter la vue
+    // au moment où le suivi commence.
+    _navZoomManuel = false;
+    _navZoomPalier = _palierPourZoom(widget.mapController.camera.zoom);
+    _navZoomDebutGeste = null;
     _navDernierTick = null;
     _navRotationCible = null;
     _navDerniereMesure = null;
-    // Ancre de déplacement de l'adaptation continue : posée sur la position
-    // de départ. Aucune rotation ne peut donc se déclencher avant un VRAI
-    // déplacement de 5 m depuis l'entrée du suivi : un cap résiduel (dernier
-    // cap connu avant l'arrêt) ne fait plus pivoter la carte immobile.
-    _navDernierePositionRotationContinue = _fixActuelleLatLng;
+    // Interpolation de position / rotation remise à neuf : la première mesure
+    // reçue posera une cible propre, sans hériter d'une animation entamée
+    // dans une session précédente.
+    _navDeplacementDebut = null;
+    _navDeplacementCible = null;
+    _navDeplacementDebutTemps = null;
+    _navDeplacementDureeMs = 0;
+    _navRotationDebutTemps = null;
+    _navRotationDureeMs = 0;
+    _horodatageFixPrecedent = null;
+    // Nouvelle session : on repart d'un intervalle entre fixes inconnu plutôt
+    // que d'hériter des moyennes de la session précédente.
+    _intervallesFixMs.clear();
+    _dernierFixTemps = null;
+    // Aucune rotation ne peut se déclencher avant un VRAI déplacement de 4 m
+    // depuis l'entrée du suivi : un cap résiduel (dernier cap connu avant
+    // l'arrêt) ne fait plus pivoter la carte immobile. Ce seuil est géré par
+    // le contrôleur d'orientation lui-même.
     _gestesActifs = 0;
     _suiviEnAttenteMouvement = false;
     _longPressDezoomActif = false;
@@ -1496,8 +1601,8 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     // Nouvelle session de suivi : référentiel d'orientation remis à zéro.
     // La rotation affichée (vue d'ensemble d'un itinéraire, bouton
     // « Ma position ») devient la référence angulaire : le premier cap GPS
-    // ne réaligne plus la carte d'un coup, seul un vrai déplacement la fera
-    // pivoter (double seuil 10°/5 m).
+    // ne réaligne plus la carte d'un coup, seul un vrai virage la fera
+    // pivoter (double seuil 15°/4 m confirmé).
     _orientationNav.reinitialiser(
       rotationInitialeDegres: widget.mapController.camera.rotation,
     );
@@ -1510,7 +1615,6 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     _gestesActifs = 0;
     _navDernierTick = null;
     _navCentreCourant = null;
-    _navDernierePositionRotationContinue = null;
     _suiviEnAttenteMouvement = false;
     _longPressDezoomActif = false;
     _positionDebutGeste = null;
@@ -1591,9 +1695,74 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     // du lissage habituel de ~0,3 s.
     _navDernierTick = null;
     // Le déplacement qui a motivé la reprise ne doit pas servir d'élan pour
-    // une rotation immédiate : l'ancre repart de la position courante. La
-    // carte ne pivotera qu'après 5 m parcourus DEPUIS la reprise.
-    _navDernierePositionRotationContinue = _fixActuelleLatLng;
+    // une rotation immédiate : la carte ne pivotera qu'après un vrai virage
+    // constaté DEPUIS la reprise.
+    _orientationNav.reinitialiser(
+      rotationInitialeDegres: widget.mapController.camera.rotation,
+    );
+    // Interpolation remise à plat : le point bleu repart de la position
+    // laissée par le geste et rejoindra la prochaine fix en glissant.
+    _navDeplacementDebut = null;
+    _navDeplacementCible = null;
+    _navDeplacementDebutTemps = null;
+    _navDeplacementDureeMs = 0;
+    _horodatageFixPrecedent = null;
+  }
+
+  /// Intervalle (ms) entre deux fixes GPS, MOYENNÉ sur les trois dernières
+  /// mesures.
+  ///
+  /// La durée de glissade du point bleu est calée sur cet intervalle. Utiliser
+  /// le seul dernier intervalle rendait sa vitesse dépendante du moindre
+  /// retard de livraison d'une fix : une mesure arrivée 300 ms en retard
+  /// ralentissait visiblement la glissade suivante, puis la suivante
+  /// accélérait — le point « respirait ». La moyenne glissante donne un
+  /// déplacement régulier tout en restant réactive (3 fixes ≈ 3 s).
+  double _intervalleLisseMs(double intervalleBrutMs) {
+    _intervallesFixMs.add(intervalleBrutMs.clamp(200.0, 4000.0));
+    if (_intervallesFixMs.length > 3) _intervallesFixMs.removeAt(0);
+    var somme = 0.0;
+    for (final valeur in _intervallesFixMs) {
+      somme += valeur;
+    }
+    return somme / _intervallesFixMs.length;
+  }
+
+  /// Zoom visé en navigation selon la vitesse (m/s), avec HYSTÉRÉSIS : on ne
+  /// change de palier qu'en franchissant nettement le seuil (montée plus
+  /// exigeante que la descente). Sans cela, une vitesse qui oscille autour
+  /// d'un seuil ferait « respirer » le zoom en permanence.
+  ///
+  /// Paliers : à pied 18 (rues lisibles), ville 17, route 16, voie rapide 15
+  /// (vue d'ensemble). Seuils ≈ 7 / 29 / 72 km/h.
+  ///
+  /// La vitesse reçue est plafonnée en amont à
+  /// [_navVitesseMaxMetresParSeconde] (80 km/h) : au-delà, on considère que
+  /// l'utilisateur ne lit plus son trajet et qu'il s'agit d'une mesure
+  /// aberrante.
+  double _zoomPourVitesse(double vitesseMs) {
+    const seuilsMontants = <double>[2.0, 8.0, 20.0];
+    const seuilsDescendants = <double>[1.5, 6.5, 18.0];
+    const zoomParPalier = <double>[18.0, 17.0, 16.0, 15.0];
+    var palier = _navZoomPalier.clamp(0, 3).toInt();
+    while (palier < 3 && vitesseMs >= seuilsMontants[palier]) {
+      palier++;
+    }
+    while (palier > 0 && vitesseMs < seuilsDescendants[palier - 1]) {
+      palier--;
+    }
+    _navZoomPalier = palier;
+    return zoomParPalier[palier];
+  }
+
+  /// Palier de zoom le plus proche du zoom [zoom] affiché : sert à démarrer
+  /// l'adaptation à la vitesse SANS changer la vue que l'utilisateur vient de
+  /// choisir (ou qu'un centrage animé vient de poser).
+  int _palierPourZoom(double zoom) {
+    if (zoom >= 17.5) return 0;
+    if (zoom >= 16.5) return 1;
+    if (zoom >= 15.5) return 2;
+    return 3;
   }
 
   /// Boucle de suivi navigation : la caméra glisse en continu vers la
@@ -1601,18 +1770,19 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// elle, est événementielle, pilotée par [ControleurOrientation] :
   ///
   ///  - chaque NOUVELLE mesure GPS alimente le filtre circulaire du cap
-  ///    puis le test à double seuil : delta >= 10° ET 5 m parcourus depuis
-  ///    la dernière référence (référentiel glissant réarmé à chaque
-  ///    recadrage) ;
+  ///    puis le test à double seuil : delta >= 15° ET 4 m parcourus depuis
+  ///    la dernière référence, confirmé sur deux mesures ;
   ///  - au déclenchement, la rotation cible devient `-cap` (direction vers
-  ///    le haut) et la carte y pivote par lissage exponentiel — jamais par
-  ///    un saut sec ;
-  ///  - entre deux recadrages la rotation est totalement figée : les petites
-  ///    variations de trajectoire et le bruit des capteurs ne font rien.
+  ///    le haut) et la carte effectue la rotation ENTIÈRE en une animation
+  ///    de durée proportionnelle à l'angle ;
+  ///  - entre deux virages la rotation est totalement figée : aucune
+  ///    adaptation continue, donc plus de « petits tours » successifs.
+  ///
+  /// La position, elle, est INTERPOLÉE entre deux fixes sur la durée qui les
+  /// sépare : le point bleu avance régulièrement au lieu de rester sur place
+  /// puis de se précipiter sur la nouvelle mesure.
   void _surTickNavigation(Duration elapsed) {
-    if (!mounted ||
-        !widget.modeNavigation ||
-        widget.positionActuelle == null) {
+    if (!mounted || !widget.modeNavigation || widget.positionActuelle == null) {
       return;
     }
     // Le suivi de la position NE DÉPEND PAS du cache de tuiles (FMTC). Sur le
@@ -1627,13 +1797,19 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       return;
     }
     // Un geste utilisateur est en cours (glissement, pincement, pivotement,
-    // double-clic, appui long de dézoom) : on suspend l'écriture caméra du
+    // double-clic, appui long de dézoom) : on suspend l'ÉCRITURE caméra du
     // suivi le temps du geste pour ne pas lui faire opposition. Au
     // relâchement, [_suiviEnAttenteMouvement] garde la main à l'utilisateur
     // jusqu'à un réel déplacement (le suivi reprend alors, cf.
     // [_reprendreSuiviNavigation]).
-    if (_gestesActifs > 0 || _longPressDezoomActif) return;
-    if (_suiviEnAttenteMouvement) return;
+    //
+    // ATTENTION : cette suspension ne concerne QUE la caméra. Le POINT BLEU,
+    // lui, continue d'avancer (interpolation + [_pointBleuNotifier] ci-dessous)
+    // même pendant le geste : sinon il restait cloué sur place tout le temps
+    // de la manipulation, puis sautait d'un coup sur la première fix reçue au
+    // relâchement — le fameux « reste sur place puis se précipite ».
+    final suiviSuspendu =
+        _gestesActifs > 0 || _longPressDezoomActif || _suiviEnAttenteMouvement;
 
     final dt =
         (_navDernierTick == null
@@ -1642,7 +1818,10 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
             .clamp(1, 120)
             .toInt();
     _navDernierTick = elapsed;
-    final k = 1 - exp(-_navFacteurLissage * dt / 1000);
+    // Raideur réservée au zoom et au décalage écran (voir
+    // [_navFacteurLissageZoom]) : la position et la rotation, elles, sont
+    // animées en durée fixe.
+    final k = 1 - exp(-_navFacteurLissageZoom * dt / 1000);
 
     final camera = widget.mapController.camera;
     final mesure = widget.positionActuelle!;
@@ -1651,8 +1830,50 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     // Analyse d'orientation : UNE fois par mesure GPS réellement nouvelle.
     if (!identical(mesure, _navDerniereMesure)) {
       _navDerniereMesure = mesure;
+
+      // --- Position : nouvelle cible d'interpolation -----------------------
+      // La durée de la glissade est calée sur l'intervalle réel entre deux
+      // fixes (légèrement allongé pour que la retargete suivante arrive
+      // avant la fin : le mouvement ne s'arrête jamais entre deux mesures).
+      // Un saut anormalement long (perte de signal, recadrage GPS) est
+      // étalé davantage, proportionnellement à la distance : la carte ne
+      // « téléporte » plus le point bleu.
+      final maintenant = DateTime.now();
+      final precedent = _horodatageFixPrecedent;
+      _horodatageFixPrecedent = maintenant;
+      // Intervalle MOYENNÉ : une fix livrée en retard ne doit pas ralentir
+      // visiblement la glissade du point bleu (voir [_intervalleLisseMs]).
+      final intervalleMs = precedent == null
+          ? 1000.0
+          : _intervalleLisseMs(
+              maintenant.difference(precedent).inMilliseconds.toDouble(),
+            );
+      final departPosition = _navCentreCourant ?? cible;
+      final distance = distanceHaversineMetres(
+        departPosition.latitude,
+        departPosition.longitude,
+        cible.latitude,
+        cible.longitude,
+      );
+      final dureeDistanceMs =
+          distance / _navVitesseMaxMetresParSeconde * 1000.0;
+      final dureePositionMs = max(
+        intervalleMs * 1.15,
+        dureeDistanceMs,
+      ).clamp(200.0, 5000.0);
+      _navDeplacementDebut = departPosition;
+      _navDeplacementCible = cible;
+      _navDeplacementDebutTemps = elapsed;
+      _navDeplacementDureeMs = dureePositionMs;
+
+      // --- Orientation : rotation en UN SEUL geste -------------------------
+      // Pendant un geste, on ne nourrit PAS le contrôleur : il croirait avoir
+      // recadré la carte alors que la caméra est tenue par l'utilisateur, et
+      // la rotation serait « consommée » sans effet. À la reprise,
+      // [_reprendreSuiviNavigation] remet le référentiel d'orientation à zéro
+      // depuis la rotation réellement affichée.
       final capBrut = widget.capUtilisateur;
-      if (capBrut != null) {
+      if (capBrut != null && !suiviSuspendu) {
         final rotationCibleRecadrage = _orientationNav.mettreAJour(
           capBrutDegres: capBrut,
           position: cible,
@@ -1664,63 +1885,51 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
             'nouvelle_rotation': rotationCibleRecadrage,
             'precision_m': mesure.accuracy,
           });
+          // La rotation part de la valeur AFFICHÉE et va jusqu'à la cible en
+          // une fois : durée proportionnelle à l'angle à parcourir. Aucune
+          // correction continue ne viendra ensuite compléter ce geste.
+          final delta = deltaRotation(
+            _navRotationCourante,
+            rotationCibleRecadrage,
+          );
           _navRotationCible = rotationCibleRecadrage;
-        }
-      }
-
-      // Adaptation continue : au lieu d'attendre les seuls recadrages à
-      // double seuil, la carte suit EN DOUCEUR la direction filtrée du
-      // déplacement (le point de direction du trajet reste « droit », vers
-      // le haut de l'écran). Le filtre circulaire du cap a déjà gommé le
-      // bruit ; le seuil minimal ci-dessous empêche les micro-rotations
-      // perpétuelles tant que la trajectoire ne va pas vraiment plus « au
-      // haut » que la rotation affichée.
-      //
-      // GARDE-FOU : l'adaptation n'est appliquée qu'après un réel
-      // déplacement depuis la dernière adaptation ([seuilDistanceMetres]).
-      // Sans ce garde-fou, le cap filtré qui dérive lentement à l'arrêt
-      // (GPS qui renvoie 0° à l'immobilité) ferait tourner la carte toute
-      // seule, sans que le pied ait bougé.
-      final capFiltre = _orientationNav.capFiltre;
-      if (capFiltre != null) {
-        final derniere = _navDernierePositionRotationContinue;
-        final deplacementSuffisant =
-            derniere == null ||
-            distanceHaversineMetres(
-                  derniere.latitude,
-                  derniere.longitude,
-                  cible.latitude,
-                  cible.longitude,
-                ) >=
-                seuilDistanceMetres;
-        if (deplacementSuffisant) {
-          // Déplacement réel : l'ancre avance MAINTENANT, qu'on pivote ou
-          // non. Sinon elle resterait figée loin derrière et un simple bruit
-          // de cap à l'arrêt (GPS immobile) finirait par dépasser 5 m et
-          // ferait pivoter la carte toute seule.
-          _navDernierePositionRotationContinue = cible;
-          final cibleContinue = normaliserDegre(-capFiltre);
-          final cibleEnCours = _navRotationCible ?? _navRotationCourante;
-          if (deltaRotation(cibleEnCours, cibleContinue).abs() >=
-              _seuilRotationContinueDegres) {
-            _navRotationCible = cibleContinue;
-          }
+          _navRotationDebut = _navRotationCourante;
+          _navRotationDebutTemps = elapsed;
+          _navRotationDureeMs =
+              (_navRotationMsBase + _navRotationMsParDegre * delta.abs()).clamp(
+                _navRotationMsBase,
+                _navRotationMsMax,
+              );
         }
       }
     }
 
-    // Centre de départ : l'état interne lissé, JAMAIS camera.center (qui
-    // contient le décalage écran et provoquerait des oscillations).
-    final depart = _navCentreCourant ?? camera.center;
-    _navCentreCourant = LatLng(
-      depart.latitude + (cible.latitude - depart.latitude) * k,
-      depart.longitude + (cible.longitude - depart.longitude) * k,
-    );
+    // --- Position interpolée ---------------------------------------------
+    final debut = _navDeplacementDebut;
+    final fin = _navDeplacementCible;
+    final debutTemps = _navDeplacementDebutTemps;
+    if (debut != null && fin != null && debutTemps != null) {
+      final t = _navDeplacementDureeMs <= 0
+          ? 1.0
+          : ((elapsed - debutTemps).inMilliseconds / _navDeplacementDureeMs)
+                .clamp(0.0, 1.0);
+      _navCentreCourant = LatLng(
+        debut.latitude + (fin.latitude - debut.latitude) * t,
+        debut.longitude + (fin.longitude - debut.longitude) * t,
+      );
+    } else {
+      // Aucune mesure traitée depuis l'entrée dans le suivi : on rejoint la
+      // cible sans à-coup au fil des frames.
+      final actuel = _navCentreCourant ?? camera.center;
+      _navCentreCourant = LatLng(
+        actuel.latitude + (cible.latitude - actuel.latitude) * k,
+        actuel.longitude + (cible.longitude - actuel.longitude) * k,
+      );
+    }
 
-    // Le point bleu GLISSE avec la caméra : il est posé sur le centre lissé
-    // (et non sur la fix brute, qui le faisait sauter en avant puis refluer
-    // d'un coup quand la caméra le rattrapait). Garde anti-tremblement : on
-    // ne notifie que si le point a réellement bougé d'une trame à l'autre.
+    // Le point bleu GLISSE avec la caméra : il est posé sur la position
+    // interpolée (et non sur la fix brute). Garde anti-tremblement : on ne
+    // notifie que si le point a réellement bougé d'une trame à l'autre.
     final navCourant = _navCentreCourant;
     final pointAffiche = _pointBleuNotifier.value;
     if (navCourant != null &&
@@ -1731,21 +1940,53 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       _pointBleuNotifier.value = navCourant;
     }
 
-    // Lissage du zoom.
+    // Geste en cours : le point bleu vient d'être avancé, mais on ne touche
+    // PAS à la caméra (l'utilisateur en a la main). On resynchronise la
+    // rotation interne sur la valeur affichée et on abandonne toute animation
+    // de rotation en cours, pour ne pas repartir d'un cap calculé avant le
+    // geste au moment de la reprise.
+    if (suiviSuspendu) {
+      _navRotationCourante = camera.rotation;
+      _navRotationCible = null;
+      _navRotationDebutTemps = null;
+      return;
+    }
+
+    // Zoom adaptatif à la vitesse : tant que l'utilisateur n'a pas réglé le
+    // zoom lui-même, le suivi resserre la vue à pied et l'élargit sur voie
+    // rapide (voir [_zoomPourVitesse]). La vitesse est PLAFONNÉE : on ne
+    // roule pas vite en lisant son trajet, une mesure aberrante ne doit pas
+    // élargir la carte comme un vrai déplacement rapide.
+    if (!_navZoomManuel) {
+      _navZoomCible = _zoomPourVitesse(
+        min(mesure.speed, _navVitesseMaxMetresParSeconde),
+      );
+    }
+
+    // Lissage du zoom (seule grandeur encore exponentielle : sa vitesse
+    // n'influe pas sur la lecture du déplacement).
     final zoom = camera.zoom + (_navZoomCible - camera.zoom) * k;
 
-    // Lissage de la rotation vers la cible du dernier recadrage. Facteur
-    // plus doux que la caméra : le pivotement doit rester confortable.
+    // Rotation : animation à durée fixe vers la cible du dernier recadrage,
+    // puis rotation FIGÉE jusqu'au prochain virage confirmé.
     var rotation = _navRotationCourante;
     final cibleRot = _navRotationCible;
-    if (cibleRot != null) {
-      final kRot = 1 - exp(-_navFacteurLissageRotation * dt / 1000);
-      final delta = deltaRotation(rotation, cibleRot);
-      if (delta.abs() > 0.3) {
-        rotation = normaliserDegre(rotation + delta * kRot);
-      } else {
+    final rotationDebutTemps = _navRotationDebutTemps;
+    if (cibleRot != null && rotationDebutTemps != null) {
+      final t = _navRotationDureeMs <= 0
+          ? 1.0
+          : ((elapsed - rotationDebutTemps).inMilliseconds /
+                    _navRotationDureeMs)
+                .clamp(0.0, 1.0);
+      final progression = Curves.easeInOutCubic.transform(t);
+      rotation = normaliserDegre(
+        _navRotationDebut +
+            deltaRotation(_navRotationDebut, cibleRot) * progression,
+      );
+      if (t >= 1.0) {
         rotation = cibleRot;
         _navRotationCible = null;
+        _navRotationDebutTemps = null;
       }
     }
     _navRotationCourante = rotation;
@@ -1790,13 +2031,26 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
         event is MapEventDoubleTapZoomStart) {
       _gestesActifs++;
       _positionDebutGeste ??= _fixActuelleLatLng;
+      // Zoom au DÉBUT du geste : servir de témoin pour reconnaître un vrai
+      // zoom manuel au relâchement (un simple glissement ne change pas le zoom).
+      _navZoomDebutGeste ??= widget.mapController.camera.zoom;
     } else if (event is MapEventMoveEnd ||
         event is MapEventRotateEnd ||
         event is MapEventDoubleTapZoomEnd) {
       if (_gestesActifs > 0) _gestesActifs--;
+      // Zoom modifié pendant le geste : l'utilisateur a choisi son niveau,
+      // le zoom adaptatif à la vitesse ne doit plus y toucher.
+      final zoomGesteDebut = _navZoomDebutGeste;
+      if (zoomGesteDebut != null &&
+          (widget.mapController.camera.zoom - zoomGesteDebut).abs() > 0.05) {
+        _navZoomManuel = true;
+      }
       // Fin de TOUS les gestes en cours (le pincement émet Move ET Rotate) :
       // le suivi reprend ou attend un déplacement selon le mouvement réel.
-      if (_gestesActifs == 0) _finGesteManuel();
+      if (_gestesActifs == 0) {
+        _navZoomDebutGeste = null;
+        _finGesteManuel();
+      }
     }
     // Inertie de lâcher (fling) : après un glissement rapide, flutter_map
     // continue d'animer la caméra sur l'élan. Le suivi doit rester suspendu
@@ -1811,6 +2065,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     // résistance, et reprend au prochain déplacement réel.
     if (widget.modeNavigation && event is MapEventScrollWheelZoom) {
       _suiviEnAttenteMouvement = true;
+      _navZoomManuel = true;
     }
     _journaliserGeste(event);
     // Pendant la navigation, un zoom manuel (pincement, molette, double-tap)
@@ -1821,6 +2076,16 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     if (widget.modeNavigation) {
       _navZoomCible = widget.mapController.camera.zoom;
       _navRotationCourante = widget.mapController.camera.rotation;
+      // Une torsion manuelle annule l'animation de rotation en cours : sans
+      // cela le ticker reprendrait la main et ramènerait la carte vers une
+      // cible calculée AVANT le geste, en opposition avec le doigt.
+      _navRotationCible = null;
+      _navRotationDebutTemps = null;
+      // La référence angulaire suit la rotation choisie par l'utilisateur :
+      // la carte ne repivote pas immédiatement pour revenir à l'ancien cap.
+      _orientationNav.reinitialiser(
+        rotationInitialeDegres: widget.mapController.camera.rotation,
+      );
     }
     if (event is MapEventMove) {
       _surZoomChange();
@@ -1879,7 +2144,18 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   Future<void> _chargerPois() async {
     if (!_fmtcReady || !mounted) return;
     if (widget.suspendreTravailCarte) return;
-    if (CircuitBreakerPois.ouvert) return;
+    if (CircuitBreakerPois.ouvert) {
+      // Disjoncteur ouvert : on ne martèle pas Overpass, mais on reprogramme
+      // une tentative pour la fin du délai. Sinon les badges restaient absents
+      // jusqu'au prochain déplacement de la carte.
+      _debouncePois?.cancel();
+      final delai =
+          CircuitBreakerPois.tempsRestant + const Duration(milliseconds: 500);
+      _debouncePois = Timer(delai, () {
+        if (mounted) unawaited(_chargerPois());
+      });
+      return;
+    }
 
     final camera = widget.mapController.camera;
     if (camera.zoom < zoomMinPois) {
@@ -1914,7 +2190,8 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       }
     } catch (e) {
       debugPrint('[KinFlow] Erreur chargement POI: $e');
-      CircuitBreakerPois.enregistrerEchec();
+      // L'échec est déjà compté UNE fois par `telechargerPois` (et non par
+      // miroir) : compter aussi ici ouvrait le disjoncteur deux fois plus vite.
       _debouncePois?.cancel();
       // Repli exponentiel (5 s, 15 s, 35 s, 75 s… plafonné à 120 s) : quand
       // Overpass souffre, on espace les tentatives au lieu de marteler.
@@ -1931,8 +2208,8 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     if (!_carteRendue) return;
     final zoom = widget.mapController.camera.zoom;
     // La signature embarque aussi la visibilité des badges ancrés des lieux
-    // personnels : elle change dès qu'un badge de maison/travail franchit le
-    // seuil [_zoomMinLieuxPersonnels], même si les tableaux de POIs, eux, ne
+    // personnels : elle change dès qu'un badge de travail franchit le seuil
+    // [_zoomMinLieuxPersonnels], même si les tableaux de POIs, eux, ne
     // bougent pas. Sans cela, le marqueur resterait figé jusqu'au prochain
     // changement de seuil POI.
     final signature =
@@ -2014,7 +2291,26 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     return visibles;
   }
 
-  Future<void> _chargerRoutes() async {
+  Future<void> _chargerRoutes() {
+    final enCours = _chargementRoutesEnCours;
+    if (enCours != null) {
+      _routesARelancer = true;
+      return enCours;
+    }
+    final futur = _chargerRoutesImpl();
+    _chargementRoutesEnCours = futur;
+    return futur.whenComplete(() {
+      if (identical(_chargementRoutesEnCours, futur)) {
+        _chargementRoutesEnCours = null;
+      }
+      if (_routesARelancer && mounted) {
+        _routesARelancer = false;
+        unawaited(_chargerRoutes());
+      }
+    });
+  }
+
+  Future<void> _chargerRoutesImpl() async {
     if (!_fmtcReady || !mounted) return;
     if (widget.suspendreTravailCarte) return;
 
@@ -2054,6 +2350,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       if (!mounted) return;
 
       _tentativesRoutes = 0;
+      _suspensionRoutesSignalee = false;
       _segmentsCache[_cleSegments(rond, detailsComplets)] = _SegmentsParZone(
         segments,
         rond,
@@ -2067,6 +2364,12 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
         'zoom': camera.zoom,
         'details_complets': detailsComplets,
       });
+      // Overpass a répondu mais sans aucun segment (zone hors couverture,
+      // réponse vide…) : même repli que sur échec, sinon la carte resterait
+      // incolore alors que le réseau embarqué a de quoi la colorer.
+      if (segments.isEmpty) {
+        await _dessinerReseauEmbarque(rond, detailsComplets);
+      }
       _reconstruirePolylignes();
     } catch (e) {
       debugPrint('[KinFlow] Erreur chargement routes: $e');
@@ -2074,15 +2377,24 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       // secours pendant 30 s à 240 s), pas une erreur. Le repli exponentiel
       // ci-dessous relancera tout seul à la fin de la pause.
       if (RoadService.disjoncteurOuvert) {
-        Journal.a(
-          'CARTE',
-          'Chargement des routes suspendu : disjoncteur Overpass ouvert',
-        );
+        if (!_suspensionRoutesSignalee) {
+          _suspensionRoutesSignalee = true;
+          Journal.a(
+            'CARTE',
+            'Chargement des routes suspendu : disjoncteur Overpass ouvert',
+          );
+        }
       } else {
         Journal.e('CARTE', 'Chargement des routes pour la carte échoué', {
           'erreur': '$e',
         });
       }
+      // Repli HORS-LIGNE : Overpass saturé (502) ou injoignable ne doit plus
+      // laisser la carte sans aucune couleur. Le réseau routier embarqué
+      // (`assets/kinflow_routes.bin`) couvre Kinshasa : on dessine ce qu'il
+      // contient, et les vraies données le remplaceront dès qu'une requête
+      // aboutira (la clé de cache est la même).
+      await _dessinerReseauEmbarque(rond, detailsComplets);
       _reconstruirePolylignes();
       _debounceRoutes?.cancel();
       // Repli exponentiel : 5 s, 15 s, 35 s, 75 s… plafonné à 120 s. Tant que
@@ -2097,8 +2409,44 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     }
   }
 
+  /// Dessine les lignes de trafic depuis le réseau routier EMBARQUÉ
+  /// (`assets/kinflow_routes.bin`) quand Overpass ne répond pas.
+  ///
+  /// Sans cela, une saturation d'Overpass (HTTP 502, très fréquente) laissait
+  /// la carte totalement incolore : le fond s'affichait, mais aucune rue
+  /// colorée. Le graphe embarqué ne contient pas tous les détails d'Overpass ;
+  /// c'est un repli visuel, remplacé automatiquement par les vraies données
+  /// dès qu'une requête aboutit (même clé de cache).
+  Future<void> _dessinerReseauEmbarque(
+    LatLngBounds zone,
+    bool detailsComplets,
+  ) async {
+    final cle = _cleSegments(zone, detailsComplets);
+    // Une zone déjà dessinée (même par ce repli) n'est pas recalculée ; une
+    // zone vide, en revanche, peut être remplie par le réseau embarqué.
+    final existant = _segmentsCache[cle];
+    if (existant != null && existant.segments.isNotEmpty) return;
+    // Même zone déjà en cours de repli : un appel concurrent (panning + timer)
+    // produisait plusieurs dessins et plusieurs lignes de journal identiques.
+    if (!_repliEmbarqueEnCours.add(cle)) return;
+    try {
+      final segments = await OfflineRoutes.segmentsPourAffichage(zone);
+      if (!mounted || segments.isEmpty) return;
+      _segmentsCache[cle] = _SegmentsParZone(segments, zone, detailsComplets);
+      while (_segmentsCache.length > 40) {
+        _segmentsCache.remove(_segmentsCache.keys.first);
+      }
+      Journal.a('CARTE', 'Réseau embarqué affiché (Overpass indisponible)', {
+        'segments': segments.length,
+      });
+    } catch (e) {
+      debugPrint('[KinFlow] Repli réseau embarqué impossible: $e');
+    } finally {
+      _repliEmbarqueEnCours.remove(cle);
+    }
+  }
+
   /// Charge dans le cache local les segments traversés par l'itinéraire
-  /// (le couloir bleu → vert), avec la même finesse que le moteur de calcul :
   /// court trajet → toutes classes de rues, longue distance → grands axes.
   /// Les zones déjà servies par [RoadService] (cache mémoire/disque partagé)
   /// ne déclenchent AUCUN téléchargement : disponible quasi instantanément.
@@ -2539,9 +2887,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   Marker _marqueurAmi(AmiPosition ami) {
     return Marker(
       point: ami.position,
-      width: 120,
-      height: 92,
-      alignment: const Alignment(0, 0.59),
+      width: 130,
+      height: 104,
+      alignment: const Alignment(0, 0.57),
       // Contre-rotation : le pin reste droit quand la carte pivote.
       rotate: true,
       child: _MarqueurAmi(ami: ami),
@@ -2836,25 +3184,50 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   String get _urlDuMode => _urlPourMode(_modeCarte);
 
   String _urlPourMode(_ModeCarte mode) => switch (mode) {
-    _ModeCarte.sombre => _urlTuilesSombre,
-    _ModeCarte.satellite => _urlTuilesSatellite,
-    _ModeCarte.claire => _urlTuiles,
-    _ModeCarte.positron => _urlTuilesPositron,
-    _ModeCarte.darkMatter => _urlTuilesDarkMatter,
-    _ModeCarte.voyager => _urlTuilesVoyager,
-    _ModeCarte.topo => _urlTuilesTopo,
+    _ModeCarte.claire => CarteConfig.urlFondClair,
+    _ModeCarte.sombre => CarteConfig.urlFondSombre,
+    _ModeCarte.satellite => CarteConfig.urlPourStyle(
+      CarteConfig.styleSatellite,
+      _urlTuilesSatellite,
+    ),
+    _ModeCarte.positron => CarteConfig.urlPourStyle(
+      CarteConfig.styleMinimal,
+      _urlTuilesPositron,
+    ),
+    _ModeCarte.darkMatter => CarteConfig.urlPourStyle(
+      CarteConfig.styleMinimalSombre,
+      _urlTuilesDarkMatter,
+    ),
+    _ModeCarte.voyager => CarteConfig.urlPourStyle(
+      CarteConfig.styleVif,
+      _urlTuilesVoyager,
+    ),
+    _ModeCarte.topo => CarteConfig.urlPourStyle(
+      CarteConfig.styleTopo,
+      _urlTuilesTopo,
+    ),
   };
 
   /// Identifiant court et stable d'une famille de fond : deux modes qui
   /// partagent exactement les mêmes tuiles doivent renvoyer la même famille
-  /// (c'est le cas de « claire » et « sombre », tous deux en OSM).
+  /// (c'est le cas de « claire » et « sombre » sans MapTiler, tous deux en
+  /// OSM). Avec MapTiler, chaque style a son propre cache : une famille par
+  /// style, sinon les tuiles d'un fond seraient servies pour un autre.
   String _familleFond(_ModeCarte mode) => switch (mode) {
-    _ModeCarte.claire || _ModeCarte.sombre => 'osm',
-    _ModeCarte.satellite => 'esri-satellite',
-    _ModeCarte.positron => 'carto-positron',
-    _ModeCarte.darkMatter => 'carto-dark-matter',
-    _ModeCarte.voyager => 'carto-voyager',
-    _ModeCarte.topo => 'opentopomap',
+    _ModeCarte.claire => CarteConfig.mapTilerActif ? 'maptiler-clair' : 'osm',
+    _ModeCarte.sombre => CarteConfig.mapTilerActif ? 'maptiler-sombre' : 'osm',
+    _ModeCarte.satellite =>
+      CarteConfig.mapTilerActif ? 'maptiler-satellite' : 'esri-satellite',
+    _ModeCarte.positron =>
+      CarteConfig.mapTilerActif ? 'maptiler-minimal' : 'carto-positron',
+    _ModeCarte.darkMatter =>
+      CarteConfig.mapTilerActif
+          ? 'maptiler-minimal-sombre'
+          : 'carto-dark-matter',
+    _ModeCarte.voyager =>
+      CarteConfig.mapTilerActif ? 'maptiler-vif' : 'carto-voyager',
+    _ModeCarte.topo =>
+      CarteConfig.mapTilerActif ? 'maptiler-topo' : 'opentopomap',
   };
 
   /// Fournisseur de tuiles pour le mode demandé. Un fournisseur FMTC DISTINCT
@@ -2940,9 +3313,10 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
             ),
           );
         }
-        // En mode sombre, on désature les tuiles OSM et on les assombrit
-        // pour obtenir un fond gris foncé / noir.
-        if (_modeCarte == _ModeCarte.sombre) {
+        // En mode sombre SANS MapTiler, on désature les tuiles OSM et on les
+        // assombrit pour obtenir un fond gris foncé / noir. Avec MapTiler, le
+        // style `-dark` est déjà nuit : appliquer le filtre le noierait.
+        if (_modeCarte == _ModeCarte.sombre && !CarteConfig.mapTilerActif) {
           return ColorFiltered(
             colorFilter: const ColorFilter.matrix([
               0.2126,
@@ -3015,18 +3389,36 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// Épingle classique (punaise) : la même que la prévisualisation et le
   /// bouton « Épingler ». Sa pointe en bas sert d'ancre géographique.
   Widget _construireEpingle() {
-    return const Icon(
-      Icons.push_pin,
-      size: 34,
-      color: _couleurEpinglette,
-    );
+    return const Icon(Icons.push_pin, size: 34, color: _couleurEpinglette);
   }
 
   /// Icône de localisation standard (« goutte d'eau ») : le symbole habituel
-  /// de position sur les téléphones. Utilisée pour la position de l'utilisateur
-  /// et le lieu recherché.
+  /// d'un LIEU sur les téléphones (destination, lieu recherché). Ce n'est pas
+  /// le point de position de l'utilisateur : voir [_PointBleu].
   Widget _construireGoutte(Color couleur) {
     return Icon(Icons.location_on, size: 46, color: couleur);
+  }
+
+  /// Précision GPS (mètres) en dessous de laquelle le halo de précision est
+  /// masqué : à cette échelle, le cercle serait plus petit que le point bleu
+  /// lui-même et n'apporterait aucune information.
+  static const double _precisionMinHaloMetres = 8.0;
+
+  /// Halo de précision GPS : un disque bleu translucide à l'échelle réelle
+  /// (rayon = `accuracy`, donc il grandit en zoomant) cerclé d'un liseré un
+  /// peu plus marqué. Même langage visuel que Google Maps / Apple Plans.
+  CircleMarker _cerclePrecision(Position pos, {LatLng? centre}) {
+    // Plafond : une fix à 1 km de précision (sortie de tunnel, GPS froid)
+    // couvrirait toute la ville et masquerait la carte.
+    final rayon = pos.accuracy.clamp(_precisionMinHaloMetres, 250.0);
+    return CircleMarker(
+      point: centre ?? LatLng(pos.latitude, pos.longitude),
+      radius: rayon,
+      useRadiusInMeter: true,
+      color: const Color(0x1A1A73E8),
+      borderColor: const Color(0x401A73E8),
+      borderStrokeWidth: 1.0,
+    );
   }
 
   /// Étape « Ajouter à l'itinéraire » : un pin ambre numéroté de son rang dans
@@ -3044,37 +3436,32 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// rester bien visible au centre pendant qu'on vise le point.
   static const double _taillePoseLieu = 40;
 
-  /// Zoom en dessous duquel les badges ancrés des lieux personnels (maison,
-  /// travail) disparaissent de la carte. Fortement dézoomés, ces petits repères
+  /// Zoom en dessous duquel les badges ancrés des lieux personnels
+  /// disparaissent de la carte. Fortement dézoomés, ces petits repères
   /// individuels n'ont plus leur place à l'échelle de la ville et ne feraient
   /// qu'encombrer la vue. Aligné sur le seuil d'apparition des POIs
   /// ([zoomMinPois]) : badges et POIs réagissent au même niveau, la transition
   /// est visuellement cohérente. Masquer aussi le badge épinglé en cours de
-  /// destination (maison/travail) relève d'un choix produit différent — ici on
-  /// ne masque que les deux badges ancrés.
+  /// destination relève d'un choix produit différent — ici on ne masque que
+  /// le badge ancré.
   static const double _zoomMinLieuxPersonnels = 14.0;
 
-  /// Vrai quand les badges ancrés des lieux personnels (maison, travail)
-  /// restent visibles au zoom donné. En dessous de [_zoomMinLieuxPersonnels]
-  /// (dézoom prononcé), ils sont masqués, exactement comme les POIs autour du
-  /// même seuil.
+  /// Vrai quand le badge ancré du lieu de travail reste visible au zoom
+  /// donné. En dessous de [_zoomMinLieuxPersonnels] (dézoom prononcé), il est
+  /// masqué, exactement comme les POIs autour du même seuil.
   bool _lieuxPersonnelsVisibles(double zoom) => zoom >= _zoomMinLieuxPersonnels;
 
   /// Vert de la famille POI, commun à tous les badges de lieu personnel.
   static const Color _vertLieuPersonnel = Color(0xFF00B050);
 
-  /// Icône qui distingue les deux lieux personnels : la maison et le travail
-  /// partagent EXACTEMENT le même badge, seul ce pictogramme change.
-  static IconData _iconeLieuPersonnel(TypeLieuPose type) =>
-      type == TypeLieuPose.maison ? Icons.home : Icons.work;
+  /// Icône du lieu de travail posé sur la carte.
+  static IconData _iconeLieuPersonnel(TypeLieuPose _) => Icons.work;
 
-  /// Badge d'un lieu personnel (maison ou travail) : le même badge que les
-  /// POIs — pastille blanche bordée de vert, icône verte — avec un faible
-  /// encombrement sur la carte. Il sert à la fois de prévisualisation pendant
-  /// la pose, de domicile posé et de lieu de travail posé ; [icone] est le SEUL
-  /// élément qui distingue la maison du travail. [taille] : la pose de lieu
-  /// emploie la version agrandie [_taillePoseLieu] pour rester visible au
-  /// centre.
+  /// Badge d'un lieu personnel : le même badge que les POIs — pastille
+  /// blanche bordée de vert, icône verte — avec un faible encombrement sur la
+  /// carte. Il sert à la fois de prévisualisation pendant la pose et de lieu
+  /// de travail posé. [taille] : la pose de lieu emploie la version agrandie
+  /// [_taillePoseLieu] pour rester visible au centre.
   Widget _construireBadgeLieu(IconData icone, {double taille = 30}) {
     return Container(
       width: taille,
@@ -3091,8 +3478,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
     );
   }
 
-  /// Badge d'un [type] de lieu personnel (maison ou travail) à la [taille]
-  /// demandée : même code pour les deux, seul le pictogramme diffère.
+  /// Badge du lieu de travail à la [taille] demandée.
   Widget _construireLieu(TypeLieuPose type, {double taille = 30}) =>
       _construireBadgeLieu(_iconeLieuPersonnel(type), taille: taille);
 
@@ -3103,15 +3489,10 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   /// recalée sur la chaussée à côté du bâtiment où le badge est ancré.
   static const double _seuilCoincidenceLieuM = 50;
 
-  /// Si [point] tombe (à [_seuilCoincidenceLieuM] près) sur la maison ou le
-  /// lieu de travail enregistré, renvoie son type — autrement null.
+  /// Si [point] tombe (à [_seuilCoincidenceLieuM] près) sur le lieu de
+  /// travail enregistré, renvoie son type — autrement null.
   TypeLieuPose? _typeLieuPersonnel(LatLng? point) {
     if (point == null) return null;
-    final maison = widget.pointMaison;
-    if (maison != null &&
-        distanceMetresHaversine(maison, point) < _seuilCoincidenceLieuM) {
-      return TypeLieuPose.maison;
-    }
     final travail = widget.pointTravail;
     if (travail != null &&
         distanceMetresHaversine(travail, point) < _seuilCoincidenceLieuM) {
@@ -3126,8 +3507,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
       _typeLieuPersonnel(widget.pointDestination ?? widget.lieuRecherche);
 
   /// Marqueur d'une destination (itinéraire ou lieu recherché) : son BADGE
-  /// rond si le point est une maison ou le lieu de travail, sinon le pin vert
-  /// habituel.
+  /// rond si le point est le lieu de travail, sinon le pin vert habituel.
   Widget _construireMarqueurDestination(LatLng point) {
     final type = _typeLieuPersonnel(point);
     return type == null
@@ -3371,6 +3751,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
                 // reste la cible du suivi.
                 _longPressDezoomActif = false;
                 _navZoomCible = widget.mapController.camera.zoom;
+                // Dézoom volontaire : le niveau choisi est respecté jusqu'à la
+                // fin de la session, le zoom adaptatif ne le reprend pas.
+                _navZoomManuel = true;
                 _suiviEnAttenteMouvement = true;
               }
             },
@@ -3384,6 +3767,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
               // navigation suspendu indéfiniment.
               if (_departsPointeurs.isEmpty && _gestesActifs > 0) {
                 _gestesActifs = 0;
+                _navZoomDebutGeste = null;
                 _finGesteManuel();
               }
             },
@@ -3393,26 +3777,25 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
               _annulerSansTap();
               if (_departsPointeurs.isEmpty && _gestesActifs > 0) {
                 _gestesActifs = 0;
+                _navZoomDebutGeste = null;
                 _finGesteManuel();
               }
             },
             child: FlutterMap(
               mapController: widget.mapController,
-
               options: MapOptions(
                 initialCenter: const LatLng(-4.325, 15.322),
-
-                initialZoom: 13,
-
+                // Zoom d'ouverture calé sur [zoomMinPois] : les badges des
+                // lieux (POIs) sont visibles dès l'affichage de la carte, au
+                // lieu d'un premier écran vide où il fallait zoomer à la main
+                // pour les faire apparaître.
+                initialZoom: 14,
                 onMapEvent: _surEvenementCarte,
-
                 interactionOptions: const InteractionOptions(
                   scrollWheelVelocity: 0.015,
-
                   pinchZoomThreshold: 0.15,
                 ),
               ),
-
               children: [
                 _tuileDeBase(_modeCarte),
 
@@ -3437,6 +3820,32 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
                   valueListenable: _pointBleuNotifier,
                   builder: (context, pointBleu, _) => Stack(
                     children: [
+                      // Halo de précision GPS, sous le point et sous les
+                      // raccords : la convention des grandes applis de
+                      // géolocalisation. Il rend l'information « le GPS hésite
+                      // de X mètres » lisible d'un coup d'œil, au lieu de
+                      // laisser croire à une précision au mètre près. Il suit
+                      // le point bleu LISSÉ (et non la fix brute) pour rester
+                      // parfaitement concentrique au disque. Masqué quand la
+                      // précision est déjà excellente (< 8 m) : le halo serait
+                      // un simple cerclage du point.
+                      if (widget.positionActuelle != null &&
+                          widget.positionActuelle!.accuracy >=
+                              _precisionMinHaloMetres)
+                        CircleLayer(
+                          circles: [
+                            _cerclePrecision(
+                              widget.positionActuelle!,
+                              centre:
+                                  pointBleu ??
+                                  LatLng(
+                                    widget.positionActuelle!.latitude,
+                                    widget.positionActuelle!.longitude,
+                                  ),
+                            ),
+                          ],
+                        ),
+
                       // Pointillés de départ : ancrés au point bleu vivant,
                       // au-dessus du tracé pour rester visibles même si le pin
                       // s'intersecte avec l'itinéraire.
@@ -3451,6 +3860,11 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
                           // destinations, pour ne jamais masquer le guidage.
                           for (final ami in widget.amis) _marqueurAmi(ami),
 
+                          // Pin bleu « position de l'utilisateur » : la même
+                          // goutte que le pin vert des ami(e)s, en bleu. Sa
+                          // POINTE est ancrée sur la coordonnée (voir
+                          // [_PointBleu.ancrage]) pour ne pas décaler la
+                          // position affichée.
                           // Ordre de peinture = ordre d'empilement : ce marqueur
                           // est AVANT tous les marqueurs de destination (vert,
                           // épingle), il passe donc toujours EN DESSOUS d'eux
@@ -3464,8 +3878,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
                                         widget.positionActuelle!.latitude,
                                         widget.positionActuelle!.longitude,
                                       )),
-                              width: 50,
-                              height: 50,
+                              width: _PointBleu.taille,
+                              height: _PointBleu.taille,
+                              alignment: _PointBleu.ancrage,
                               // Contre-rotation : le marqueur reste visuellement
                               // droit pendant la rotation de la carte, sans gêner
                               // son déplacement qui suit la position GPS.
@@ -3473,17 +3888,15 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
                               // Isolé dans un RepaintBoundary : le point bleu ne
                               // se recolle plus en copie fantôme au-dessus/en
                               // dessous de lui-même quand la caméra pivote et
-                              // zoome en même temps pendant la pose maison/travail
+                              // zoome en même temps pendant la pose du travail
                               // (doublon visible sur le rendu Web).
-                              child: RepaintBoundary(
-                                child: _construireGoutte(Colors.blueAccent),
-                              ),
+                              child: const RepaintBoundary(child: _PointBleu()),
                             ),
 
-                          // Lieu recherché : BADGE du lieu personnel si c'est la maison
-                          // ou le travail, sinon le pin vert habituel. Quand la
-                          // destination de l'itinéraire occupe déjà le même point, seul
-                          // son marqueur est dessiné (pas de doublon).
+                          // Lieu recherché : BADGE du lieu de travail si c'en est
+                          // un, sinon le pin vert habituel. Quand la destination de
+                          // l'itinéraire occupe déjà le même point, seul son
+                          // marqueur est dessiné (pas de doublon).
                           if (widget.lieuRecherche != null &&
                               !_coincide(
                                 widget.lieuRecherche,
@@ -3506,18 +3919,14 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
 
                           // Destination de l'itinéraire : son marqueur vert reste en
                           // place même quand un autre lieu est ensuite recherché. Si la
-                          // destination est la maison ou le travail, c'est leur BADGE
-                          // rond (icône domicile/mallette) qui s'affiche, pas un pin.
+                          // destination est le lieu de travail, c'est son BADGE rond
+                          // (icône mallette) qui s'affiche, pas un pin.
                           if (widget.pointDestination != null)
                             Marker(
                               point: widget.pointDestination!,
-
                               width: 50,
-
                               height: 50,
-
                               rotate: true,
-
                               child: _construireMarqueurDestination(
                                 widget.pointDestination!,
                               ),
@@ -3535,39 +3944,17 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
                               child: _construireEtape(i + 1),
                             ),
 
-                          // Lieux personnels posés (domicile, travail) : leurs icônes restent
-                          // ancrées sur ces lieux, collées à la carte (elles suivent les
-                          // déplacements et rotations), tant que l'utilisateur ne les
-                          // change ou ne les supprime pas. Masquées pendant une nouvelle
-                          // pose, remplacées par l'icône de prévisualisation au centre.
-                          // Leur TAILLE suit le zoom ([_BadgeAncrageZoom] lit la caméra) :
-                          // gros en zoom in, petit puis invisible en zoom out.
-                          if (widget.pointMaison != null &&
-                              _poseLieuActif != TypeLieuPose.maison &&
-                              _typeLieuDestination != TypeLieuPose.maison)
-                            Marker(
-                              key: const ValueKey('badge_maison'),
-                              point: widget.pointMaison!,
-                              width: _BadgeAncrageZoom.tailleBoite,
-                              height: _BadgeAncrageZoom.tailleBoite,
-                              // Reste droit pendant la rotation de la carte.
-                              rotate: true,
-                              // Le badge change de taille à chaque
-                              // mouvement/zoom de caméra. Isolé dans un
-                              // RepaintBoundary, il ne laisse plus filer de
-                              // copie fantôme décalée au-dessus/en dessous
-                              // pendant l'animation de pose (doublon Web).
-                              child: RepaintBoundary(
-                                child: _BadgeAncrageZoom(
-                                  construire: (taille) => _construireLieu(
-                                    TypeLieuPose.maison,
-                                    taille: taille,
-                                  ),
-                                ),
-                              ),
-                            ),
-
+                          // Lieu de travail posé : son icône reste ancrée sur ce
+                          // lieu, collée à la carte (elle suit les déplacements et
+                          // rotations), tant que l'utilisateur ne le change ou ne le
+                          // supprime pas. Masquée pendant une nouvelle pose,
+                          // remplacée par l'icône de prévisualisation au centre.
+                          // Sa TAILLE suit le zoom ([_BadgeAncrageZoom] lit la caméra) :
+                          // grosse en zoom in, petite puis invisible en zoom out.
                           if (widget.pointTravail != null &&
+                              _lieuxPersonnelsVisibles(
+                                widget.mapController.camera.zoom,
+                              ) &&
                               _poseLieuActif != TypeLieuPose.travail &&
                               _typeLieuDestination != TypeLieuPose.travail)
                             Marker(
@@ -3644,34 +4031,26 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
 
                               child: Transform.translate(
                                 offset: Offset(decalageBoutons!, 40),
-
                                 child: BoutonsActions(
                                   onDefinirItineraire:
                                       widget.desactiverItineraire
                                       ? null
                                       : widget.onDefinirItineraire,
-
                                   libelleDefinirItineraire:
                                       widget.libelleActionPrincipale,
-
                                   onSupprimer: widget.onSupprimer,
-
                                   onVoirDetails: widget.onVoirDetails,
-
                                   afficherDefinirItineraire:
                                       !widget.seulementSupprimer,
-
                                   onInteractionStart: () {
                                     _appuiBoutonAction = true;
                                   },
-
                                   onInteractionEnd: () {
                                     _appuiBoutonAction = false;
                                   },
                                 ),
                               ),
                             ),
-
                         ],
                       ),
                     ],
@@ -3722,7 +4101,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
               children: [
                 // Icône de prévisualisation au centre de l'écran : elle ne
                 // capte aucun toucher — la carte reste libre à pivoter et à
-                // se déplacer dessous pour viser le lieu (maison ou travail).
+                // se déplacer dessous pour viser le lieu de travail.
                 // Elle change de TAILLE à chaque mouvement/zoom de caméra,
                 // comme les badges. Isolée dans un RepaintBoundary, elle ne
                 // laisse plus filer de copie fantôme décalée au-dessus/en
@@ -3789,7 +4168,28 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
             ),
           ),
 
-        if (_fmtcReady && _modeCarte == _ModeCarte.satellite)
+        // Attribution unique : tous les fonds passent par MapTiler dès qu'une
+        // clé est configurée (obligation des conditions d'utilisation).
+        if (_fmtcReady && CarteConfig.mapTilerActif)
+          Positioned(
+            top: 8,
+            left: 8,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.85),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Text(
+                '© MapTiler © OpenStreetMap',
+                style: TextStyle(fontSize: 9, color: Colors.black87),
+              ),
+            ),
+          ),
+
+        if (_fmtcReady &&
+            !CarteConfig.mapTilerActif &&
+            _modeCarte == _ModeCarte.satellite)
           Positioned(
             top: 8,
             left: 8,
@@ -3807,6 +4207,7 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
           ),
 
         if (_fmtcReady &&
+            !CarteConfig.mapTilerActif &&
             (_modeCarte == _ModeCarte.positron ||
                 _modeCarte == _ModeCarte.darkMatter))
           Positioned(
@@ -3825,7 +4226,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
             ),
           ),
 
-        if (_fmtcReady && _modeCarte == _ModeCarte.voyager)
+        if (_fmtcReady &&
+            !CarteConfig.mapTilerActif &&
+            _modeCarte == _ModeCarte.voyager)
           Positioned(
             top: 8,
             left: 8,
@@ -3842,7 +4245,9 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
             ),
           ),
 
-        if (_fmtcReady && _modeCarte == _ModeCarte.topo)
+        if (_fmtcReady &&
+            !CarteConfig.mapTilerActif &&
+            _modeCarte == _ModeCarte.topo)
           Positioned(
             top: 8,
             left: 8,
@@ -3929,16 +4334,17 @@ class _TrafficMapState extends State<TrafficMap> with TickerProviderStateMixin {
   }
 }
 
-/// Badge maison/travail ANCRÉ à taille SUIVANT LE ZOOM : il lit la caméra dans
+/// Badge du lieu de travail ANCRÉ à taille SUIVANT LE ZOOM : il lit la caméra dans
 /// son build ([MapCamera.of], fournie par le modèle hérité de FlutterMap), donc
 /// il est reconstruit à chaque changement de zoom/déplacement/rotation de la
-/// carte. Sa taille à l'écran suit ainsi le zoom — gros quand on zoome,
-/// minuscule puis INVISIBLE quand on dézoome — au lieu d'une grosse icône
-/// figée qui reste plantée sur la carte même en dézoom maximal.
+/// carte. Sa taille à l'écran suit ainsi le zoom — gros quand on zoome, mais
+/// jamais sous [tailleMinVisible] — au lieu d'une grosse icône figée qui reste
+/// plantée sur la carte même en dézoom maximal. Le badge n'est construit que
+/// lorsque le zoom atteint [zoomMinPois] (voir `_lieuxPersonnelsVisibles`).
 class _BadgeAncrageZoom extends StatelessWidget {
   const _BadgeAncrageZoom({required this.construire});
 
-  /// Fabrique le badge voulu (maison ou travail) à la taille demandée.
+  /// Fabrique le badge du lieu de travail à la taille demandée.
   final Widget Function(double taille) construire;
 
   /// Zoom de référence : à ce niveau le badge affiche sa [tailleBase].
@@ -3947,9 +4353,11 @@ class _BadgeAncrageZoom extends StatelessWidget {
   /// Taille du badge au zoom de référence (px, gabarit POI actuel).
   static const double tailleBase = 30;
 
-  /// Sous cette taille à l'écran (px) le badge disparaît complètement : le
-  /// dézoom fait « petit petit jusqu'à disparaître ».
-  static const double tailleMinVisible = 7;
+  /// Taille minimale à l'écran (px) une fois le badge affiché. Il ne rétrécit
+  /// plus jusqu'à devenir illisible : sans ce plancher, le badge du travail
+  /// mesurait moins de 7 px (donc invisible) à tous les zooms inférieurs à
+  /// ~15, alors que les POIs, eux, apparaissent dès [zoomMinPois] (14).
+  static const double tailleMinVisible = 22;
 
   /// Taille maximale (px) : le badge ne devient pas absurde en très fort zoom.
   static const double tailleMax = 72;
@@ -3962,17 +4370,59 @@ class _BadgeAncrageZoom extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final taille = _taillePourZoom(MapCamera.of(context).zoom);
-    if (taille <= 0) return const SizedBox.shrink();
     return Align(alignment: Alignment.center, child: construire(taille));
   }
 
   /// Taille d'affichage pour un zoom donné : double à chaque niveau de zoom
-  /// au-dessus de [zoomReference], réduite de moitié en dessous, 0 (invisible)
-  /// sous [tailleMinVisible].
+  /// au-dessus de [zoomReference], réduite de moitié en dessous, mais jamais
+  /// sous [tailleMinVisible] (le badge reste lisible tant qu'il est affiché).
   static double _taillePourZoom(double zoom) {
     final taille = tailleBase * pow(2, zoom - zoomReference);
-    if (taille < tailleMinVisible) return 0;
-    return min(taille, tailleMax);
+    return taille.clamp(tailleMinVisible, tailleMax);
+  }
+}
+
+/// Pin bleu de la position de l'utilisateur : la même goutte `location_on`
+/// que le pin vert des ami(e)s (même gabarit, même ombre portée), simplement
+/// en bleu — le repère « position » habituel des téléphones.
+///
+/// La POINTE du pin tombe exactement sur la coordonnée GPS. Le dessin
+/// Material s'arrête à 22/24 de la hauteur de l'icône (2 unités de marge en
+/// haut et en bas) : [ancrage] compense cette marge pour que la boîte du
+/// marqueur place la pointe — et non le centre — sur le point géographique.
+/// Sans ce réglage, le pin flotte ~4 px au-dessus de la vraie position.
+class _PointBleu extends StatelessWidget {
+  const _PointBleu();
+
+  /// Bleu « position », conservé de l'ancien repère pour rester reconnaissable.
+  static const Color _bleu = Colors.blueAccent;
+
+  /// Taille de l'icône (px écran), alignée sur la goutte des lieux recherchés
+  /// pour que les deux pins aient le même gabarit.
+  static const double taille = 46;
+
+  /// Fraction de la hauteur de l'icône où se trouve la pointe du dessin.
+  static const double _hauteurPointe = 22 / 24;
+
+  /// Alignement à passer au [Marker] : `bottom`, c'est-à-dire la hauteur de
+  /// boîte située sous le point, doit valoir la hauteur de la pointe.
+  /// `y = 1 - 2 * hauteurPointe`.
+  static Alignment get ancrage => Alignment(0, 1 - 2 * _hauteurPointe);
+
+  @override
+  Widget build(BuildContext context) {
+    return const SizedBox(
+      width: taille,
+      height: taille,
+      child: Icon(
+        Icons.location_on,
+        size: taille,
+        color: _bleu,
+        shadows: [
+          Shadow(color: Colors.black38, blurRadius: 4, offset: Offset(0, 1)),
+        ],
+      ),
+    );
   }
 }
 
@@ -4016,14 +4466,14 @@ class _MarqueurAmi extends StatelessWidget {
                   ],
                 ),
                 Positioned(
-                  top: 7,
+                  top: 5,
                   child: Container(
                     padding: const EdgeInsets.all(1),
                     decoration: const BoxDecoration(
                       color: Colors.white,
                       shape: BoxShape.circle,
                     ),
-                    child: AvatarAnimalWidget(taille: 26, avatarId: ami.avatar),
+                    child: AvatarAnimalWidget(taille: 30, avatarId: ami.avatar),
                   ),
                 ),
               ],
@@ -4046,44 +4496,6 @@ class _MarqueurAmi extends StatelessWidget {
               ),
             ),
           ),
-          // Âge de la dernière position enregistrée : visible même quand le
-          // téléphone de l'ami(e) est éteint (position « figée » côté serveur).
-          if (ami.majA != null) ...[
-            const SizedBox(height: 2),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(8),
-                boxShadow: const [
-                  BoxShadow(
-                    color: Colors.black26,
-                    blurRadius: 3,
-                    offset: Offset(0, 1),
-                  ),
-                ],
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.schedule, size: 10, color: _vert),
-                  const SizedBox(width: 3),
-                  Flexible(
-                    child: Text(
-                      tempsRelatif(ami.majA!),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w600,
-                        color: _vert,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
         ],
       ),
     );

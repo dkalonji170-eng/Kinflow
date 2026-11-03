@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import 'notifications_screen.dart';
 import '../theme/theme_provider.dart';
 import 'about_screen.dart';
+import 'compte_screen.dart';
 import 'help_screen.dart';
 import '../services/diagnostics_service.dart';
 import 'voix_guidage_screen.dart';
@@ -103,6 +104,70 @@ class SettingsScreen extends StatelessWidget {
             },
           ),
           const Divider(),
+          ListTile(
+            leading: const Icon(Icons.manage_accounts),
+            title: const Text("Mon compte"),
+            subtitle: const Text("Sauvegarder le compte, email, suppression"),
+            trailing: const Icon(Icons.arrow_forward_ios),
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const CompteScreen()),
+              );
+            },
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.logout),
+            title: const Text("Déconnexion"),
+            trailing: const Icon(Icons.arrow_forward_ios),
+            onTap: () {
+              showDialog(
+                context: context,
+                builder: (context) {
+                  final onSurface = Theme.of(context).colorScheme.onSurface;
+                  return AlertDialog(
+                    title: Text(
+                      "Déconnexion",
+                      style: TextStyle(color: onSurface),
+                    ),
+                    content: Text(
+                      "Voulez-vous vraiment vous déconnecter ?",
+                      style: TextStyle(color: onSurface),
+                    ),
+                    actions: [
+                      TextButton(
+                        style: TextButton.styleFrom(foregroundColor: onSurface),
+                        onPressed: () {
+                          Navigator.pop(context);
+                        },
+                        child: const Text("Annuler"),
+                      ),
+                      TextButton(
+                        style: TextButton.styleFrom(foregroundColor: onSurface),
+                        onPressed: () async {
+                          final navigator = Navigator.of(context);
+                          Journal.i('COMPTE', 'Déconnexion confirmée');
+                          // Plus de partage de position après la déconnexion :
+                          // on ne publie jamais sous une session anonyme.
+                          PositionPartageService.instance.stop();
+                          await SupabaseService().signOut();
+                          navigator.pop();
+                          navigator.pushAndRemoveUntil(
+                            MaterialPageRoute(
+                              builder: (context) => const SplashScreen(),
+                            ),
+                            (route) => false,
+                          );
+                        },
+                        child: const Text("Déconnexion"),
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
+          ),
         ],
       ),
     );

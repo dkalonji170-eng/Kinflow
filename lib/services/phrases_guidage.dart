@@ -37,27 +37,88 @@ abstract final class PhrasesGuidage {
     'demitour_1': 'Dans 100 mètres, faites demi-tour.',
     'demitour_2': 'Dans 50 mètres, faites demi-tour.',
     'demitour_3': 'Veuillez faire demi-tour.',
-    'arrivee':
-        'Vous êtes arrivé à destination. Merci de nous avoir accordé votre '
-        'attention. À bientôt pour d\'autres aventures.',
+    'arrivee': 'Vous êtes arrivé à destination.',
   };
+
+  /// Ancienne phrase d'arrivée (avant raccourcissement). Conservée pour
+  /// pouvoir la reconnaître : une installation qui l'a sur disque sans
+  /// l'avoir modifiée bascule sur la phrase courte actuelle.
+  static const String _ancienneArrivee =
+      'Vous êtes arrivé à destination. Merci de nous avoir accordé votre '
+      'attention. À bientôt pour d\'autres aventures.';
 
   /// Les 14 phrases éditables, dans l'ordre d'affichage des Réglages.
   static const List<PhraseGuidage> editables = [
-    PhraseGuidage('depart', 'Départ', 'Prononcée dès que l\'itinéraire est tracé.'),
-    PhraseGuidage('gauche_0', 'À gauche — 300 m', 'Annoncée 300 m avant le virage.'),
-    PhraseGuidage('gauche_1', 'À gauche — 100 m', 'Annoncée 100 m avant le virage.'),
-    PhraseGuidage('gauche_2', 'À gauche — 50 m', 'Annoncée 50 m avant le virage.'),
-    PhraseGuidage('gauche_3', 'À gauche — imminent', 'Annoncée juste avant le virage.'),
-    PhraseGuidage('droite_0', 'À droite — 300 m', 'Annoncée 300 m avant le virage.'),
-    PhraseGuidage('droite_1', 'À droite — 100 m', 'Annoncée 100 m avant le virage.'),
-    PhraseGuidage('droite_2', 'À droite — 50 m', 'Annoncée 50 m avant le virage.'),
-    PhraseGuidage('droite_3', 'À droite — imminent', 'Annoncée juste avant le virage.'),
-    PhraseGuidage('demitour_0', 'Demi-tour — 300 m', 'Annoncée 300 m avant le virage.'),
-    PhraseGuidage('demitour_1', 'Demi-tour — 100 m', 'Annoncée 100 m avant le virage.'),
-    PhraseGuidage('demitour_2', 'Demi-tour — 50 m', 'Annoncée 50 m avant le virage.'),
-    PhraseGuidage('demitour_3', 'Demi-tour — imminent', 'Annoncée juste avant le virage.'),
-    PhraseGuidage('arrivee', 'Arrivée', 'Prononcée à l\'approche de la destination.'),
+    PhraseGuidage(
+      'depart',
+      'Départ',
+      'Prononcée dès que l\'itinéraire est tracé.',
+    ),
+    PhraseGuidage(
+      'gauche_0',
+      'À gauche — 300 m',
+      'Annoncée 300 m avant le virage.',
+    ),
+    PhraseGuidage(
+      'gauche_1',
+      'À gauche — 100 m',
+      'Annoncée 100 m avant le virage.',
+    ),
+    PhraseGuidage(
+      'gauche_2',
+      'À gauche — 50 m',
+      'Annoncée 50 m avant le virage.',
+    ),
+    PhraseGuidage(
+      'gauche_3',
+      'À gauche — imminent',
+      'Annoncée juste avant le virage.',
+    ),
+    PhraseGuidage(
+      'droite_0',
+      'À droite — 300 m',
+      'Annoncée 300 m avant le virage.',
+    ),
+    PhraseGuidage(
+      'droite_1',
+      'À droite — 100 m',
+      'Annoncée 100 m avant le virage.',
+    ),
+    PhraseGuidage(
+      'droite_2',
+      'À droite — 50 m',
+      'Annoncée 50 m avant le virage.',
+    ),
+    PhraseGuidage(
+      'droite_3',
+      'À droite — imminent',
+      'Annoncée juste avant le virage.',
+    ),
+    PhraseGuidage(
+      'demitour_0',
+      'Demi-tour — 300 m',
+      'Annoncée 300 m avant le virage.',
+    ),
+    PhraseGuidage(
+      'demitour_1',
+      'Demi-tour — 100 m',
+      'Annoncée 100 m avant le virage.',
+    ),
+    PhraseGuidage(
+      'demitour_2',
+      'Demi-tour — 50 m',
+      'Annoncée 50 m avant le virage.',
+    ),
+    PhraseGuidage(
+      'demitour_3',
+      'Demi-tour — imminent',
+      'Annoncée juste avant le virage.',
+    ),
+    PhraseGuidage(
+      'arrivee',
+      'Arrivée',
+      'Prononcée à l\'approche de la destination.',
+    ),
   ];
 
   /// Valeurs par défaut (aucune personnalisation).
@@ -93,8 +154,21 @@ abstract final class PhrasesGuidage {
     final prefs = await SharedPreferences.getInstance();
     return {
       for (final e in _defaut.entries)
-        e.key: _vigoureuse(prefs.getString(cleStockage(e.key))) ?? e.value,
+        e.key:
+            _phraseLue(e.key, prefs.getString(cleStockage(e.key))) ?? e.value,
     };
+  }
+
+  /// Phrase personnalisée lue sur disque, ou null pour garder le défaut.
+  ///
+  /// L'ancienne phrase d'arrivée, si elle n'a pas été retouchée, est ignorée :
+  /// elle est remplacée par « Vous êtes arrivé à destination. » comme demandé,
+  /// sans que l'utilisateur ait à rétablir les défauts à la main.
+  static String? _phraseLue(String cle, String? brut) {
+    final texte = _vigoureuse(brut);
+    if (texte == null) return null;
+    if (cle == 'arrivee' && texte == _ancienneArrivee) return null;
+    return texte;
   }
 
   /// Enregistre les phrases personnalisées (toutes les clés, défauts inclus).

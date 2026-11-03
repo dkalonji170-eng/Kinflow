@@ -7,8 +7,7 @@ void main() {
       final info = InformationVille.depuisJson({
         'id': '1',
         'contenu': 'Un titre assez long pour passer toutes les vérifications',
-        'source_url':
-            'https://www.radiookapi.net/actualite/2026/09/23/example',
+        'source_url': 'https://www.radiookapi.net/actualite/2026/09/23/example',
         'latitude': -4.325,
         'longitude': 15.322,
         'nb_verts': 3,
@@ -30,6 +29,55 @@ void main() {
         'cree_a': '2026-09-23T10:00:00Z',
       });
       expect(info.sourceUrl, isNull);
+    });
+  });
+
+  group('InformationVille.copyWith', () {
+    InformationVille base() => InformationVille(
+      id: 'info-1',
+      contenu: 'Une info avec image et épinglage',
+      sourceUrl: 'https://exemple.cd/article',
+      imageUrl: 'https://exemple.cd/photo.jpg',
+      latitude: -4.325,
+      longitude: 15.322,
+      nbVerts: 3,
+      nbRouges: 1,
+      maReaction: 'VERT',
+      emojis: const [('🔥', 2)],
+      mesEmojis: const {'🔥'},
+      epinglee: true,
+      creeA: DateTime.utc(2026, 10, 31, 12),
+    );
+
+    test('conserve image et épinglage lors d\'une réaction optimiste', () {
+      final copie = base().copyWith(nbVerts: 4, maReaction: 'ROUGE');
+
+      expect(copie.imageUrl, 'https://exemple.cd/photo.jpg');
+      expect(copie.epinglee, isTrue);
+      expect(copie.sourceUrl, 'https://exemple.cd/article');
+      expect(copie.nbVerts, 4);
+      expect(copie.maReaction, 'ROUGE');
+      expect(copie.creeA, DateTime.utc(2026, 10, 31, 12));
+    });
+
+    test('conserve l\'image lors d\'un changement d\'émoji', () {
+      final copie = base().copyWith(
+        emojis: const [('❤️', 5)],
+        mesEmojis: const {'❤️'},
+      );
+
+      expect(copie.imageUrl, 'https://exemple.cd/photo.jpg');
+      expect(copie.epinglee, isTrue);
+      expect(copie.emojis, [('❤️', 5)]);
+      expect(copie.mesEmojis, {'❤️'});
+    });
+
+    test('effacerReaction remet maReaction à null', () {
+      final copie = base().copyWith(effacerReaction: true);
+
+      expect(copie.maReaction, isNull);
+      expect(copie.imageUrl, 'https://exemple.cd/photo.jpg');
+      expect(copie.epinglee, isTrue);
     });
   });
 

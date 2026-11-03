@@ -31,19 +31,23 @@
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 		<string>UIInterfaceOrientationPortraitUpsideDown</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<!-- Discussion privée : photo prise avec l'appareil ou choisie dans la
+	     galerie, et message vocal (micro). -->
+	<key>NSCameraUsageDescription</key>
+	<string>KinFlow utilise l'appareil photo pour envoyer une photo à un(e) ami(e).</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>KinFlow accède à la galerie pour envoyer une photo à un(e) ami(e).</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>KinFlow utilise le micro pour envoyer un message vocal à un(e) ami(e).</string>
 </dict>
 </plist>
