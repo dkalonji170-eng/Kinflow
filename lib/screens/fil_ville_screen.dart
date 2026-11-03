@@ -90,6 +90,8 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   // --- Amis(es) -------------------------------------------------------------
   List<Map<String, dynamic>> _amis = [];
   List<Map<String, dynamic>> _demandes = [];
+  List<AmiPosition> get _positionnes =>
+      _amis.map(AmiPosition.depuisJson).whereType<AmiPosition>().toList();
 
   /// Messages non lus par ami(e) : ami_id -> nombre.
   Map<String, int> _nonLus = {};
@@ -515,7 +517,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
           children: [
-            _carteMonCode(theme),
+            _carteMonCode(theme, context),
             const SizedBox(height: 24),
             const SizedBox(height: 96),
             const EspaceVideSocial(
@@ -535,7 +537,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
         itemCount: _infosSuivis.length + 1,
         separatorBuilder: (_, _) => const SizedBox(height: 10),
         itemBuilder: (_, index) {
-          if (index == 0) return _carteMonCode(theme);
+          if (index == 0) return _carteMonCode(theme, context);
           index--;
           final info = _infosSuivis[index];
           final prenom = info['prenom'] as String? ?? '';
@@ -596,7 +598,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
             const SizedBox(height: 16),
             _barreRechercheAmis(theme),
           ],
-          if (positionnes.isNotEmpty) ...[
+          if (_positionnes.isNotEmpty) ...[
             const SizedBox(height: 20),
             const TitreSection(
               icone: Icons.location_on,
@@ -604,7 +606,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
               sousTitre: 'La position partagée par tes amis(es)',
             ),
             const SizedBox(height: 10),
-            _bandePositions(theme, positionnes),
+            _bandePositions(theme, _positionnes),
           ],
           if (_amis.isNotEmpty) ...[_barreRechercheAmis(theme)],
           const SizedBox(height: 20),
@@ -949,6 +951,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
     required VoidCallback onAction,
   }) {
     final theme = Theme.of(context);
+    final pret = _monCodeAmi.isNotEmpty;
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -963,28 +966,22 @@ class _FilVilleScreenState extends State<FilVilleScreen>
         children: [
           Row(
             children: [
-              const Icon(Icons.qr_code_2, color: Colors.white, size: 20),
-              const SizedBox(width: 8),
-              const Text(
-                'Mon espace',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.w800,
-                  fontSize: 15,
               Container(
-                padding: const EdgeInsets.all(9),
+                width: 40,
+                height: 40,
                 decoration: BoxDecoration(
                   color: KinColors.primary.withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(icone, color: KinColors.primary, size: 20),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
               Expanded(
                 child: Text(
                   titre,
                   style: theme.textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w800,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 15,
                   ),
                 ),
               ),
@@ -1015,6 +1012,7 @@ class _FilVilleScreenState extends State<FilVilleScreen>
               _boutonCode(theme, Icons.ios_share, 'Partager', _partagerCodeAmi,
                   actif: pret),
             ],
+          ),
           const SizedBox(height: 12),
           SizedBox(
             width: double.infinity,
@@ -1930,6 +1928,62 @@ class _FilVilleScreenState extends State<FilVilleScreen>
   }
 
   /// « Position partagée » ou « Position non partagée ».
+  Widget _bandePositions(ThemeData theme, List<AmiPosition> positions) {
+    return SizedBox(
+      height: 82,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: positions.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 10),
+        itemBuilder: (_, index) {
+          final position = positions[index];
+          return Material(
+            color: theme.colorScheme.surface,
+            borderRadius: BorderRadius.circular(16),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(16),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => const PartagePositionScreen(),
+                ),
+              ),
+              child: Container(
+                width: 210,
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: [
+                    const Icon(Icons.location_on_outlined),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            position.nom,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleSmall,
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            'Position partagée',
+                            style: theme.textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   String _libellePositionAmi(Map<String, dynamic> ami) {
     final latitude = _doubleOuNull(ami['latitude']);
     final longitude = _doubleOuNull(ami['longitude']);

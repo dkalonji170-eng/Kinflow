@@ -135,12 +135,6 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
             },
           ),
           const Divider(),
-          SwitchListTile(
-            title: const Text("Publications des pages suivies"),
-            value: publicationsPages,
-            onChanged: notifications
-                ? (value) {
-                    setState(() => publicationsPages = value);
           _switch(
             titre: "Alertes embouteillages",
             valeur: embouteillages,
@@ -152,12 +146,6 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                 : null,
           ),
           const Divider(),
-          SwitchListTile(
-            title: const Text("Réponses à mes commentaires"),
-            value: reponsesCommentaires,
-            onChanged: notifications
-                ? (value) {
-                    setState(() => reponsesCommentaires = value);
           _switch(
             titre: "Alertes routes bloquées",
             valeur: routesBloquees,
@@ -168,21 +156,28 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                   }
                 : null,
           ),
-          SwitchListTile(
-            title: const Text("Alertes embouteillages"),
-            value: embouteillages,
-            thumbColor: WidgetStateProperty.resolveWith<Color>((states) {
-              if (states.contains(WidgetState.selected)) {
-                return colorScheme.onPrimary;
-              }
-              return colorScheme.onSurfaceVariant;
-            }),
-            trackColor: WidgetStateProperty.resolveWith<Color>((states) {
-              if (states.contains(WidgetState.selected)) {
-                return colorScheme.primary;
-              }
-              return colorScheme.surfaceContainerHighest;
-            }),
+          const Divider(),
+          _switch(
+            titre: "Publications des pages suivies",
+            valeur: publicationsPages,
+            onChanged: notifications
+                ? (value) {
+                    setState(() => publicationsPages = value);
+                    sauvegarderPreferences();
+                  }
+                : null,
+          ),
+          const Divider(),
+          _switch(
+            titre: "Réponses à mes commentaires",
+            valeur: reponsesCommentaires,
+            onChanged: notifications
+                ? (value) {
+                    setState(() => reponsesCommentaires = value);
+                    sauvegarderPreferences();
+                  }
+                : null,
+          ),
           const Divider(),
           _switch(
             titre: "Nouveaux messages",

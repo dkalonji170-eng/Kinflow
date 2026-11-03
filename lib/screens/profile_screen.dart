@@ -482,6 +482,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           ),
         ),
       ],
+    );
     return Scaffold(
       appBar: AppBar(title: const Text("Mon profil"), centerTitle: true),
       body: ListView(

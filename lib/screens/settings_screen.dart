@@ -6,6 +6,9 @@ import 'about_screen.dart';
 import 'compte_screen.dart';
 import 'help_screen.dart';
 import '../services/diagnostics_service.dart';
+import '../services/position_partage_service.dart';
+import '../services/supabase_service.dart';
+import 'splash_screen.dart';
 import 'voix_guidage_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
